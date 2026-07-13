@@ -22,6 +22,33 @@ ROOT="${ROOT:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 PREFIX="${PREFIX:-$ROOT/bin}"
 BUILDROOT="${BUILDROOT:-$ROOT/build}"
 TARGET="${TARGET:-x86_64-w64-mingw32}"
+TOOLCHAIN_FLAVOR="${TOOLCHAIN_FLAVOR:-llvm-mingw}"
+# 全局安装到 /usr/local；可执行文件直接放到 /usr/local/bin，组件支持文件放到 /usr/local/<name>。
+GLOBAL_TOOLCHAIN_ROOT="${GLOBAL_TOOLCHAIN_ROOT:-/usr/local}"
+TOOLCHAIN_ROOT="${TOOLCHAIN_ROOT:-$GLOBAL_TOOLCHAIN_ROOT}"
+TOOLCHAIN_BIN="${TOOLCHAIN_BIN:-$TOOLCHAIN_ROOT/bin}"
+XPACK_MINGW_ROOT="${XPACK_MINGW_ROOT:-$TOOLCHAIN_ROOT/xpack-mingw-w64-gcc}"
+XPACK_MINGW_REPO="${XPACK_MINGW_REPO:-xpack-dev-tools/mingw-w64-gcc-xpack}"
+XPACK_MINGW_VERSION="${XPACK_MINGW_VERSION:-latest}"
+LLVM_MINGW_ROOT="${LLVM_MINGW_ROOT:-$TOOLCHAIN_ROOT/llvm-mingw}"
+LLVM_MINGW_REPO="${LLVM_MINGW_REPO:-mstorsjo/llvm-mingw}"
+LLVM_MINGW_VERSION="${LLVM_MINGW_VERSION:-latest}"
+LLVM_MINGW_CRT="${LLVM_MINGW_CRT:-ucrt}"
+LLVM_LINUX_ROOT="${LLVM_LINUX_ROOT:-$TOOLCHAIN_ROOT/llvm-linux}"
+LLVM_LINUX_REPO="${LLVM_LINUX_REPO:-llvm/llvm-project}"
+LLVM_LINUX_VERSION="${LLVM_LINUX_VERSION:-latest}"
+CMAKE_ROOT="${CMAKE_ROOT:-$TOOLCHAIN_ROOT/cmake}"
+CMAKE_REPO="${CMAKE_REPO:-Kitware/CMake}"
+CMAKE_VERSION="${CMAKE_VERSION:-latest}"
+NINJA_ROOT="${NINJA_ROOT:-$TOOLCHAIN_ROOT/ninja}"
+NINJA_REPO="${NINJA_REPO:-ninja-build/ninja}"
+NINJA_VERSION="${NINJA_VERSION:-latest}"
+PYTOOLS_ROOT="${PYTOOLS_ROOT:-$TOOLCHAIN_ROOT/python-tools}"
+NASM_ROOT="${NASM_ROOT:-$TOOLCHAIN_ROOT/nasm}"
+NASM_REPO="${NASM_REPO:-https://github.com/netwide-assembler/nasm.git}"
+NASM_VERSION="${NASM_VERSION:-latest}"
+SEVENZIP_ROOT="${SEVENZIP_ROOT:-$TOOLCHAIN_ROOT/7zip}"
+TOOLCHAIN_EXTRA_LIBS="${TOOLCHAIN_EXTRA_LIBS:-}"
 JOBS="${JOBS:-$(nproc)}"
 FFMPEG_JOBS="${FFMPEG_JOBS:-$JOBS}"
 FFMPEG_REF="${FFMPEG_REF:-master}"
@@ -29,7 +56,7 @@ FFMPEG_REF="${FFMPEG_REF:-master}"
 # 编译优化选项
 OPT_CFLAGS_BASE="${OPT_CFLAGS_BASE:--O3 -pipe -DNDEBUG -funwind-tables -fexceptions}"
 INLINE_ENABLE="${INLINE_ENABLE:-1}"
-INLINE_FLAGS="${INLINE_FLAGS:--finline-functions -finline-small-functions -findirect-inlining}"
+INLINE_FLAGS="${INLINE_FLAGS:--finline-functions}"
 SECTION_GC_ENABLE="${SECTION_GC_ENABLE:-1}"
 LTO_ENABLE="${LTO_ENABLE:-0}"
 LTO_FLAGS="${LTO_FLAGS:--flto=auto}"
@@ -66,7 +93,6 @@ declare -A URLS=(
   [svtav1hdr]="https://github.com/juliobbv-p/svt-av1-hdr.git"
   [libvpl]="https://github.com/intel/libvpl.git"
   [vapoursynth]="https://github.com/vapoursynth/vapoursynth.git"
-  [VapourSynth-BM3DCUDA]="https://github.com/WolframRhodium/VapourSynth-BM3DCUDA.git"
   [x264]="https://github.com/mirror/x264.git"
   [x265]="https://github.com/videolan/x265.git"
   [vmaf]="https://github.com/Netflix/vmaf.git"
@@ -74,14 +100,15 @@ declare -A URLS=(
   [vvdec]="https://github.com/fraunhoferhhi/vvdec.git"
   [sdl2]="https://github.com/libsdl-org/SDL.git"
   [zlib]="https://github.com/madler/zlib.git"
-  [bzip2]="https://gitlab.com/bzip2/bzip2.git"
+  [bzip2]="https://github.com/libarchive/bzip2.git"
   [lzma]="https://github.com/tukaani-project/xz.git"
 
-  [libxml2]="https://gitlab.gnome.org/GNOME/libxml2.git"
+  [libxml2]="https://github.com/GNOME/libxml2.git"
   [libmp3lame]="https://github.com/TimothyGu/lame.git"
   [libogg]="https://github.com/xiph/ogg.git"
   [libvorbis]="https://github.com/xiph/vorbis.git"
   [libsoxr]="https://github.com/chirlu/soxr.git"
+  [fdk-aac]="https://github.com/mstorsjo/fdk-aac.git"
   [libaom]="http://aomedia.googlesource.com/aom"
   [libvpx]="http://chromium.googlesource.com/webm/libvpx"
   [libopenjpeg]="https://github.com/uclouvain/openjpeg.git"
@@ -97,6 +124,25 @@ declare -A URLS=(
   [vulkan-headers]="https://github.com/KhronosGroup/Vulkan-Headers.git"
   [mbedtls]="https://github.com/Mbed-TLS/mbedtls.git"
   [avisynth]="https://github.com/AviSynth/AviSynthPlus.git"
+  [libssh]="https://git.libssh.org/projects/libssh.git"
+  [opencl-headers]="https://github.com/KhronosGroup/OpenCL-Headers.git"
+  [opencl-loader]="https://github.com/KhronosGroup/OpenCL-ICD-Loader.git"
+  [libiconv]="https://git.savannah.gnu.org/git/libiconv.git"
+  [libpng]="https://github.com/pnggroup/libpng.git"
+  [libsnappy]="https://github.com/google/snappy.git"
+  [libtheora]="https://gitlab.xiph.org/xiph/theora.git"
+  [libspeex]="https://github.com/xiph/speex.git"
+  [libtwolame]="https://github.com/njh/twolame.git"
+  [libmysofa]="https://github.com/hoene/libmysofa.git"
+  [libopenmpt]="https://github.com/OpenMPT/openmpt.git"
+  [libdvdread]="https://code.videolan.org/videolan/libdvdread.git"
+  [libdvdnav]="https://code.videolan.org/videolan/libdvdnav.git"
+  [chromaprint]="https://github.com/acoustid/chromaprint.git"
+  [libzmq]="https://github.com/zeromq/libzmq.git"
+  [libzvbi]="https://github.com/zapping-vbi/zvbi.git"
+  [libgsm]="https://github.com/timothytylee/libgsm.git"
+  [opencore-amr]="https://github.com/BelledonneCommunications/opencore-amr.git"
+  [vo-amrwbenc]="https://github.com/mstorsjo/vo-amrwbenc.git"
 )
 
 # Git 源码版本 Tag 匹配正则
@@ -119,7 +165,6 @@ declare -A TAG_REGEX=(
   [svtav1hdr]='^v[0-9]+(\.[0-9]+)*$'
   [libvpl]='^v2\.[0-9]+(\.[0-9]+)*$'
   [vapoursynth]='^R[0-9]+(\.[0-9]+)*$'
-  [VapourSynth-BM3DCUDA]='^R[0-9]+(\.[0-9]+)*$'
   [x264]='stable|master'
   [x265]='^[0-9]+\.[0-9]+(\.[0-9]+)*$|^v[0-9]+\.[0-9]+(\.[0-9]+)*$'
   [vmaf]='^v[0-9]+(\.[0-9]+)*$'
@@ -135,6 +180,7 @@ declare -A TAG_REGEX=(
   [libogg]='^v?[0-9]+(\.[0-9]+)*$'
   [libvorbis]='^v?[0-9]+(\.[0-9]+)*$'
   [libsoxr]='^v?[0-9]+(\.[0-9]+)*$'
+  [fdk-aac]='^v?[0-9]+(\.[0-9]+)*$'
   [libaom]='^v[0-9]+(\.[0-9]+)*$'
   [libvpx]='^v[0-9]+(\.[0-9]+)*$'
   [libopenjpeg]='^v[0-9]+(\.[0-9]+)*$'
@@ -150,6 +196,25 @@ declare -A TAG_REGEX=(
   [vulkan-headers]='^v[0-9]+(\.[0-9]+)*$'
   [mbedtls]='^v3\.[0-9]+(\.[0-9]+)*$'
   [avisynth]='^v[0-9]+(\.[0-9]+)*$'
+  [libssh]='^(libssh-)?v?[0-9]+(\.[0-9]+)+$'
+  [opencl-headers]='^v[0-9]{4}\.[0-9]{2}\.[0-9]{2}$'
+  [opencl-loader]='^v[0-9]{4}\.[0-9]{2}\.[0-9]{2}$'
+  [libiconv]='^v?[0-9]+(\.[0-9]+)+$'
+  [libpng]='^v?1\.[0-9]+\.[0-9]+$'
+  [libsnappy]='^[0-9]+(\.[0-9]+)+$'
+  [libtheora]='^v?[0-9]+(\.[0-9]+)+$'
+  [libspeex]='^[Ss]peex-[0-9]+(\.[0-9]+)+$'
+  [libtwolame]='^v?[0-9]+(\.[0-9]+)+$'
+  [libmysofa]='^v?[0-9]+(\.[0-9]+)+$'
+  [libopenmpt]='^libopenmpt-[0-9]+(\.[0-9]+)+$'
+  [libdvdread]='^v?[0-9]+(\.[0-9]+)+$'
+  [libdvdnav]='^v?[0-9]+(\.[0-9]+)+$'
+  [chromaprint]='^v?[0-9]+(\.[0-9]+)+$'
+  [libzmq]='^v?[0-9]+(\.[0-9]+)+$'
+  [libzvbi]='^v?[0-9]+(\.[0-9]+)+$'
+  [libgsm]='^v?[0-9]+(\.[0-9]+)*([_-]pl[0-9]+)?$'
+  [opencore-amr]='^v?[0-9]+(\.[0-9]+)+$'
+  [vo-amrwbenc]='^v?[0-9]+(\.[0-9]+)+$'
 )
 
 # 编译依赖阶段列表
@@ -158,16 +223,36 @@ STAGES=(
   "zlib"
   "bzip2"
   "lzma"
+  "libiconv"
+  "libpng"
 
   "libxml2"
   "libmp3lame"
   "libogg"
   "libvorbis"
   "libsoxr"
+  "fdk-aac"
   "libaom"
   "libvpx"
   "libopenjpeg"
   "mbedtls"
+  "libssh"
+  "opencl-headers"
+  "opencl-loader"
+  "libsnappy"
+  "libtheora"
+  "libspeex"
+  "libtwolame"
+  "libmysofa"
+  "libopenmpt"
+  "libdvdread"
+  "libdvdnav"
+  "chromaprint"
+  "libzmq"
+  "libzvbi"
+  "libgsm"
+  "opencore-amr"
+  "vo-amrwbenc"
   "libsrt"
   "librist"
   "libbluray"
@@ -193,7 +278,6 @@ STAGES=(
   "svtav1hdr"
   "libvpl"
   "vapoursynth"
-  "VapourSynth-BM3DCUDA"
   "x264"
   "x265"
   "vmaf"
@@ -208,6 +292,393 @@ STAGES=(
 # ==============================================================================
 # 子模块 1: 环境与工具链检测 (原 tool.sh)
 # ==============================================================================
+as_root() {
+  if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+    "$@"
+  else
+    sudo "$@"
+  fi
+}
+
+github_asset_url() {
+  local repo="$1" version="$2" pattern="$3"
+  python3 - "$repo" "$version" "$pattern" <<'PYGH'
+import json, re, sys, time, urllib.request
+repo, version, pattern = sys.argv[1:4]
+api = f"https://api.github.com/repos/{repo}/releases/latest" if version == "latest" else f"https://api.github.com/repos/{repo}/releases/tags/{version}"
+for attempt in range(4):
+    try:
+        with urllib.request.urlopen(api, timeout=60) as r:
+            data = json.load(r)
+        break
+    except Exception:
+        if attempt == 3:
+            raise
+        time.sleep(5 * (attempt + 1))
+rx = re.compile(pattern)
+for a in data.get("assets", []):
+    name = a.get("name", "")
+    if rx.search(name):
+        print(a["browser_download_url"])
+        raise SystemExit(0)
+raise SystemExit(f"no release asset matched {pattern!r} in {repo} {data.get('tag_name', version)}")
+PYGH
+}
+
+link_global_tool() {
+  local src="$1" name="${2:-$(basename "$1")}"
+  as_root mkdir -p "$TOOLCHAIN_BIN"
+  as_root ln -sf "$src" "$TOOLCHAIN_BIN/$name"
+  if [[ "$TOOLCHAIN_BIN" != "/usr/local/bin" ]]; then
+    as_root mkdir -p /usr/local/bin
+    as_root ln -sf "$TOOLCHAIN_BIN/$name" "/usr/local/bin/$name"
+  fi
+}
+
+link_prefixed_tools() {
+  local dir="$1" f name
+  as_root mkdir -p "$TOOLCHAIN_BIN"
+  for f in "$dir"/$TARGET-*; do
+    [[ -x "$f" && -f "$f" ]] || continue
+    name="$(basename "$f")"
+    as_root ln -sf "$f" "$TOOLCHAIN_BIN/$name"
+    if [[ "$TOOLCHAIN_BIN" != "/usr/local/bin" ]]; then
+      as_root mkdir -p /usr/local/bin
+      as_root ln -sf "$TOOLCHAIN_BIN/$name" "/usr/local/bin/$name"
+    fi
+  done
+}
+
+install_global_path_profile() {
+  as_root mkdir -p "$TOOLCHAIN_BIN"
+  as_root tee /etc/profile.d/ffmpeg-build-tools.sh >/dev/null <<EOF
+# Installed by ffmpeg.sh tool
+export PATH="$TOOLCHAIN_BIN:\$PATH"
+EOF
+  export PATH="$TOOLCHAIN_BIN:$PATH"
+}
+
+xpack_mingw_asset_url() {
+  github_asset_url "$XPACK_MINGW_REPO" "$XPACK_MINGW_VERSION" '^xpack-mingw-w64-gcc-.*-linux-x64\.tar\.gz$'
+}
+
+install_xpack_mingw() {
+  as_root mkdir -p "$TOOLCHAIN_ROOT"
+  local asset_url marker tmp archive extract next_root found toolroot asset_file
+  asset_url="$(xpack_mingw_asset_url)"
+  marker="$XPACK_MINGW_ROOT/.asset_url"
+  if [[ -x "$XPACK_MINGW_ROOT/bin/$TARGET-gcc" && -f "$marker" && "$(cat "$marker")" == "$asset_url" ]]; then
+    echo "xPack MinGW-w64 GCC already current: $XPACK_MINGW_ROOT"
+    link_prefixed_tools "$XPACK_MINGW_ROOT/bin"
+    return 0
+  fi
+
+  tmp="$(mktemp -d)"
+  archive="$tmp/xpack-mingw-w64-gcc.tar.gz"
+  extract="$tmp/extract"
+  next_root="$XPACK_MINGW_ROOT.tmp"
+  asset_file="$tmp/.asset_url"
+  echo "== Install xPack MinGW-w64 GCC latest stable globally =="
+  echo "$asset_url"
+  curl -fL --retry 3 -o "$archive" "$asset_url"
+  mkdir -p "$extract"
+  tar -xzf "$archive" -C "$extract"
+  found="$(find "$extract" -type f -path "*/bin/$TARGET-gcc" -perm -u+x | head -n 1)"
+  [[ -n "$found" ]] || { echo "下载包里找不到 bin/$TARGET-gcc"; exit 1; }
+  toolroot="$(cd "$(dirname "$found")/.." && pwd)"
+  printf '%s\n' "$asset_url" > "$asset_file"
+  as_root rm -rf "$next_root"
+  as_root mkdir -p "$next_root"
+  as_root cp -a "$toolroot/." "$next_root/"
+  as_root cp "$asset_file" "$next_root/.asset_url"
+  as_root rm -rf "$XPACK_MINGW_ROOT"
+  as_root mv "$next_root" "$XPACK_MINGW_ROOT"
+  rm -rf "$tmp"
+  link_prefixed_tools "$XPACK_MINGW_ROOT/bin"
+  "$XPACK_MINGW_ROOT/bin/$TARGET-gcc" --version | head -n 1
+}
+
+
+llvm_mingw_asset_url() {
+  github_asset_url "$LLVM_MINGW_REPO" "$LLVM_MINGW_VERSION" "^llvm-mingw-.*-${LLVM_MINGW_CRT}-ubuntu-22\\.04-x86_64\\.tar\\.xz$"
+}
+
+install_llvm_mingw() {
+  as_root mkdir -p "$TOOLCHAIN_ROOT"
+  local asset_url marker tmp archive extract next_root found toolroot asset_file
+  asset_url="$(llvm_mingw_asset_url)"
+  marker="$LLVM_MINGW_ROOT/.asset_url"
+  if [[ -x "$LLVM_MINGW_ROOT/bin/$TARGET-clang" && -f "$marker" && "$(cat "$marker")" == "$asset_url" ]]; then
+    echo "llvm-mingw already current: $LLVM_MINGW_ROOT"
+    link_prefixed_tools "$LLVM_MINGW_ROOT/bin"
+    link_global_tool "$LLVM_MINGW_ROOT/bin/llvm-ar" llvm-ar
+    link_global_tool "$LLVM_MINGW_ROOT/bin/llvm-ranlib" llvm-ranlib
+    link_global_tool "$LLVM_MINGW_ROOT/bin/llvm-strip" llvm-strip
+    link_global_tool "$LLVM_MINGW_ROOT/bin/llvm-objdump" llvm-objdump
+    return 0
+  fi
+
+  tmp="$(mktemp -d)"
+  archive="$tmp/llvm-mingw.tar.xz"
+  extract="$tmp/extract"
+  next_root="$LLVM_MINGW_ROOT.tmp"
+  asset_file="$tmp/.asset_url"
+  echo "== Install latest llvm-mingw/Clang globally =="
+  echo "$asset_url"
+  curl -fL --retry 3 -o "$archive" "$asset_url"
+  mkdir -p "$extract"
+  tar -xJf "$archive" -C "$extract"
+  found="$(find "$extract" -path "*/bin/$TARGET-clang" | head -n 1)"
+  [[ -n "$found" ]] || { echo "下载包里找不到 bin/$TARGET-clang"; exit 1; }
+  toolroot="$(cd "$(dirname "$found")/.." && pwd)"
+  printf '%s\n' "$asset_url" > "$asset_file"
+  as_root rm -rf "$next_root"
+  as_root mkdir -p "$next_root"
+  as_root cp -a "$toolroot/." "$next_root/"
+  as_root cp "$asset_file" "$next_root/.asset_url"
+  as_root rm -rf "$LLVM_MINGW_ROOT"
+  as_root mv "$next_root" "$LLVM_MINGW_ROOT"
+  rm -rf "$tmp"
+  link_prefixed_tools "$LLVM_MINGW_ROOT/bin"
+  link_global_tool "$LLVM_MINGW_ROOT/bin/llvm-ar" llvm-ar
+  link_global_tool "$LLVM_MINGW_ROOT/bin/llvm-ranlib" llvm-ranlib
+  link_global_tool "$LLVM_MINGW_ROOT/bin/llvm-strip" llvm-strip
+  link_global_tool "$LLVM_MINGW_ROOT/bin/llvm-objdump" llvm-objdump
+  "$LLVM_MINGW_ROOT/bin/$TARGET-clang" --version | head -n 1
+}
+
+llvm_linux_release() {
+  python3 - "$LLVM_LINUX_REPO" "$LLVM_LINUX_VERSION" <<'PYLLVM'
+import json, re, sys, time, urllib.request
+repo, version = sys.argv[1:3]
+api = f"https://api.github.com/repos/{repo}/releases/latest" if version == "latest" else f"https://api.github.com/repos/{repo}/releases/tags/{version}"
+for attempt in range(4):
+    try:
+        with urllib.request.urlopen(api, timeout=60) as r:
+            tag = json.load(r)["tag_name"]
+        break
+    except Exception:
+        if attempt == 3:
+            raise
+        time.sleep(5 * (attempt + 1))
+m = re.fullmatch(r"llvmorg-(\d+)\.\d+\.\d+", tag)
+if not m:
+    raise SystemExit(f"unexpected LLVM stable tag: {tag}")
+print(tag, m.group(1))
+PYLLVM
+}
+
+install_llvm_linux() {
+  local release major marker tmp
+  read -r release major <<< "$(llvm_linux_release)"
+  marker="$TOOLCHAIN_ROOT/.llvm-linux-release"
+  if [[ -x "/usr/bin/clang-$major" && -x "/usr/bin/ld.lld-$major" && -f "$marker" && "$(cat "$marker")" == "$release" ]]; then
+    echo "Native LLVM already current: $release"
+  else
+    echo "== Install latest stable native LLVM/Clang/LLD from apt.llvm.org =="
+    tmp="$(mktemp)"
+    curl -fsSL --retry 3 -o "$tmp" https://apt.llvm.org/llvm.sh
+    chmod +x "$tmp"
+    as_root env DEBIAN_FRONTEND=noninteractive bash "$tmp" "$major" all
+    rm -f "$tmp"
+    printf '%s\n' "$release" | as_root tee "$marker" >/dev/null
+  fi
+  as_root ln -sfn "/usr/lib/llvm-$major" "$LLVM_LINUX_ROOT"
+  link_global_tool "/usr/bin/clang-$major" clang-linux
+  link_global_tool "/usr/bin/clang++-$major" clang++-linux
+  link_global_tool "/usr/bin/ld.lld-$major" ld.lld-linux
+  link_global_tool "/usr/bin/llvm-ar-$major" llvm-ar-linux
+  link_global_tool "/usr/bin/llvm-ranlib-$major" llvm-ranlib-linux
+  link_global_tool "/usr/bin/llvm-strip-$major" llvm-strip-linux
+  "/usr/bin/clang-$major" --version | head -n 1
+}
+
+sevenzip_asset_url() {
+  github_asset_url "ip7z/7zip" latest '^7z[0-9]+-linux-x64\.tar\.xz$'
+}
+
+install_7zip_latest() {
+  local url marker tmp archive next_root
+  url="$(sevenzip_asset_url)"
+  marker="$SEVENZIP_ROOT/.asset_url"
+  if [[ -x "$SEVENZIP_ROOT/bin/7zz" && -f "$marker" && "$(cat "$marker")" == "$url" ]]; then
+    echo "7-Zip already current: $url"
+  else
+    tmp="$(mktemp -d)"
+    archive="$tmp/7zip.tar.xz"
+    next_root="$SEVENZIP_ROOT.tmp"
+    echo "== Install latest stable 7-Zip globally =="
+    curl -fL --retry 3 -o "$archive" "$url"
+    tar -xJf "$archive" -C "$tmp"
+    [[ -x "$tmp/7zz" ]] || { echo "7-Zip archive does not contain 7zz"; exit 1; }
+    as_root rm -rf "$next_root"
+    as_root mkdir -p "$next_root/bin"
+    as_root install -m 755 "$tmp/7zz" "$next_root/bin/7zz"
+    printf '%s\n' "$url" > "$tmp/.asset_url"
+    as_root install -m 644 "$tmp/.asset_url" "$next_root/.asset_url"
+    as_root rm -rf "$SEVENZIP_ROOT"
+    as_root mv "$next_root" "$SEVENZIP_ROOT"
+    rm -rf "$tmp"
+  fi
+  link_global_tool "$SEVENZIP_ROOT/bin/7zz" 7zz
+  link_global_tool "$SEVENZIP_ROOT/bin/7zz" 7z
+  "$SEVENZIP_ROOT/bin/7zz" i | head -n 2
+}
+
+cmake_asset_url() {
+  github_asset_url "$CMAKE_REPO" "$CMAKE_VERSION" '^cmake-[0-9].*-linux-x86_64\.tar\.gz$'
+}
+
+install_cmake_latest() {
+  as_root mkdir -p "$TOOLCHAIN_ROOT"
+  local asset_url marker tmp archive extract found toolroot asset_file next_root
+  asset_url="$(cmake_asset_url)"
+  marker="$CMAKE_ROOT/.asset_url"
+  if [[ -x "$CMAKE_ROOT/bin/cmake" && -f "$marker" && "$(cat "$marker")" == "$asset_url" ]]; then
+    echo "CMake already current: $CMAKE_ROOT"
+  else
+    tmp="$(mktemp -d)"
+    archive="$tmp/cmake.tar.gz"
+    extract="$tmp/extract"
+    asset_file="$tmp/.asset_url"
+    next_root="$CMAKE_ROOT.tmp"
+    echo "== Install latest stable CMake globally =="
+    echo "$asset_url"
+    curl -fL --retry 3 -o "$archive" "$asset_url"
+    mkdir -p "$extract"
+    tar -xzf "$archive" -C "$extract"
+    found="$(find "$extract" -type f -path "*/bin/cmake" -perm -u+x | head -n 1)"
+    [[ -n "$found" ]] || { echo "下载包里找不到 bin/cmake"; exit 1; }
+    toolroot="$(cd "$(dirname "$found")/.." && pwd)"
+    printf '%s\n' "$asset_url" > "$asset_file"
+    as_root rm -rf "$next_root"
+    as_root mkdir -p "$next_root"
+    as_root cp -a "$toolroot/." "$next_root/"
+    as_root cp "$asset_file" "$next_root/.asset_url"
+    as_root rm -rf "$CMAKE_ROOT"
+    as_root mv "$next_root" "$CMAKE_ROOT"
+    rm -rf "$tmp"
+  fi
+  link_global_tool "$CMAKE_ROOT/bin/cmake" cmake
+  link_global_tool "$CMAKE_ROOT/bin/ctest" ctest
+  link_global_tool "$CMAKE_ROOT/bin/cpack" cpack
+  "$CMAKE_ROOT/bin/cmake" --version | head -n 1
+}
+
+ninja_asset_url() {
+  github_asset_url "$NINJA_REPO" "$NINJA_VERSION" '^ninja-linux\.zip$'
+}
+
+install_ninja_latest() {
+  as_root mkdir -p "$TOOLCHAIN_ROOT"
+  local asset_url marker tmp archive extract asset_file next_root
+  asset_url="$(ninja_asset_url)"
+  marker="$NINJA_ROOT/.asset_url"
+  if [[ -x "$NINJA_ROOT/bin/ninja" && -f "$marker" && "$(cat "$marker")" == "$asset_url" ]]; then
+    echo "Ninja already current: $NINJA_ROOT"
+  else
+    tmp="$(mktemp -d)"
+    archive="$tmp/ninja.zip"
+    extract="$tmp/extract"
+    asset_file="$tmp/.asset_url"
+    next_root="$NINJA_ROOT.tmp"
+    echo "== Install latest stable Ninja globally =="
+    echo "$asset_url"
+    curl -fL --retry 3 -o "$archive" "$asset_url"
+    mkdir -p "$extract"
+    unzip -q "$archive" -d "$extract"
+    [[ -x "$extract/ninja" ]] || { echo "下载包里找不到 ninja"; exit 1; }
+    printf '%s\n' "$asset_url" > "$asset_file"
+    as_root rm -rf "$next_root"
+    as_root mkdir -p "$next_root/bin"
+    as_root cp "$extract/ninja" "$next_root/bin/ninja"
+    as_root chmod +x "$next_root/bin/ninja"
+    as_root cp "$asset_file" "$next_root/.asset_url"
+    as_root rm -rf "$NINJA_ROOT"
+    as_root mv "$next_root" "$NINJA_ROOT"
+    rm -rf "$tmp"
+  fi
+  link_global_tool "$NINJA_ROOT/bin/ninja" ninja
+  "$NINJA_ROOT/bin/ninja" --version
+}
+
+install_python_tools_latest() {
+  as_root mkdir -p "$TOOLCHAIN_ROOT"
+  echo "== Install / update latest stable Meson + Python build helpers globally =="
+  if [[ ! -x "$PYTOOLS_ROOT/bin/python" ]]; then
+    as_root rm -rf "$PYTOOLS_ROOT"
+    as_root python3 -m venv "$PYTOOLS_ROOT"
+  fi
+  as_root "$PYTOOLS_ROOT/bin/python" -m pip install -U pip setuptools wheel packaging meson
+  link_global_tool "$PYTOOLS_ROOT/bin/meson" meson
+  "$PYTOOLS_ROOT/bin/meson" --version
+}
+
+nasm_latest_tag() {
+  if [[ "$NASM_VERSION" != "latest" ]]; then
+    printf '%s\n' "$NASM_VERSION"
+    return 0
+  fi
+  git ls-remote --tags --refs "$NASM_REPO" 'nasm-*' \
+    | awk -F/ '{print $NF}' \
+    | { grep -E '^nasm-[0-9]+(\.[0-9]+)*$' || true; } \
+    | sed 's/^nasm-//' \
+    | sort -V \
+    | tail -n 1 \
+    | sed 's/^/nasm-/'
+}
+
+install_nasm_latest() {
+  as_root mkdir -p "$TOOLCHAIN_ROOT"
+  local tag marker tmp src dest next_root
+  tag="$(nasm_latest_tag)"
+  [[ -n "$tag" ]] || { echo "无法解析 NASM 最新稳定 tag"; exit 1; }
+  marker="$NASM_ROOT/.tag"
+  if [[ -x "$NASM_ROOT/bin/nasm" && -f "$marker" && "$(cat "$marker")" == "$tag" ]]; then
+    echo "NASM already current: $NASM_ROOT ($tag)"
+  else
+    tmp="$(mktemp -d)"
+    src="$tmp/nasm"
+    dest="$tmp/dest"
+    next_root="$NASM_ROOT.tmp"
+    echo "== Build/install latest stable NASM globally =="
+    echo "$NASM_REPO $tag"
+    git clone --depth 1 --branch "$tag" "$NASM_REPO" "$src"
+    pushd "$src" >/dev/null
+    ./autogen.sh
+    ./configure --prefix="$NASM_ROOT"
+    make -j"$JOBS"
+    # ponytail: FFmpeg only needs nasm/ndisasm; git builds may not generate nasm.1, so avoid fragile manpage install.
+    mkdir -p "$dest$NASM_ROOT/bin"
+    install -m 755 nasm "$dest$NASM_ROOT/bin/nasm"
+    [[ -x ndisasm ]] && install -m 755 ndisasm "$dest$NASM_ROOT/bin/ndisasm"
+    popd >/dev/null
+    as_root rm -rf "$next_root"
+    as_root mkdir -p "$next_root"
+    as_root cp -a "$dest$NASM_ROOT/." "$next_root/"
+    printf '%s\n' "$tag" > "$tmp/.tag"
+    as_root cp "$tmp/.tag" "$next_root/.tag"
+    as_root rm -rf "$NASM_ROOT"
+    as_root mv "$next_root" "$NASM_ROOT"
+    rm -rf "$tmp"
+  fi
+  link_global_tool "$NASM_ROOT/bin/nasm" nasm
+  [[ -x "$NASM_ROOT/bin/ndisasm" ]] && link_global_tool "$NASM_ROOT/bin/ndisasm" ndisasm
+  "$NASM_ROOT/bin/nasm" -v
+}
+
+first_tool() {
+  local t
+  for t in "$@"; do
+    if command -v "$t" >/dev/null 2>&1; then
+      command -v "$t"
+      return 0
+    fi
+  done
+  echo "找不到工具: $*" >&2
+  exit 1
+}
+
 run_tool() {
   echo "===> [子命令: tool] 检测与安装构建工具链..."
 
@@ -233,32 +704,52 @@ run_tool() {
   local CUDA_KEYRING="${CUDA_REPO}/cuda-keyring_1.1-1_all.deb"
   local CUDA_TOOLKIT_ENABLE="${CUDA_TOOLKIT_ENABLE:-1}"
 
-  echo "== Update apt =="
+  echo "== Update apt bootstrap packages =="
   sudo apt update
-  sudo apt full-upgrade -y
 
   echo
-  echo "== Install build toolchain =="
+  echo "== Install bootstrap packages (latest toolchains are downloaded below, not from apt) =="
   sudo apt install -y --no-install-recommends \
     build-essential \
-    autoconf automake libtool make cmake meson ninja-build \
-    pkg-config nasm yasm xxd \
-    git curl ca-certificates \
-    python3 gettext autopoint gperf \
-    mingw-w64 mingw-w64-tools \
-    binutils-mingw-w64-x86-64 \
-    gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 \
-    gcc-mingw-w64-x86-64-posix g++-mingw-w64-x86-64-posix \
-    mingw-w64-x86-64-dev
+    autoconf automake libtool make \
+    pkg-config xxd \
+    git curl ca-certificates tar xz-utils unzip \
+    python3 python3-venv perl gnupg lsb-release \
+    gettext autopoint gperf
+
+  install_global_path_profile
+  install_cmake_latest
+  install_ninja_latest
+  install_python_tools_latest
+  install_nasm_latest
+  install_xpack_mingw
+  install_llvm_mingw
+  install_llvm_linux
+  install_7zip_latest
+
+  if [[ "$TOOLCHAIN_FLAVOR" == "system" ]]; then
+    sudo apt install -y --no-install-recommends \
+      mingw-w64 mingw-w64-tools \
+      binutils-mingw-w64-x86-64 \
+      gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 \
+      gcc-mingw-w64-x86-64-posix g++-mingw-w64-x86-64-posix \
+      gcc-mingw-w64-x86-64-win32 g++-mingw-w64-x86-64-win32 \
+      mingw-w64-x86-64-dev
+  fi
 
   if [[ "$CUDA_TOOLKIT_ENABLE" == "1" ]]; then
     echo
     echo "== Install / update latest CUDA Toolkit for WSL =="
-    local tmpdeb
-    tmpdeb="$(mktemp --suffix=.deb)"
-    curl -fL --retry 3 -o "$tmpdeb" "$CUDA_KEYRING"
-    sudo dpkg -i "$tmpdeb"
-    rm -f "$tmpdeb"
+    if dpkg-query -W -f='${Status}' cuda-keyring 2>/dev/null | grep -q 'install ok installed'; then
+      echo "Reuse installed cuda-keyring."
+    else
+      local tmpdeb
+      tmpdeb="$(mktemp --suffix=.deb)"
+      curl -fL --retry 3 --retry-all-errors --connect-timeout 20 \
+        -o "$tmpdeb" "$CUDA_KEYRING"
+      sudo dpkg -i "$tmpdeb"
+      rm -f "$tmpdeb"
+    fi
 
     sudo apt update
 
@@ -293,20 +784,49 @@ EOF
 
   echo
   echo "== Check versions =="
-  echo "[MinGW GCC]"
-  x86_64-w64-mingw32-gcc-posix --version | head -n 1 || true
-
-  echo
-  echo "[MinGW G++]"
-  x86_64-w64-mingw32-g++-posix --version | head -n 1 || true
+  echo "[Toolchain flavor] $TOOLCHAIN_FLAVOR"
+  case "$TOOLCHAIN_FLAVOR" in
+    llvm-mingw)
+      "$LLVM_MINGW_ROOT/bin/$TARGET-clang" --version | head -n 1 || true
+      "$LLVM_MINGW_ROOT/bin/$TARGET-clang++" --version | head -n 1 || true
+      ;;
+    xpack-mingw64-gcc)
+      "$XPACK_MINGW_ROOT/bin/$TARGET-gcc" --version | head -n 1 || true
+      "$XPACK_MINGW_ROOT/bin/$TARGET-g++" --version | head -n 1 || true
+      ;;
+    system)
+      x86_64-w64-mingw32-gcc-win32 --version | head -n 1 || true
+      x86_64-w64-mingw32-g++-win32 --version | head -n 1 || true
+      ;;
+  esac
 
   echo
   echo "[CMake]"
   cmake --version | head -n 1 || true
 
   echo
+  echo "[Ninja]"
+  ninja --version || true
+
+  echo
   echo "[Meson]"
   meson --version || true
+
+  echo
+  echo "[NASM]"
+  nasm -v || true
+
+  echo
+  echo "[Native LLVM]"
+  clang-linux --version | head -n 1 || true
+
+  echo
+  echo "[7-Zip]"
+  7zz i | head -n 2 || true
+
+  echo
+  echo "[pkg-config]"
+  pkg-config --version || true
 
   echo
   echo "[NVCC]"
@@ -377,10 +897,49 @@ normalize_version() {
     lcms2)
       echo "${tag#lcms}"
       ;;
+    libssh)
+      tag="${tag#libssh-}"; echo "${tag#v}"
+      ;;
+    libspeex)
+      tag="${tag#Speex-}"; tag="${tag#speex-}"; echo "$tag"
+      ;;
+    libopenmpt)
+      echo "${tag#libopenmpt-}"
+      ;;
     *)
       echo "${tag#v}"
       ;;
   esac
+}
+
+git_retry() {
+  local attempt
+  for attempt in 1 2 3 4; do
+    if (( attempt % 2 == 1 )); then
+      "$@" && return 0
+    else
+      env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u all_proxy "$@" && return 0
+    fi
+    echo "git command failed (attempt $attempt/4), retrying..." >&2
+    sleep "$((attempt * 5))"
+  done
+  return 1
+}
+
+git_clone_retry() {
+  local url="$1" dir="$2" attempt
+  for attempt in 1 2 3 4; do
+    rm -rf "$dir"
+    if (( attempt % 2 == 1 )); then
+      git clone --filter=blob:none "$url" "$dir" && return 0
+    else
+      env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u all_proxy \
+        git clone --filter=blob:none "$url" "$dir" && return 0
+    fi
+    echo "git clone failed (attempt $attempt/4), retrying..." >&2
+    sleep "$((attempt * 5))"
+  done
+  return 1
 }
 
 clone_if_missing() {
@@ -422,7 +981,7 @@ clone_if_missing() {
     else
       git config --global http.version HTTP/1.1 || true
       git config --global http.postBuffer 1048576000 || true
-      git clone --filter=blob:none "$url" "$repo_dir"
+      git_clone_retry "$url" "$repo_dir"
     fi
   fi
 }
@@ -460,13 +1019,13 @@ checkout_stable() {
   if [[ "$name" == "ffmpeg-source" ]]; then
     echo "     -> Switching $name to branch $tag..."
     git -C "$repo_dir" checkout "$tag" 2>/dev/null || git -C "$repo_dir" switch "$tag"
-    git -C "$repo_dir" pull origin "$tag"
+    git_retry git -C "$repo_dir" pull --ff-only origin "$tag"
   else
     git -C "$repo_dir" switch --detach "$tag" 2>/dev/null || \
     git -C "$repo_dir" checkout --detach "$tag"
   fi
 
-  git -C "$repo_dir" submodule update --init --recursive || true
+  git_retry git -C "$repo_dir" submodule update --init --recursive || true
 
   local commit_hash
   commit_hash="$(git -C "$repo_dir" rev-parse HEAD)"
@@ -481,20 +1040,19 @@ update_one() {
 
   clone_if_missing "$name"
 
-  if [[ "$name" == "libaom" || "$name" == "libvpx" ]]; then
-    echo "     -> $name: source=${URLS[$name]}, ref=tarball, commit=initialized"
-    return
-  fi
-
   echo "===> sanitize $name"
-  sanitize_repo "$repo_dir"
+  if ! sanitize_repo "$repo_dir"; then
+    echo "incomplete source tree detected, recloning $name"
+    rm -rf "$repo_dir"
+    clone_if_missing "$name"
+  fi
 
   # 强制使用 HTTPS 远程源以防 SSH 连接超时
   local url="${URLS[$name]}"
   git -C "$repo_dir" remote set-url origin "$url" 2>/dev/null || true
 
   echo "===> fetch $name"
-  git -C "$repo_dir" fetch --tags --prune --force origin
+  git_retry git -C "$repo_dir" fetch --tags --prune --force origin
 
   local tag=""
   if [[ "$name" == "ffmpeg-source" ]]; then
@@ -516,6 +1074,7 @@ update_one() {
 }
 
 run_update() {
+  local start="${1:-}" seen=0
   echo "===> [子命令: update] 同步所有依赖库与 FFmpeg 源码..."
   mkdir -p "$ROOT"
 
@@ -538,7 +1097,6 @@ run_update() {
     svtav1hdr
     libvpl
     vapoursynth
-    VapourSynth-BM3DCUDA
     x264
     x265
     vmaf
@@ -548,16 +1106,36 @@ run_update() {
     zlib
     bzip2
     lzma
+    libiconv
+    libpng
 
     libxml2
     libmp3lame
     libogg
     libvorbis
     libsoxr
+    fdk-aac
     libaom
     libvpx
     libopenjpeg
     mbedtls
+    libssh
+    opencl-headers
+    opencl-loader
+    libsnappy
+    libtheora
+    libspeex
+    libtwolame
+    libmysofa
+    libopenmpt
+    libdvdread
+    libdvdnav
+    chromaprint
+    libzmq
+    libzvbi
+    libgsm
+    opencore-amr
+    vo-amrwbenc
     libsrt
     librist
     libbluray
@@ -572,11 +1150,24 @@ run_update() {
   )
 
   for r in "${repos[@]}"; do
+    if [[ -n "$start" && "$seen" == "0" ]]; then
+      [[ "$r" == "$start" ]] && seen=1 || continue
+    fi
     update_one "$r"
   done
 
+  [[ -z "$start" || "$seen" == "1" ]] || { echo "unknown update start repo: $start"; exit 1; }
+
   echo
   echo "All source trees are updated successfully."
+  echo
+  echo "== Source version manifest =="
+  for r in "${repos[@]}"; do
+    printf '%-24s ref=%-24s commit=%s\n' \
+      "$r" \
+      "$(git -C "$ROOT/$r" describe --tags --always 2>/dev/null || echo unknown)" \
+      "$(git -C "$ROOT/$r" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)"
+  done
 }
 
 # ==============================================================================
@@ -590,16 +1181,36 @@ normalize_stage() {
     zlib) echo "zlib" ;;
     bzip2|bzlib) echo "bzip2" ;;
     lzma|xz) echo "lzma" ;;
+    libiconv|iconv) echo "libiconv" ;;
+    libpng|png) echo "libpng" ;;
 
     libxml2|xml2) echo "libxml2" ;;
     libmp3lame|lame|mp3lame) echo "libmp3lame" ;;
     libogg|ogg) echo "libogg" ;;
     libvorbis|vorbis) echo "libvorbis" ;;
     libsoxr|soxr) echo "libsoxr" ;;
+    fdk-aac|fdkaac|libfdk-aac|libfdk_aac|libfdk) echo "fdk-aac" ;;
     libaom|aom) echo "libaom" ;;
     libvpx|vpx) echo "libvpx" ;;
     libopenjpeg|openjpeg) echo "libopenjpeg" ;;
     mbedtls) echo "mbedtls" ;;
+    libssh|ssh) echo "libssh" ;;
+    opencl-headers|cl-headers) echo "opencl-headers" ;;
+    opencl-loader|cl-loader|opencl) echo "opencl-loader" ;;
+    libsnappy|snappy) echo "libsnappy" ;;
+    libtheora|theora) echo "libtheora" ;;
+    libspeex|speex) echo "libspeex" ;;
+    libtwolame|twolame) echo "libtwolame" ;;
+    libmysofa|mysofa) echo "libmysofa" ;;
+    libopenmpt|openmpt) echo "libopenmpt" ;;
+    libdvdread|dvdread) echo "libdvdread" ;;
+    libdvdnav|dvdnav) echo "libdvdnav" ;;
+    chromaprint) echo "chromaprint" ;;
+    libzmq|zmq|zeromq) echo "libzmq" ;;
+    libzvbi|zvbi) echo "libzvbi" ;;
+    libgsm|gsm) echo "libgsm" ;;
+    opencore-amr|opencore|amr) echo "opencore-amr" ;;
+    vo-amrwbenc|voamrwbenc) echo "vo-amrwbenc" ;;
     libsrt|srt) echo "libsrt" ;;
     librist|rist) echo "librist" ;;
     libbluray|bluray) echo "libbluray" ;;
@@ -625,7 +1236,6 @@ normalize_stage() {
     svtav1hdr|svtav1|svt-av1|svt) echo "svtav1hdr" ;;
     libvpl|vpl) echo "libvpl" ;;
     vapoursynth|vs) echo "vapoursynth" ;;
-    vapoursynth-bm3dcuda|bm3dcuda|bm3d) echo "VapourSynth-BM3DCUDA" ;;
     x264) echo "x264" ;;
     x265) echo "x265" ;;
     vmaf) echo "vmaf" ;;
@@ -696,15 +1306,9 @@ need_meson_min() {
   local req="$1"
   local have
   have="$(meson --version)"
-  if ! python3 - "$have" "$req" <<'PY'
-import sys
-from packaging.version import Version
-sys.exit(0 if Version(sys.argv[1].strip()) >= Version(sys.argv[2].strip()) else 1)
-PY
-  then
+  if [[ "$(printf '%s\n%s\n' "$req" "$have" | sort -V | head -n 1)" != "$req" ]]; then
     echo "Meson 版本过低: 当前 $have，需要 >= $req"
-    echo '可先执行: python3 -m pip install --user -U meson packaging'
-    echo '并确保 ~/.local/bin 在 PATH 前面'
+    echo "可先执行: ./ffmpeg.sh tool"
     exit 1
   fi
 }
@@ -712,18 +1316,11 @@ PY
 is_valid_cuda() {
   local dir="$1"
   [[ -d "$dir" ]] || return 1
-  # 检查 cuda.h
   local found_cuda=0
   for h in "$dir/include/cuda.h" "$dir/targets/x86_64-linux/include/cuda.h"; do
     [[ -f "$h" ]] && found_cuda=1
   done
   [[ "$found_cuda" == "1" ]] || return 1
-  # 检查 nvrtc.h
-  local found_nvrtc=0
-  for h in "$dir/include/nvrtc.h" "$dir/targets/x86_64-linux/include/nvrtc.h"; do
-    [[ -f "$h" ]] && found_nvrtc=1
-  done
-  [[ "$found_nvrtc" == "1" ]] || return 1
   return 0
 }
 
@@ -735,7 +1332,7 @@ find_cuda_home() {
 
   if [[ -n "$CUDA_HOME" ]]; then
     is_valid_cuda "$CUDA_HOME" || {
-      echo "CUDA_HOME 缺少头文件(cuda.h/nvrtc.h): $CUDA_HOME"
+      echo "CUDA_HOME 缺少 cuda.h: $CUDA_HOME"
       exit 1
     }
     return 0
@@ -754,7 +1351,7 @@ find_cuda_home() {
     fi
   done
 
-  echo "未找到完整的 CUDA Toolkit（需要 cuda.h 和 nvrtc.h）。请检查 /usr/local/cuda"
+  echo "未找到完整的 CUDA Toolkit（需要 cuda.h）。请检查 /usr/local/cuda"
   exit 1
 }
 
@@ -869,7 +1466,15 @@ build_autotools() {
   pushd "$stage" >/dev/null
 
   if [[ ! -x ./configure ]]; then
-    if [[ -x ./autogen.sh ]]; then
+    if [[ "$name" == "libtwolame" ]]; then
+      # twolame's autogen.sh immediately configures in maintainer mode and then
+      # requires asciidoc. Generate the release build system without that step.
+      autoreconf -fiv
+    elif [[ -x ./autogen.sh ]]; then
+      if [[ "$name" == "opus" ]]; then
+        # ponytail: opus autogen downloads optional DNN data; FFmpeg libopus does not need it.
+        sed -i '/dnn\/download_model\.sh/d' ./autogen.sh
+      fi
       ./autogen.sh
     elif [[ -f ./bootstrap ]]; then
       ./bootstrap
@@ -878,6 +1483,8 @@ build_autotools() {
     fi
   fi
 
+  CPPFLAGS="${CPPFLAGS:-} -I$PREFIX/include" \
+  LDFLAGS="$LDFLAGS -L$PREFIX/lib" \
   ./configure \
     --host="$TARGET" \
     --prefix="$PREFIX" \
@@ -885,8 +1492,14 @@ build_autotools() {
     --enable-static \
     "$@"
 
-  make -j"$JOBS"
-  make install
+  if [[ "$name" == "libtwolame" ]]; then
+    make -C libtwolame -j"$JOBS"
+    make -C libtwolame install
+    install -Dm644 twolame.pc "$PREFIX/lib/pkgconfig/twolame.pc"
+  else
+    make -j"$JOBS"
+    make install
+  fi
   popd >/dev/null
 }
 
@@ -934,6 +1547,12 @@ build_meson() {
   stage="$(stage_src "$name")"
   local bld="$BUILDROOT/$name"
 
+  if [[ "$name" == "libdvdread" ]]; then
+    # Its optional ChangeLog target runs `git log` from the Meson build dir.
+    # Hide the staged reflog so Meson omits that non-runtime artifact.
+    rm -f "$stage/.git/logs/HEAD"
+  fi
+
   rm -rf "$bld"
 
   meson setup "$bld" "$stage" \
@@ -949,7 +1568,11 @@ build_meson() {
 }
 
 setup_build_env() {
-  export PATH="$HOME/.local/bin:$PREFIX/bin:$PATH"
+  export PATH="$TOOLCHAIN_BIN:$CMAKE_ROOT/bin:$NINJA_ROOT/bin:$PYTOOLS_ROOT/bin:$NASM_ROOT/bin:$HOME/.local/bin:$PREFIX/bin:$PATH"
+  case "$TOOLCHAIN_FLAVOR" in
+    llvm-mingw) export PATH="$LLVM_MINGW_ROOT/bin:$PATH" ;;
+    xpack-mingw64-gcc) export PATH="$XPACK_MINGW_ROOT/bin:$PATH" ;;
+  esac
 
   need_cmd python3
   need_cmd git
@@ -960,16 +1583,45 @@ setup_build_env() {
   need_cmd autoreconf
   need_cmd pkg-config
 
-  CC="$(canonical_tool "${CC:-${TARGET}-gcc-posix}")"
-  CXX="$(canonical_tool "${CXX:-${TARGET}-g++-posix}")"
-  AR="$(canonical_tool "${AR:-${TARGET}-ar}")"
-  RANLIB="$(canonical_tool "${RANLIB:-${TARGET}-ranlib}")"
-  STRIP="$(canonical_tool "${STRIP:-${TARGET}-strip}")"
-  WINDRES="$(canonical_tool "${WINDRES:-${TARGET}-windres}")"
+  case "$TOOLCHAIN_FLAVOR" in
+    llvm-mingw)
+      CC="$(canonical_tool "${CC:-${TARGET}-clang}")"
+      CXX="$(canonical_tool "${CXX:-${TARGET}-clang++}")"
+      AR="$(canonical_tool "${AR:-llvm-ar}")"
+      RANLIB="$(canonical_tool "${RANLIB:-llvm-ranlib}")"
+      STRIP="$(canonical_tool "${STRIP:-llvm-strip}")"
+      if [[ -n "${WINDRES:-}" ]]; then WINDRES="$(canonical_tool "$WINDRES")"; else WINDRES="$(first_tool "${TARGET}-windres" llvm-windres)"; fi
+      if [[ -n "${DLLTOOL:-}" ]]; then DLLTOOL="$(canonical_tool "$DLLTOOL")"; else DLLTOOL="$(first_tool "${TARGET}-dlltool" llvm-dlltool)"; fi
+      TOOLCHAIN_EXTRA_LIBS="${TOOLCHAIN_EXTRA_LIBS:-}"
+      ;;
+    xpack-mingw64-gcc)
+      CC="$(canonical_tool "${CC:-${TARGET}-gcc}")"
+      CXX="$(canonical_tool "${CXX:-${TARGET}-g++}")"
+      AR="$(canonical_tool "${AR:-${TARGET}-ar}")"
+      RANLIB="$(canonical_tool "${RANLIB:-${TARGET}-ranlib}")"
+      STRIP="$(canonical_tool "${STRIP:-${TARGET}-strip}")"
+      WINDRES="$(canonical_tool "${WINDRES:-${TARGET}-windres}")"
+      DLLTOOL="$(canonical_tool "${DLLTOOL:-${TARGET}-dlltool}")"
+      TOOLCHAIN_EXTRA_LIBS="${TOOLCHAIN_EXTRA_LIBS:--lstdc++ -lgcc}"
+      ;;
+    system)
+      CC="$(canonical_tool "${CC:-${TARGET}-gcc-win32}")"
+      CXX="$(canonical_tool "${CXX:-${TARGET}-g++-win32}")"
+      AR="$(canonical_tool "${AR:-${TARGET}-ar}")"
+      RANLIB="$(canonical_tool "${RANLIB:-${TARGET}-ranlib}")"
+      STRIP="$(canonical_tool "${STRIP:-${TARGET}-strip}")"
+      WINDRES="$(canonical_tool "${WINDRES:-${TARGET}-windres}")"
+      DLLTOOL="$(canonical_tool "${DLLTOOL:-${TARGET}-dlltool}")"
+      TOOLCHAIN_EXTRA_LIBS="${TOOLCHAIN_EXTRA_LIBS:--lstdc++ -lgcc}"
+      ;;
+    *)
+      echo "未知 TOOLCHAIN_FLAVOR: $TOOLCHAIN_FLAVOR"
+      exit 1
+      ;;
+  esac
   PKG_CONFIG="$(canonical_tool "${PKG_CONFIG:-pkg-config}")"
-  DLLTOOL="$(canonical_tool "${DLLTOOL:-${TARGET}-dlltool}")"
 
-  export CC CXX AR RANLIB STRIP WINDRES PKG_CONFIG DLLTOOL
+  export CC CXX AR RANLIB STRIP WINDRES PKG_CONFIG DLLTOOL TOOLCHAIN_EXTRA_LIBS
   export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig"
   export PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig"
 
@@ -991,6 +1643,9 @@ setup_build_env() {
     COMMON_OPT_FLAGS+=" $LTO_FLAGS"
     LDFLAGS_BASE+=" $LTO_FLAGS"
   fi
+  if [[ "$TOOLCHAIN_FLAVOR" == "llvm-mingw" ]]; then
+    LDFLAGS_BASE+=" -fuse-ld=lld"
+  fi
 
   export CFLAGS="${CFLAGS:-$COMMON_OPT_FLAGS}"
   export CXXFLAGS="${CXXFLAGS:-$COMMON_OPT_FLAGS}"
@@ -998,6 +1653,125 @@ setup_build_env() {
 
   mkdir -p "$BUILDROOT"
   write_meson_cross
+}
+
+
+is_system_runtime_dll() {
+  local u="${1^^}"
+  case "$u" in
+    API-MS-WIN-*.DLL|EXT-MS-*.DLL|KERNEL32.DLL|NTDLL.DLL|UCRTBASE.DLL|VCRUNTIME*.DLL|MSVCRT.DLL) return 0 ;;
+    USER32.DLL|GDI32.DLL|ADVAPI32.DLL|SHELL32.DLL|OLE32.DLL|OLEAUT32.DLL|COMDLG32.DLL|COMCTL32.DLL) return 0 ;;
+    WS2_32.DLL|CRYPT32.DLL|BCRYPT.DLL|VERSION.DLL|SHLWAPI.DLL|SECUR32.DLL|IPHLPAPI.DLL|NCRYPT.DLL) return 0 ;;
+    CFGMGR32.DLL|RUNTIMEOBJECT.DLL|RPCRT4.DLL) return 0 ;;
+    D3D*.DLL|D2D1.DLL|DWRITE.DLL|DXGI.DLL|MF*.DLL|EVR.DLL|AVRT.DLL|PROPSYS.DLL|RTWORKQ.DLL) return 0 ;;
+    AVICAP32.DLL|IMM32.DLL|SETUPAPI.DLL|WINMM.DLL|NVCUDA.DLL|NVENCODEAPI64.DLL|VULKAN-1.DLL) return 0 ;;
+  esac
+  return 1
+}
+
+find_runtime_dll() {
+  local dll="$1" dir found
+  for dir in \
+    "$ROOT/full" "$PREFIX/bin" \
+    "$LLVM_MINGW_ROOT/bin" "$LLVM_MINGW_ROOT/$TARGET/bin" "$(dirname "$CC")"; do
+    [[ -d "$dir" ]] || continue
+    found="$(find "$dir" -maxdepth 1 -type f -iname "$dll" -print -quit 2>/dev/null || true)"
+    if [[ -n "$found" ]]; then
+      printf '%s\n' "$found"
+      return 0
+    fi
+  done
+  return 1
+}
+
+copy_runtime_dll_closure() {
+  local dst="$ROOT/full" dump_tool tmp imports missing changed file dll src
+  mkdir -p "$dst"
+  dump_tool="$(command -v llvm-objdump || command -v "$TARGET-objdump" || command -v objdump || true)"
+  [[ -n "$dump_tool" ]] || { echo "找不到 objdump/llvm-objdump，无法检查 DLL 依赖"; exit 1; }
+
+  tmp="$(mktemp -d)"
+  # ponytail: RETURN trap leaks into later functions under set -u; clean up explicitly.
+  changed=1
+  while [[ "$changed" == "1" ]]; do
+    changed=0
+    : > "$tmp/imports"
+    while IFS= read -r file; do
+      "$dump_tool" -p "$file" 2>/dev/null | sed -n 's/^[[:space:]]*DLL Name: //p' >> "$tmp/imports" || true
+    done < <(find "$dst" -type f \( -iname '*.exe' -o -iname '*.dll' \) -print)
+    sort -fu "$tmp/imports" > "$tmp/imports.sorted"
+    while IFS= read -r dll; do
+      [[ -n "$dll" ]] || continue
+      is_system_runtime_dll "$dll" && continue
+      if find "$dst" -maxdepth 1 -type f -iname "$dll" -print -quit | grep -q .; then
+        continue
+      fi
+      src="$(find_runtime_dll "$dll" || true)"
+      if [[ -n "$src" ]]; then
+        cp -f "$src" "$dst/"
+        "$STRIP" "$dst/$(basename "$src")" 2>/dev/null || true
+        changed=1
+      else
+        printf '%s\n' "$dll" >> "$tmp/missing"
+      fi
+    done < "$tmp/imports.sorted"
+  done
+
+  if [[ -s "$tmp/missing" ]]; then
+    echo "缺少非系统运行时 DLL:" >&2
+    sort -fu "$tmp/missing" >&2
+    exit 1
+  fi
+  rm -rf "$tmp"
+}
+
+patch_ffmpeg_libplacebo_vulkan_import() {
+  local ff_stage="$1" cfg="$PREFIX/include/libplacebo/config.h" api
+  [[ -f "$cfg" ]] || return 0
+  api="$(sed -n 's/^#define PL_API_VER[[:space:]]\+\([0-9]\+\).*/\1/p' "$cfg" | head -n1)"
+  [[ -n "$api" ]] || return 0
+  if (( api >= 365 )); then
+    return 0
+  fi
+
+  echo "== Patch FFmpeg Vulkan queue import for libplacebo API $api < 365 =="
+  # ponytail: libplacebo API 360 cannot import FFmpeg Vulkan queues created with
+  # VK_KHR_internally_synchronized_queues flags. Disable that optional extension
+  # so FFmpeg falls back to its own queue locks and vf_libplacebo can import it.
+  perl -0pi -e 's/#ifdef VK_KHR_internally_synchronized_queues\n([[:space:]]*\{ VK_KHR_INTERNALLY_SYNCHRONIZED_QUEUES_EXTENSION_NAME,[[:space:]]*FF_VK_EXT_INTERNAL_QUEUE_SYNC[[:space:]]*\},\n)#endif/#if 0 \&\& defined(VK_KHR_internally_synchronized_queues)\n$1#endif/g' \
+    "$ff_stage/libavutil/hwcontext_vulkan.c" \
+    "$ff_stage/libavutil/vulkan_loader.h"
+}
+
+patch_ffmpeg_cxx_runtime() {
+  local ff_stage="$1"
+  [[ "$TOOLCHAIN_FLAVOR" == "llvm-mingw" ]] || return 0
+  # FFmpeg's configure assumes GNU libstdc++; llvm-mingw ships libc++.
+  sed -i 's/-lstdc++/-lc++/g' "$ff_stage/configure"
+}
+
+verify_full_ffmpeg_config() {
+  local cfg="$1" ff_stage="$2" key
+  local required=(
+    CONFIG_AAC_ENCODER CONFIG_LIBSOXR CONFIG_LIBSSH CONFIG_OPENCL CONFIG_D3D12VA
+    CONFIG_OPENGL CONFIG_LIBSNAPPY CONFIG_LIBTHEORA CONFIG_LIBSPEEX CONFIG_LIBTWOLAME
+    CONFIG_LIBMYSOFA CONFIG_LIBOPENMPT CONFIG_LIBDVDREAD CONFIG_LIBDVDNAV
+    CONFIG_CHROMAPRINT CONFIG_LIBZMQ CONFIG_LIBZVBI CONFIG_LIBGSM
+    CONFIG_LIBOPENCORE_AMRNB CONFIG_LIBOPENCORE_AMRWB CONFIG_LIBVO_AMRWBENC
+    CONFIG_ICONV CONFIG_LIBPLACEBO_FILTER CONFIG_VULKAN CONFIG_LIBSHADERC
+    CONFIG_LIBVPL CONFIG_AV1_QSV_ENCODER CONFIG_HEVC_QSV_ENCODER
+    CONFIG_VAPOURSYNTH_DEMUXER
+  )
+  if [[ "$CUDA_ENABLE" == "1" ]]; then
+    required+=(CONFIG_CUDA_NVCC CONFIG_AV1_NVENC_ENCODER CONFIG_HEVC_NVENC_ENCODER CONFIG_SCALE_CUDA_FILTER)
+  fi
+  for key in "${required[@]}"; do
+    grep -q "^$key=yes$" "$cfg" || { echo "FFmpeg required feature disabled: $key"; exit 1; }
+  done
+  grep -Rqs '"aac_nmr_speed"' "$ff_stage/libavcodec" || {
+    echo "FFmpeg source does not contain the NMR AAC speed option"
+    exit 1
+  }
 }
 
 run_stage() {
@@ -1114,6 +1888,49 @@ Libs.private:
 EOF
       ;;
 
+    libiconv)
+      local iconv_stage iconv_version iconv_archive iconv_cache
+      iconv_stage="$(stage_src "libiconv")"
+      iconv_version="$(git -C "$iconv_stage" describe --tags --always | sed 's/^v//')"
+      iconv_cache="$ROOT/toolchains/source-archives"
+      iconv_archive="$iconv_cache/libiconv-$iconv_version.tar.gz"
+      if [[ ! -f "$iconv_archive" ]]; then
+        mkdir -p "$iconv_cache"
+        curl -fL --connect-timeout 15 -o "$iconv_archive.tmp" \
+          "https://ftp.gnu.org/pub/gnu/libiconv/libiconv-$iconv_version.tar.gz" || \
+          env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u all_proxy \
+            curl -fL --retry 4 --retry-all-errors --connect-timeout 20 \
+              -o "$iconv_archive.tmp" \
+              "https://ftp.gnu.org/pub/gnu/libiconv/libiconv-$iconv_version.tar.gz"
+        mv "$iconv_archive.tmp" "$iconv_archive"
+      fi
+      rm -rf "$iconv_stage"
+      mkdir -p "$iconv_stage"
+      tar -xzf "$iconv_archive" -C "$iconv_stage" --strip-components=1
+      pushd "$iconv_stage" >/dev/null
+      ./configure \
+        --host="$TARGET" \
+        --prefix="$PREFIX" \
+        --disable-shared \
+        --enable-static \
+        --disable-nls
+      make -j"$JOBS"
+      make install
+      popd >/dev/null
+      ;;
+
+    libpng)
+      build_cmake libpng \
+        -DPNG_SHARED=OFF \
+        -DPNG_STATIC=ON \
+        -DPNG_TESTS=OFF \
+        -DPNG_TOOLS=OFF \
+        -DPNG_FRAMEWORK=OFF \
+        -DZLIB_ROOT="$PREFIX" \
+        -DZLIB_LIBRARY="$PREFIX/lib/libz.a" \
+        -DZLIB_INCLUDE_DIR="$PREFIX/include"
+      ;;
+
 
 
     libxml2)
@@ -1142,6 +1959,11 @@ EOF
         -DCMAKE_POLICY_VERSION_MINIMUM=3.5
       cmake --build "$bld" --parallel "$JOBS"
       cmake --install "$bld"
+      [[ -f "$stage/third_party/spirv-headers/include/spirv/unified1/spirv.h" ]] || {
+        echo "shaderc 缺少 SPIR-V Headers"
+        exit 1
+      }
+      cp -rf "$stage/third_party/spirv-headers/include/spirv" "$PREFIX/include/"
       ;;
 
 
@@ -1223,6 +2045,10 @@ Cflags: -I\${includedir}
 EOF
       ;;
 
+    fdk-aac)
+      build_autotools fdk-aac
+      ;;
+
     libaom)
       local stage
       stage="$(stage_src "libaom")"
@@ -1292,6 +2118,14 @@ EOF
     mbedtls)
       local stage
       stage="$(stage_src "mbedtls")"
+      # libssh's mbedTLS backend requires a real mutex implementation. llvm-mingw
+      # provides winpthreads; keep this change confined to the staged source.
+      sed -i \
+        -e 's|^//#define MBEDTLS_THREADING_PTHREAD$|#define MBEDTLS_THREADING_PTHREAD|' \
+        -e 's|^//#define MBEDTLS_THREADING_C$|#define MBEDTLS_THREADING_C|' \
+        "$stage/include/mbedtls/mbedtls_config.h"
+      grep -q '^#define MBEDTLS_THREADING_PTHREAD$' "$stage/include/mbedtls/mbedtls_config.h"
+      grep -q '^#define MBEDTLS_THREADING_C$' "$stage/include/mbedtls/mbedtls_config.h"
       local bld="$BUILDROOT/mbedtls"
       rm -rf "$bld"
       cmake -S "$stage" -B "$bld" -G Ninja \
@@ -1308,6 +2142,179 @@ EOF
         -DCMAKE_POLICY_VERSION_MINIMUM=3.5
       cmake --build "$bld" --parallel "$JOBS"
       cmake --install "$bld"
+      ;;
+
+    libssh)
+      build_cmake libssh \
+        -DWITH_MBEDTLS=ON \
+        -DMBEDTLS_ROOT_DIR="$PREFIX" \
+        -DWITH_GCRYPT=OFF \
+        -DWITH_GSSAPI=OFF \
+        -DWITH_NACL=OFF \
+        -DWITH_FIDO2=OFF \
+        -DWITH_PCAP=OFF \
+        -DWITH_SERVER=OFF \
+        -DWITH_SFTP=ON \
+        -DWITH_EXAMPLES=OFF \
+        -DUNIT_TESTING=OFF \
+        -DCLIENT_TESTING=OFF \
+        -DSERVER_TESTING=OFF \
+        -DWITH_BENCHMARKS=OFF \
+        -DWITH_SYMBOL_VERSIONING=OFF \
+        -DWITH_ZLIB=ON
+      ;;
+
+    opencl-headers)
+      build_cmake opencl-headers \
+        -DBUILD_TESTING=OFF \
+        -DOPENCL_HEADERS_BUILD_TESTING=OFF \
+        -DOPENCL_HEADERS_BUILD_CXX_TESTS=OFF
+      ;;
+
+    opencl-loader)
+      build_cmake opencl-loader \
+        -DBUILD_TESTING=OFF \
+        -DOPENCL_ICD_LOADER_HEADERS_DIR="$PREFIX/include" \
+        -DOPENCL_ICD_LOADER_BUILD_SHARED_LIBS=OFF \
+        -DOPENCL_ICD_LOADER_BUILD_TESTING=OFF \
+        -DENABLE_OPENCL_LAYERS=OFF \
+        -DENABLE_OPENCL_LAYERINFO=OFF
+      ;;
+
+    libsnappy)
+      build_cmake libsnappy \
+        -DSNAPPY_BUILD_TESTS=OFF \
+        -DSNAPPY_BUILD_BENCHMARKS=OFF \
+        -DSNAPPY_FUZZING_BUILD=OFF \
+        -DSNAPPY_INSTALL=ON
+      ;;
+
+    libtheora)
+      build_autotools libtheora \
+        --disable-examples \
+        --disable-doc \
+        --disable-spec
+      ;;
+
+    libspeex)
+      build_autotools libspeex \
+        --disable-binaries \
+        --disable-examples
+      ;;
+
+    libtwolame)
+      build_autotools libtwolame \
+        --disable-sndfile
+      ;;
+
+    libmysofa)
+      build_cmake libmysofa \
+        -DBUILD_TESTS=OFF \
+        -DBUILD_SHARED_LIBS=OFF \
+        -DBUILD_STATIC_LIBS=ON \
+        -DZLIB_ROOT="$PREFIX" \
+        -DZLIB_LIBRARY="$PREFIX/lib/libz.a" \
+        -DZLIB_INCLUDE_DIR="$PREFIX/include"
+      ;;
+
+    libopenmpt)
+      local openmpt_stage
+      openmpt_stage="$(stage_src "libopenmpt")"
+      pushd "$openmpt_stage" >/dev/null
+      make clean CONFIG=mingw-w64 WINDOWS_ARCH=amd64 WINDOWS_CRT=ucrt MINGW_COMPILER=clang 2>/dev/null || true
+      local openmpt_args=(
+        CONFIG=mingw-w64 WINDOWS_ARCH=amd64 WINDOWS_CRT=ucrt MINGW_COMPILER=clang
+        CC="$CC" CXX="$CXX" LD="$CXX" AR="$AR" PKG_CONFIG="$PKG_CONFIG"
+        OVERWRITE_CFLAGS="$CFLAGS" OVERWRITE_CXXFLAGS="$CXXFLAGS"
+        CXXSTDLIB_PCLIBSPRIVATE=-lc++
+        DYNLINK=0 SHARED_LIB=0 STATIC_LIB=1 EXAMPLES=0 OPENMPT123=0 TEST=0
+        OPTIMIZE=none OPTIMIZE_LTO=0
+        NO_ZLIB=1 NO_MPG123=1 NO_OGG=1 NO_VORBIS=1 NO_VORBISFILE=1
+      )
+      make -j"$JOBS" "${openmpt_args[@]}"
+      make install PREFIX="$PREFIX" "${openmpt_args[@]}"
+      popd >/dev/null
+      ;;
+
+    libdvdread)
+      build_meson libdvdread \
+        -Denable_docs=false \
+        -Dlibdvdcss=disabled \
+        -Ddlfcn=builtin
+      ;;
+
+    libdvdnav)
+      build_meson libdvdnav \
+        -Denable_docs=false \
+        -Denable_examples=false
+      ;;
+
+    chromaprint)
+      build_cmake chromaprint \
+        -DBUILD_TOOLS=OFF \
+        -DBUILD_TESTS=OFF \
+        -DUSE_INTERNAL_AVRESAMPLE=ON \
+        -DFFT_LIB=kissfft
+      ;;
+
+    libzmq)
+      build_cmake libzmq \
+        -DZMQ_WIN32_WINNT=0x0A00 \
+        -DZMQ_HAVE_IPC=OFF \
+        -DBUILD_SHARED=OFF \
+        -DBUILD_STATIC=ON \
+        -DBUILD_TESTS=OFF \
+        -DWITH_DOCS=OFF \
+        -DWITH_PERF_TOOL=OFF \
+        -DENABLE_DRAFTS=OFF \
+        -DENABLE_WS=OFF \
+        -DWITH_LIBSODIUM=OFF \
+        -DENABLE_CURVE=OFF \
+        -DWITH_OPENPGM=OFF \
+        -DWITH_NORM=OFF \
+        -DWITH_VMCI=OFF \
+        -DENABLE_CPACK=OFF
+      ;;
+
+    libzvbi)
+      build_autotools libzvbi \
+        --disable-tests \
+        --disable-examples \
+        --disable-nls \
+        --with-libiconv-prefix="$PREFIX" \
+        --without-x
+      ;;
+
+    libgsm)
+      local gsm_stage gsm_bld gsm_src obj
+      gsm_stage="$(stage_src "libgsm")"
+      gsm_bld="$BUILDROOT/libgsm"
+      rm -rf "$gsm_bld"
+      mkdir -p "$gsm_bld" "$PREFIX/include/gsm" "$PREFIX/lib"
+      local gsm_sources=(
+        add code debug decode long_term lpc preprocess rpe gsm_destroy gsm_decode
+        gsm_encode gsm_explode gsm_implode gsm_create gsm_print gsm_option short_term table
+      )
+      local gsm_objects=()
+      for gsm_src in "${gsm_sources[@]}"; do
+        obj="$gsm_bld/$gsm_src.o"
+        "$CC" $CFLAGS -DSASR -DWAV49 -DNeedFunctionPrototypes=1 \
+          -I"$gsm_stage/inc" -c "$gsm_stage/src/$gsm_src.c" -o "$obj"
+        gsm_objects+=("$obj")
+      done
+      "$AR" rcs "$PREFIX/lib/libgsm.a" "${gsm_objects[@]}"
+      "$RANLIB" "$PREFIX/lib/libgsm.a"
+      cp -f "$gsm_stage/inc/gsm.h" "$PREFIX/include/gsm.h"
+      cp -f "$gsm_stage/inc/gsm.h" "$PREFIX/include/gsm/gsm.h"
+      ;;
+
+    opencore-amr)
+      build_autotools opencore-amr \
+        --disable-examples
+      ;;
+
+    vo-amrwbenc)
+      build_autotools vo-amrwbenc
       ;;
 
     libsrt)
@@ -1361,6 +2368,7 @@ EOF
         --prefix "$PREFIX" \
         --buildtype release \
         --default-library=static \
+        -Dhave_mingw_pthreads=true \
         -Dbuilt_tools=false \
         -Dtest=false
       meson compile -C "$bld" -j "$JOBS"
@@ -1460,8 +2468,15 @@ EOF
       local stage
       stage="$(stage_src "libshaderc")"
       pushd "$stage" >/dev/null
-      if [ ! -d third_party/glslang ]; then
-        python3 utils/git-sync-deps
+      if [[ ! -d third_party/glslang || ! -d third_party/spirv-tools/external/spirv-headers ]]; then
+        # ponytail: GitHub is flaky here; retry the official sync instead of vendoring deps in this script.
+        for i in 1 2 3 4 5; do
+          python3 utils/git-sync-deps && break
+          rm -rf third_party/spirv-headers third_party/spirv-tools/external/spirv-headers third_party/googletest
+          echo "shaderc deps sync failed, retry $i/5..."
+          sleep 10
+          [[ "$i" != "5" ]] || exit 1
+        done
       fi
       popd >/dev/null
 
@@ -1489,8 +2504,32 @@ EOF
     vulkan-headers)
       local stage
       stage="$(stage_src "vulkan-headers")"
-      mkdir -p "$PREFIX/include"
+      local vk_version
+      vk_version="$(git -C "$stage" describe --tags --always 2>/dev/null | sed 's/^v//' | sed 's/-.*//')"
+      mkdir -p "$PREFIX/include" "$PREFIX/lib" "$PREFIX/lib/pkgconfig"
       cp -rf "$stage/include/"* "$PREFIX/include/"
+
+      # ponytail: enough for MinGW to link Windows' system Vulkan loader (vulkan-1.dll); build full Vulkan-Loader only if this import lib stops working.
+      cat > "$PREFIX/lib/vulkan-1.def" <<EOF
+LIBRARY vulkan-1.dll
+EXPORTS
+vkGetInstanceProcAddr
+EOF
+      "$DLLTOOL" -d "$PREFIX/lib/vulkan-1.def" -l "$PREFIX/lib/libvulkan-1.dll.a" -D vulkan-1.dll
+      cp -f "$PREFIX/lib/libvulkan-1.dll.a" "$PREFIX/lib/libvulkan.dll.a"
+
+      cat > "$PREFIX/lib/pkgconfig/vulkan.pc" <<EOF
+prefix=$PREFIX
+exec_prefix=\${prefix}
+libdir=\${exec_prefix}/lib
+includedir=\${prefix}/include
+
+Name: Vulkan-Loader
+Description: Windows Vulkan loader import library
+Version: $vk_version
+Libs: -L\${libdir} -lvulkan-1
+Cflags: -I\${includedir}
+EOF
       ;;
 
     libplacebo)
@@ -1511,10 +2550,14 @@ EOF
         -Dlcms=enabled
       meson compile -C "$bld" -j "$JOBS"
       meson install -C "$bld"
+      grep -q '^pl_has_vk_proc_addr=1' "$PREFIX/lib/pkgconfig/libplacebo.pc" || {
+        echo "libplacebo 未链接 Windows Vulkan loader 的 vkGetInstanceProcAddr"
+        exit 1
+      }
       ;;
 
     opus)
-      build_autotools opus
+      build_autotools opus --disable-extra-programs --disable-deep-plc --disable-dred --disable-osce
       ;;
 
     zimg)
@@ -1729,103 +2772,6 @@ EOF
       cp -f "$PREFIX/lib/pkgconfig/vapoursynth.pc" "$PREFIX/lib/pkgconfig/VapourSynth.pc"
       ;;
 
-    VapourSynth-BM3DCUDA)
-      local vs_stage
-      vs_stage="$(stage_src "VapourSynth-BM3DCUDA")"
-      local bld="$BUILDROOT/VapourSynth-BM3DCUDA"
-      rm -rf "$bld"
-      mkdir -p "$bld"
-      mkdir -p "$PREFIX/bin"  # 确保 bin 文件夹存在
-      pushd "$bld" >/dev/null
-
-      echo "==> Generating CUDA/NVRTC stub import libraries"
-      cat > cuda.def <<'EOF'
-LIBRARY nvcuda
-EXPORTS
-cuInit
-cuDeviceGet
-cuDeviceGetCount
-cuDeviceGetAttribute
-cuDevicePrimaryCtxRetain
-cuDevicePrimaryCtxRelease
-cuDevicePrimaryCtxRelease_v2
-cuCtxPushCurrent
-cuCtxPushCurrent_v2
-cuCtxPopCurrent
-cuCtxPopCurrent_v2
-cuMemAlloc
-cuMemAlloc_v2
-cuMemAllocPitch
-cuMemAllocPitch_v2
-cuMemAllocHost
-cuMemAllocHost_v2
-cuMemFree
-cuMemFree_v2
-cuMemFreeHost
-cuModuleLoadData
-cuModuleUnload
-cuModuleGetFunction
-cuStreamCreate
-cuStreamDestroy
-cuStreamDestroy_v2
-cuStreamSynchronize
-cuGetErrorString
-cuGraphCreate
-cuGraphDestroy
-cuGraphAddKernelNode
-cuGraphAddKernelNode_v2
-cuGraphAddMemcpyNode
-cuGraphAddMemsetNode
-cuGraphInstantiate
-cuGraphInstantiateWithFlags
-cuGraphLaunch
-cuGraphExecDestroy
-EOF
-      "$TARGET-dlltool" -d cuda.def -l libcuda.a
-
-      cat > nvrtc.def <<'EOF'
-LIBRARY nvrtc
-EXPORTS
-nvrtcCompileProgram
-nvrtcCreateProgram
-nvrtcDestroyProgram
-nvrtcGetCUBIN
-nvrtcGetCUBINSize
-nvrtcGetErrorString
-nvrtcGetNumSupportedArchs
-nvrtcGetProgramLog
-nvrtcGetProgramLogSize
-nvrtcGetPTX
-nvrtcGetPTXSize
-nvrtcGetSupportedArchs
-EOF
-      "$TARGET-dlltool" -d nvrtc.def -l libnvrtc.a
-
-      echo "==> Compiling VapourSynth-BM3DCPU"
-      "$CXX" -shared -O3 -std=c++20 -static-libgcc -static-libstdc++ -Wl,-Bstatic -lwinpthread -Wl,-Bdynamic $CXXFLAGS \
-        -I"$PREFIX/include" \
-        "$vs_stage/cpu_source/source.cpp" \
-        -o "$PREFIX/bin/bm3dcpu.dll"
-
-      if [[ "$CUDA_ENABLE" == "1" ]]; then
-        setup_cuda
-        echo "==> Compiling VapourSynth-BM3DCUDA_RTC"
-        "$CXX" -shared -O3 -std=c++20 -static-libgcc -static-libstdc++ -Wl,-Bstatic -lwinpthread -Wl,-Bdynamic $CXXFLAGS \
-          -I"$PREFIX/include" -I"$CUDA_HOME/include" -I"$CUDA_HOME/targets/x86_64-linux/include" \
-          "$vs_stage/rtc_source/source.cpp" \
-          -L. -lcuda -lnvrtc -lws2_32 \
-          -o "$PREFIX/bin/bm3dcuda_rtc.dll"
-      fi
-
-      popd >/dev/null
-
-      mkdir -p "$PREFIX/bin/plugins"
-      cp -f "$PREFIX/bin/bm3dcpu.dll" "$PREFIX/bin/plugins/" 2>/dev/null || true
-      if [[ "$CUDA_ENABLE" == "1" ]]; then
-        cp -f "$PREFIX/bin/bm3dcuda_rtc.dll" "$PREFIX/bin/plugins/" 2>/dev/null || true
-      fi
-      ;;
-
     x264)
       local stage
       stage="$(stage_src "x264")"
@@ -2006,14 +2952,69 @@ EOF
         sed -i "s|$PREFIX/lib/libmbedcrypto.a|-lmbedcrypto|g" "$PREFIX/lib/pkgconfig/srt.pc" 2>/dev/null || true
         sed -i "s|$PREFIX/lib/libmbedx509.a|-lmbedx509|g" "$PREFIX/lib/pkgconfig/srt.pc" 2>/dev/null || true
       fi
+      # ponytail: some CMake projects write "-l-lpthread" into .pc under llvm-mingw; normalize before FFmpeg checks.
+      sed -i 's/-l-lpthread/-lpthread/g; s/-l-pthread/-lpthread/g' "$PREFIX/lib/pkgconfig/"*.pc 2>/dev/null || true
+
       if [[ -f "$PREFIX/lib/pkgconfig/haisrt.pc" ]]; then
         sed -i "s|$PREFIX/lib/libmbedtls.a|-lmbedtls|g" "$PREFIX/lib/pkgconfig/haisrt.pc" 2>/dev/null || true
         sed -i "s|$PREFIX/lib/libmbedcrypto.a|-lmbedcrypto|g" "$PREFIX/lib/pkgconfig/haisrt.pc" 2>/dev/null || true
         sed -i "s|$PREFIX/lib/libmbedx509.a|-lmbedx509|g" "$PREFIX/lib/pkgconfig/haisrt.pc" 2>/dev/null || true
       fi
 
+      # OpenCL CMake installs its header metadata and MinGW archive under names
+      # that pkg-config/-lOpenCL do not search in this static cross build.
+      if [[ -f "$PREFIX/share/pkgconfig/OpenCL-Headers.pc" ]]; then
+        install -m 644 "$PREFIX/share/pkgconfig/OpenCL-Headers.pc" "$PREFIX/lib/pkgconfig/OpenCL-Headers.pc"
+      fi
+      if [[ -f "$PREFIX/lib/OpenCL.a" && ! -e "$PREFIX/lib/libOpenCL.a" ]]; then
+        ln -s OpenCL.a "$PREFIX/lib/libOpenCL.a"
+      fi
+      if [[ -f "$PREFIX/lib/pkgconfig/OpenCL.pc" ]]; then
+        if grep -q '^Libs\.private:' "$PREFIX/lib/pkgconfig/OpenCL.pc"; then
+          sed -i 's/^Libs\.private:.*/Libs.private: -lcfgmgr32 -lruntimeobject -lole32/' "$PREFIX/lib/pkgconfig/OpenCL.pc"
+        else
+          printf '%s\n' 'Libs.private: -lcfgmgr32 -lruntimeobject -lole32' >> "$PREFIX/lib/pkgconfig/OpenCL.pc"
+        fi
+      fi
+      if [[ -f "$PREFIX/lib/pkgconfig/libchromaprint.pc" ]] &&
+         ! grep -q 'CHROMAPRINT_NODLL' "$PREFIX/lib/pkgconfig/libchromaprint.pc"; then
+        sed -i '/^Cflags:/ s/$/ -DCHROMAPRINT_NODLL/' "$PREFIX/lib/pkgconfig/libchromaprint.pc"
+      fi
+
+      # libssh 0.12 omits its static CMake interface from libssh.pc. Without
+      # these flags its headers request dllimport symbols and FFmpeg's probe
+      # cannot link libssh.a. Mbed TLS also omits its Windows RNG dependency.
+      if [[ -f "$PREFIX/lib/pkgconfig/mbedcrypto.pc" ]]; then
+        if grep -q '^Libs\.private:' "$PREFIX/lib/pkgconfig/mbedcrypto.pc"; then
+          sed -i 's/^Libs\.private:.*/Libs.private: -lbcrypt/' "$PREFIX/lib/pkgconfig/mbedcrypto.pc"
+        else
+          printf '%s\n' 'Libs.private: -lbcrypt' >> "$PREFIX/lib/pkgconfig/mbedcrypto.pc"
+        fi
+      fi
+      if [[ -f "$PREFIX/lib/pkgconfig/libssh.pc" ]]; then
+        grep -q 'LIBSSH_STATIC' "$PREFIX/lib/pkgconfig/libssh.pc" ||
+          sed -i '/^Cflags:/ s/$/ -DLIBSSH_STATIC/' "$PREFIX/lib/pkgconfig/libssh.pc"
+        sed -i 's/^Requires\.private:.*/Requires.private: mbedcrypto zlib/' "$PREFIX/lib/pkgconfig/libssh.pc"
+        if grep -q '^Libs\.private:' "$PREFIX/lib/pkgconfig/libssh.pc"; then
+          sed -i 's/^Libs\.private:.*/Libs.private: -lpthread -liphlpapi -lws2_32 -Wl,--enable-stdcall-fixup/' "$PREFIX/lib/pkgconfig/libssh.pc"
+        else
+          printf '%s\n' 'Libs.private: -lpthread -liphlpapi -lws2_32 -Wl,--enable-stdcall-fixup' >> "$PREFIX/lib/pkgconfig/libssh.pc"
+        fi
+      fi
+      if [[ -f "$PREFIX/lib/pkgconfig/libzmq.pc" ]]; then
+        grep -q 'ZMQ_STATIC' "$PREFIX/lib/pkgconfig/libzmq.pc" ||
+          sed -i '/^Cflags:/ s/$/ -DZMQ_STATIC/' "$PREFIX/lib/pkgconfig/libzmq.pc"
+        if grep -q '^Libs\.private:' "$PREFIX/lib/pkgconfig/libzmq.pc"; then
+          sed -i 's/^Libs\.private:.*/Libs.private: -lstdc++ -lpthread -lws2_32 -lrpcrt4 -liphlpapi/' "$PREFIX/lib/pkgconfig/libzmq.pc"
+        else
+          printf '%s\n' 'Libs.private: -lstdc++ -lpthread -lws2_32 -lrpcrt4 -liphlpapi' >> "$PREFIX/lib/pkgconfig/libzmq.pc"
+        fi
+      fi
+
       local ff_stage
       ff_stage="$(stage_src "ffmpeg-source")"
+      patch_ffmpeg_libplacebo_vulkan_import "$ff_stage"
+      patch_ffmpeg_cxx_runtime "$ff_stage"
       pushd "$ff_stage" >/dev/null
       rm -f config.h config.mak config.log
 
@@ -2058,6 +3059,10 @@ EOF
         echo "缺少 soxr，请先编译 libsoxr 阶段"
         exit 1
       }
+      PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" "$PKG_CONFIG" --exists fdk-aac || {
+        echo "缺少 fdk-aac，请先编译 fdk-aac 阶段"
+        exit 1
+      }
       PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" "$PKG_CONFIG" --exists aom || {
         echo "缺少 aom，请先编译 libaom 阶段"
         exit 1
@@ -2098,12 +3103,37 @@ EOF
         echo "缺少 vidstab，请先编译 libvidstab 阶段"
         exit 1
       }
+      PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" "$PKG_CONFIG" --exists vulkan || {
+        echo "缺少 vulkan.pc，请先编译 vulkan-headers 阶段"
+        exit 1
+      }
       PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" "$PKG_CONFIG" --exists shaderc || {
         echo "缺少 shaderc，请先编译 libshaderc 阶段"
         exit 1
       }
       PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" "$PKG_CONFIG" --exists libplacebo || {
         echo "缺少 libplacebo，请先编译 libplacebo 阶段"
+        exit 1
+      }
+      local required_pc
+      for required_pc in \
+        libssh OpenCL theoraenc speex libmysofa libopenmpt dvdread dvdnav \
+        libchromaprint libzmq zvbi-0.2 opencore-amrnb opencore-amrwb vo-amrwbenc; do
+        PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" "$PKG_CONFIG" --exists "$required_pc" || {
+          echo "缺少 pkg-config 依赖: $required_pc"
+          exit 1
+        }
+      done
+      [[ -f "$PREFIX/lib/libsnappy.a" || -f "$PREFIX/lib/libsnappy_static.a" ]] || {
+        echo "缺少静态 libsnappy"
+        exit 1
+      }
+      [[ -f "$PREFIX/lib/libtwolame.a" && -f "$PREFIX/lib/libgsm.a" ]] || {
+        echo "缺少静态 twolame/gsm"
+        exit 1
+      }
+      [[ -f "$PREFIX/lib/libiconv.a" ]] || {
+        echo "缺少静态 libiconv"
         exit 1
       }
       [[ -f "$PREFIX/include/AMF/core/Version.h" ]] || {
@@ -2115,9 +3145,13 @@ EOF
         exit 1
       }
 
-      local extra_cflags="-I$PREFIX/include"
+      local extra_cflags="-I$PREFIX/include -DLIBTWOLAME_STATIC"
       local extra_ldflags="-L$PREFIX/lib -Wl,--allow-multiple-definition $LDFLAGS"
-      local extra_libs="-lstdc++ -lgcc"
+      local extra_libs="$TOOLCHAIN_EXTRA_LIBS -lvulkan-1"
+      if [[ "$TOOLCHAIN_FLAVOR" == "llvm-mingw" ]]; then
+        # ponytail: librist uses mingw clock_gettime inline, which resolves to winpthread clock_gettime64.
+        extra_libs+=" -lpthread"
+      fi
       local cuda_flags=()
 
       if [[ "$CUDA_ENABLE" == "1" ]]; then
@@ -2197,13 +3231,15 @@ EOF
         --enable-libvvenc \
         --enable-schannel \
         --enable-d3d11va \
-        --disable-d3d12va \
+        --enable-d3d12va \
         --enable-mediafoundation \
         --enable-amf \
         --enable-avisynth \
         --enable-dxva2 \
         --enable-vulkan \
-        --disable-opencl \
+        --enable-vulkan-static \
+        --enable-opencl \
+        --enable-opengl \
         --enable-libplacebo \
         --enable-libshaderc \
         --enable-zlib \
@@ -2213,6 +3249,7 @@ EOF
         --enable-libmp3lame \
         --enable-libvorbis \
         --enable-libsoxr \
+        --enable-libfdk-aac \
         --enable-libaom \
         --enable-libvpx \
         --enable-libopenjpeg \
@@ -2223,6 +3260,23 @@ EOF
         --enable-lcms2 \
         --enable-librubberband \
         --enable-libvidstab \
+        --enable-libssh \
+        --enable-libsnappy \
+        --enable-libtheora \
+        --enable-libspeex \
+        --enable-libtwolame \
+        --enable-libmysofa \
+        --enable-libopenmpt \
+        --enable-libdvdread \
+        --enable-libdvdnav \
+        --enable-chromaprint \
+        --enable-libzmq \
+        --enable-libzvbi \
+        --enable-libgsm \
+        --enable-libopencore-amrnb \
+        --enable-libopencore-amrwb \
+        --enable-libvo-amrwbenc \
+        --enable-iconv \
         "${lto_flags[@]}" \
         "${cuda_flags[@]}" \
         "${vs_flags[@]}" \
@@ -2238,11 +3292,12 @@ EOF
         --enable-encoder=libvvenc \
         --enable-encoder=libmp3lame \
         --enable-encoder=libvorbis \
-        --enable-encoder=libaom \
+        --enable-encoder=libfdk_aac \
         --enable-encoder=libvpx_vp8 \
         --enable-encoder=libvpx_vp9 \
         --enable-encoder=aac
 
+      verify_full_ffmpeg_config ffbuild/config.mak "$ff_stage"
       make -j"$FFMPEG_JOBS"
       make install
       popd >/dev/null
@@ -2253,48 +3308,17 @@ EOF
       "$STRIP" "$PREFIX/bin/ffplay.exe" || true
       "$STRIP" "$PREFIX/bin/"*.dll 2>/dev/null || true
       
-      # 仅拷贝到 full 目录与安装前缀 bin 目录中，不污染根目录，不需要别名
+      # 仅拷贝 FFmpeg 程序和运行时 DLL。
       mkdir -p "$ROOT/full"
+      find "$ROOT/full" -maxdepth 1 -type f \( -iname "*.exe" -o -iname "*.dll" \) -delete
+      rm -rf "$ROOT/full/plugins"
       cp -f "$PREFIX/bin/ffmpeg.exe" "$ROOT/full/ffmpeg.exe"
       cp -f "$PREFIX/bin/ffprobe.exe" "$ROOT/full/ffprobe.exe" 2>/dev/null || true
       cp -f "$PREFIX/bin/ffplay.exe" "$ROOT/full/ffplay.exe" 2>/dev/null || true
-      cp -f "$PREFIX/bin/"*.dll "$ROOT/full/" 2>/dev/null || true
+      find "$PREFIX/bin" -maxdepth 1 -type f -iname "*.dll" -exec cp -f {} "$ROOT/full/" \;
 
-      # 拷贝编译器必要的 runtime DLLs 至 full 目录与前缀目录中，确保独立运行
-      local winpthread_dll gcc_dll stdc_dll gomp_dll
-      winpthread_dll="$("$CC" -print-file-name=libwinpthread-1.dll)"
-      if [[ -f "$winpthread_dll" ]]; then
-        cp -f "$winpthread_dll" "$ROOT/full/"
-        cp -f "$winpthread_dll" "$PREFIX/bin/"
-        "$STRIP" "$ROOT/full/libwinpthread-1.dll" 2>/dev/null || true
-        "$STRIP" "$PREFIX/bin/libwinpthread-1.dll" 2>/dev/null || true
-      fi
-
-      gcc_dll="$("$CC" -print-file-name=libgcc_s_seh-1.dll)"
-      if [[ -f "$gcc_dll" ]]; then
-        cp -f "$gcc_dll" "$ROOT/full/"
-        cp -f "$gcc_dll" "$PREFIX/bin/"
-        "$STRIP" "$ROOT/full/libgcc_s_seh-1.dll" 2>/dev/null || true
-        "$STRIP" "$PREFIX/bin/libgcc_s_seh-1.dll" 2>/dev/null || true
-      fi
-
-      stdc_dll="$("$CXX" -print-file-name=libstdc++-6.dll)"
-      if [[ -f "$stdc_dll" ]]; then
-        cp -f "$stdc_dll" "$ROOT/full/"
-        cp -f "$stdc_dll" "$PREFIX/bin/"
-        "$STRIP" "$ROOT/full/libstdc++-6.dll" 2>/dev/null || true
-        "$STRIP" "$PREFIX/bin/libstdc++-6.dll" 2>/dev/null || true
-      fi
-
-      gomp_dll="$("$CC" -print-file-name=libgomp-1.dll)"
-      if [[ -f "$gomp_dll" ]]; then
-        cp -f "$gomp_dll" "$ROOT/full/"
-        cp -f "$gomp_dll" "$PREFIX/bin/"
-        "$STRIP" "$ROOT/full/libgomp-1.dll" 2>/dev/null || true
-        "$STRIP" "$PREFIX/bin/libgomp-1.dll" 2>/dev/null || true
-      fi
-      
-      # 运行时已静态链接，无需拷贝 GCC 运行时 DLL
+      # 递归补齐非系统 DLL 依赖，覆盖 Clang/GCC 运行时和第三方 DLL。
+      copy_runtime_dll_closure
       ;;
 
     *)
@@ -2429,6 +3453,14 @@ show_help() {
   build --only [stages...]  仅编译指定的一个或多个库（用空格或逗号分隔，不构建后续依赖，且仅校验对应源码）
   clean           清理编译缓存和旧的编译产物，并删除 patch 临时包与 _bundle/ 目录
 
+工具链:
+  默认 TOOLCHAIN_FLAVOR=llvm-mingw：下载 llvm-mingw 最新 release，使用最新版 Clang/LLVM + UCRT
+  全局安装目录：${GLOBAL_TOOLCHAIN_ROOT:-/usr/local}；可执行文件在 /usr/local/bin
+  同步安装最新稳定版 CMake / Ninja / Meson / NASM；apt 只安装 bootstrap 依赖
+  可选 GCC：TOOLCHAIN_FLAVOR=system 使用 apt win32；TOOLCHAIN_FLAVOR=xpack-mingw64-gcc 使用 xPack GCC
+  跳过 CUDA Toolkit：CUDA_TOOLKIT_ENABLE=0 ./ffmpeg.sh tool
+
+
 常见示例:
   $0 all
   $0 tool
@@ -2453,7 +3485,7 @@ case "$cmd" in
     run_tool
     ;;
   update)
-    run_update
+    run_update "${1:-}"
     ;;
   build)
     only_stages=()

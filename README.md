@@ -1,2 +1,27 @@
 # ffmpeg-full
-一个全功能ffmpeg，采用动态连接方式减小总体积
+
+面向 Windows x64 的全功能 FFmpeg 构建脚本。产物使用动态链接，由 `ffmpeg.exe`、`ffprobe.exe`、`ffplay.exe` 和配套 DLL 组成。
+
+## 主要功能
+
+- 基于 FFmpeg master，在 Linux/WSL 中交叉编译。
+- 支持常用软编解码器、NVENC/NVDEC、Intel QSV、AMF、Vulkan、OpenCL、字幕和质量评估等功能。
+- 支持 VapourSynth 输入；BM3D CUDA 不随压缩包分发，请按 [BM3D CUDA Wiki](https://github.com/Dominic485649/ffmpeg-nvenc-lite/wiki/BM3D%E2%80%90CUDA%E2%80%90%E9%99%8D%E5%99%AA%E6%95%99%E7%A8%8B) 安装 Python 插件。
+- 默认针对 x86-64-v3 处理器优化。
+
+## 构建
+
+```bash
+chmod +x ffmpeg.sh
+./ffmpeg.sh          # 安装/更新工具，更新源码并完整编译
+./ffmpeg.sh update   # 只更新源码
+./ffmpeg.sh build    # 使用现有源码编译
+```
+
+产物位于 `full/`，发布包为 `ffmpeg-full.7z`。
+
+## FFmpegFreeUI 预设
+
+Release 中的 JSON 是 [FFmpegFreeUI](https://github.com/Lake1059/FFmpegFreeUI) v6 预设，放入 `Preset_v6\User` 后读取。NVENC 专用版见 [ffmpeg-nvenc-lite](https://github.com/Dominic485649/ffmpeg-nvenc-lite)，QSV 专用版见 [ffmpeg-qsv-lite](https://github.com/Dominic485649/ffmpeg-qsv-lite)。
+
+> 构建启用了 nonfree 组件，FFmpeg 会将二进制标记为 `nonfree and unredistributable`。请自行确认使用与再分发合规性。
