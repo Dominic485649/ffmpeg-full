@@ -1758,12 +1758,20 @@ verify_full_ffmpeg_config() {
     CONFIG_LIBMYSOFA CONFIG_LIBOPENMPT CONFIG_LIBDVDREAD CONFIG_LIBDVDNAV
     CONFIG_CHROMAPRINT CONFIG_LIBZMQ CONFIG_LIBZVBI CONFIG_LIBGSM
     CONFIG_LIBOPENCORE_AMRNB CONFIG_LIBOPENCORE_AMRWB CONFIG_LIBVO_AMRWBENC
-    CONFIG_ICONV CONFIG_LIBPLACEBO_FILTER CONFIG_VULKAN CONFIG_LIBSHADERC
+    CONFIG_ICONV CONFIG_LIBPLACEBO_FILTER CONFIG_VULKAN
     CONFIG_LIBVPL CONFIG_AV1_QSV_ENCODER CONFIG_HEVC_QSV_ENCODER
     CONFIG_VAPOURSYNTH_DEMUXER
   )
   if [[ "$CUDA_ENABLE" == "1" ]]; then
-    required+=(CONFIG_CUDA_NVCC CONFIG_AV1_NVENC_ENCODER CONFIG_HEVC_NVENC_ENCODER CONFIG_SCALE_CUDA_FILTER)
+    required+=(
+      CONFIG_CUDA_NVCC CONFIG_CUVID CONFIG_AV1_NVENC_ENCODER
+      CONFIG_HEVC_NVENC_ENCODER CONFIG_SCALE_CUDA_FILTER
+      CONFIG_AV1_CUVID_DECODER CONFIG_H264_CUVID_DECODER
+      CONFIG_HEVC_CUVID_DECODER CONFIG_MJPEG_CUVID_DECODER
+      CONFIG_MPEG1_CUVID_DECODER CONFIG_MPEG2_CUVID_DECODER
+      CONFIG_MPEG4_CUVID_DECODER CONFIG_VC1_CUVID_DECODER
+      CONFIG_VP8_CUVID_DECODER CONFIG_VP9_CUVID_DECODER
+    )
   fi
   for key in "${required[@]}"; do
     grep -q "^$key=yes$" "$cfg" || { echo "FFmpeg required feature disabled: $key"; exit 1; }
@@ -1959,11 +1967,6 @@ EOF
         -DCMAKE_POLICY_VERSION_MINIMUM=3.5
       cmake --build "$bld" --parallel "$JOBS"
       cmake --install "$bld"
-      [[ -f "$stage/third_party/spirv-headers/include/spirv/unified1/spirv.h" ]] || {
-        echo "shaderc 缺少 SPIR-V Headers"
-        exit 1
-      }
-      cp -rf "$stage/third_party/spirv-headers/include/spirv" "$PREFIX/include/"
       ;;
 
 
@@ -2479,6 +2482,12 @@ EOF
         done
       fi
       popd >/dev/null
+
+      [[ -f "$stage/third_party/spirv-headers/include/spirv/unified1/spirv.h" ]] || {
+        echo "shaderc 缺少 SPIR-V Headers"
+        exit 1
+      }
+      cp -rf "$stage/third_party/spirv-headers/include/spirv" "$PREFIX/include/"
 
       local bld="$BUILDROOT/libshaderc"
       rm -rf "$bld"
@@ -3211,6 +3220,7 @@ EOF
         --enable-ffprobe \
         --enable-ffmpeg \
         --enable-ffnvcodec \
+        --enable-cuvid \
         --enable-nvenc \
         --enable-nvdec \
         --enable-libopus \
@@ -3241,7 +3251,6 @@ EOF
         --enable-opencl \
         --enable-opengl \
         --enable-libplacebo \
-        --enable-libshaderc \
         --enable-zlib \
         --enable-bzlib \
         --enable-lzma \
