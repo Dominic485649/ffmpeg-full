@@ -1754,39 +1754,6 @@ patch_ffmpeg_encoder_params() {
   local ff_stage="$1"
   echo "== Patch FFmpeg encoder parameter handling =="
   git -C "$ff_stage" apply --whitespace=nowarn <<'PATCH'
-diff --git a/libavcodec/libaomenc.c b/libavcodec/libaomenc.c
---- a/libavcodec/libaomenc.c
-+++ b/libavcodec/libaomenc.c
-@@ -1530,4 +1530,12 @@
- #define VE AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_ENCODING_PARAM
-+#if defined(AOM_HAVE_TUNE_SSIMULACRA2)
-+#define FF_AOM_TUNE_MAX AOM_TUNE_SSIMULACRA2
-+#elif defined(AOM_HAVE_TUNE_IQ)
-+#define FF_AOM_TUNE_MAX AOM_TUNE_IQ
-+#else
-+#define FF_AOM_TUNE_MAX AOM_TUNE_SSIM
-+#endif
-+
- static const AVOption options[] = {
-     { "cpu-used",        "Quality/Speed ratio modifier",           OFFSET(cpu_used),        AV_OPT_TYPE_INT, {.i64 = 1}, 0, 8, VE},
-     { "auto-alt-ref",    "Enable use of alternate reference "
-@@ -1565,9 +1573,15 @@ static const AVOption options[] = {
-     { "good",            "Good quality",      0, AV_OPT_TYPE_CONST, {.i64 = 0 /* AOM_USAGE_GOOD_QUALITY */}, 0, 0, VE, .unit = "usage"},
-     { "realtime",        "Realtime encoding", 0, AV_OPT_TYPE_CONST, {.i64 = 1 /* AOM_USAGE_REALTIME */},     0, 0, VE, .unit = "usage"},
-     { "allintra",        "All Intra encoding", 0, AV_OPT_TYPE_CONST, {.i64 = 2 /* AOM_USAGE_ALL_INTRA */},    0, 0, VE, .unit = "usage"},
--    { "tune",            "The metric that the encoder tunes for. Automatically chosen by the encoder by default", OFFSET(tune), AV_OPT_TYPE_INT, {.i64 = -1}, -1, AOM_TUNE_SSIM, VE, .unit = "tune"},
-+    { "tune",            "The metric that the encoder tunes for. Automatically chosen by the encoder by default", OFFSET(tune), AV_OPT_TYPE_INT, {.i64 = -1}, -1, FF_AOM_TUNE_MAX, VE, .unit = "tune"},
-     { "psnr",            NULL,         0, AV_OPT_TYPE_CONST, {.i64 = AOM_TUNE_PSNR}, 0, 0, VE, .unit = "tune"},
-     { "ssim",            NULL,         0, AV_OPT_TYPE_CONST, {.i64 = AOM_TUNE_SSIM}, 0, 0, VE, .unit = "tune"},
-+#if defined(AOM_HAVE_TUNE_IQ)
-+    { "iq",              NULL,         0, AV_OPT_TYPE_CONST, {.i64 = AOM_TUNE_IQ}, 0, 0, VE, .unit = "tune"},
-+#endif
-+#if defined(AOM_HAVE_TUNE_SSIMULACRA2)
-+    { "ssimulacra2",     NULL,         0, AV_OPT_TYPE_CONST, {.i64 = AOM_TUNE_SSIMULACRA2}, 0, 0, VE, .unit = "tune"},
-+#endif
-     FF_AV1_PROFILE_OPTS
-     { "still-picture", "Encode in single frame mode (typically used for still AVIF images).", OFFSET(still_picture), AV_OPT_TYPE_BOOL, {.i64 = 0}, -1, 1, VE },
-     { "dolbyvision",     "Enable Dolby Vision RPU coding", OFFSET(dovi.enable), AV_OPT_TYPE_BOOL, {.i64 = FF_DOVI_AUTOMATIC }, -1, 1, VE, .unit = "dovi" },
 diff --git a/libavcodec/libsvtav1.c b/libavcodec/libsvtav1.c
 --- a/libavcodec/libsvtav1.c
 +++ b/libavcodec/libsvtav1.c
@@ -1916,7 +1883,6 @@ expect_encoder_param_rejected() {
 verify_encoder_params() {
   local ffmpeg="$1"
   echo "== Verify encoder parameter forwarding =="
-  encoder_smoke "$ffmpeg" -c:v libaom-av1 -b:v 0 -crf 30 -tune iq
   encoder_smoke "$ffmpeg" -c:v libaom-av1 -b:v 0 -crf 30 -aom-params tune=iq
   encoder_smoke "$ffmpeg" -c:v libsvtav1 -svtav1-params tune=0
   encoder_smoke "$ffmpeg" -c:v libx264 -x264-params keyint=1
