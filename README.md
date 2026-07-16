@@ -5,7 +5,8 @@
 ## 主要功能
 
 - 基于 FFmpeg master，在 Linux/WSL 中交叉编译。
-- 支持常用软编解码器、NVENC/NVDEC、Intel QSV、AMF、Vulkan、OpenCL、字幕和质量评估等功能。
+- 支持常用软编解码器、NVENC/NVDEC、Intel QSV、AMF、Vulkan、OpenCL、字幕和质量评估等功能；NVIDIA 硬解使用原生解码器配合 `-hwaccel cuda`，不构建旧的 `*_cuvid` 解码器。
+- 校验 libaom、SVT-AV1、x264、x265 和 VVenC 参数透传；未知参数会直接报错，避免警告后继续编码。
 - 支持 VapourSynth 输入；BM3D CUDA 不随压缩包分发，请按 [BM3D CUDA Wiki](https://github.com/Dominic485649/ffmpeg-nvenc-lite/wiki/BM3D%E2%80%90CUDA%E2%80%90%E9%99%8D%E5%99%AA%E6%95%99%E7%A8%8B) 安装 Python 插件。
 - 默认针对 x86-64-v3 处理器优化。
 

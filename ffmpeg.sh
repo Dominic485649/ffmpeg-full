@@ -1750,6 +1750,113 @@ patch_ffmpeg_cxx_runtime() {
   sed -i 's/-lstdc++/-lc++/g' "$ff_stage/configure"
 }
 
+patch_ffmpeg_encoder_params() {
+  local ff_stage="$1"
+  echo "== Patch FFmpeg encoder parameter handling =="
+  git -C "$ff_stage" apply --whitespace=nowarn <<'PATCH'
+diff --git a/libavcodec/libaomenc.c b/libavcodec/libaomenc.c
+--- a/libavcodec/libaomenc.c
++++ b/libavcodec/libaomenc.c
+@@ -1530,4 +1530,12 @@
+ #define VE AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_ENCODING_PARAM
++#if defined(AOM_HAVE_TUNE_SSIMULACRA2)
++#define FF_AOM_TUNE_MAX AOM_TUNE_SSIMULACRA2
++#elif defined(AOM_HAVE_TUNE_IQ)
++#define FF_AOM_TUNE_MAX AOM_TUNE_IQ
++#else
++#define FF_AOM_TUNE_MAX AOM_TUNE_SSIM
++#endif
++
+ static const AVOption options[] = {
+     { "cpu-used",        "Quality/Speed ratio modifier",           OFFSET(cpu_used),        AV_OPT_TYPE_INT, {.i64 = 1}, 0, 8, VE},
+     { "auto-alt-ref",    "Enable use of alternate reference "
+@@ -1565,9 +1573,15 @@ static const AVOption options[] = {
+     { "good",            "Good quality",      0, AV_OPT_TYPE_CONST, {.i64 = 0 /* AOM_USAGE_GOOD_QUALITY */}, 0, 0, VE, .unit = "usage"},
+     { "realtime",        "Realtime encoding", 0, AV_OPT_TYPE_CONST, {.i64 = 1 /* AOM_USAGE_REALTIME */},     0, 0, VE, .unit = "usage"},
+     { "allintra",        "All Intra encoding", 0, AV_OPT_TYPE_CONST, {.i64 = 2 /* AOM_USAGE_ALL_INTRA */},    0, 0, VE, .unit = "usage"},
+-    { "tune",            "The metric that the encoder tunes for. Automatically chosen by the encoder by default", OFFSET(tune), AV_OPT_TYPE_INT, {.i64 = -1}, -1, AOM_TUNE_SSIM, VE, .unit = "tune"},
++    { "tune",            "The metric that the encoder tunes for. Automatically chosen by the encoder by default", OFFSET(tune), AV_OPT_TYPE_INT, {.i64 = -1}, -1, FF_AOM_TUNE_MAX, VE, .unit = "tune"},
+     { "psnr",            NULL,         0, AV_OPT_TYPE_CONST, {.i64 = AOM_TUNE_PSNR}, 0, 0, VE, .unit = "tune"},
+     { "ssim",            NULL,         0, AV_OPT_TYPE_CONST, {.i64 = AOM_TUNE_SSIM}, 0, 0, VE, .unit = "tune"},
++#if defined(AOM_HAVE_TUNE_IQ)
++    { "iq",              NULL,         0, AV_OPT_TYPE_CONST, {.i64 = AOM_TUNE_IQ}, 0, 0, VE, .unit = "tune"},
++#endif
++#if defined(AOM_HAVE_TUNE_SSIMULACRA2)
++    { "ssimulacra2",     NULL,         0, AV_OPT_TYPE_CONST, {.i64 = AOM_TUNE_SSIMULACRA2}, 0, 0, VE, .unit = "tune"},
++#endif
+     FF_AV1_PROFILE_OPTS
+     { "still-picture", "Encode in single frame mode (typically used for still AVIF images).", OFFSET(still_picture), AV_OPT_TYPE_BOOL, {.i64 = 0}, -1, 1, VE },
+     { "dolbyvision",     "Enable Dolby Vision RPU coding", OFFSET(dovi.enable), AV_OPT_TYPE_BOOL, {.i64 = FF_DOVI_AUTOMATIC }, -1, 1, VE, .unit = "dovi" },
+diff --git a/libavcodec/libsvtav1.c b/libavcodec/libsvtav1.c
+--- a/libavcodec/libsvtav1.c
++++ b/libavcodec/libsvtav1.c
+@@ -348,19 +348,15 @@ static int config_enc_params(EbSvtAv1EncConfiguration *param,
+     while ((en = av_dict_iterate(svt_enc->svtav1_opts, en))) {
+         EbErrorType ret = svt_av1_enc_parse_parameter(param, en->key, en->value);
+         if (ret != EB_ErrorNone) {
+-            int level = (avctx->err_recognition & AV_EF_EXPLODE) ? AV_LOG_ERROR : AV_LOG_WARNING;
+-            av_log(avctx, level, "Error parsing option %s: %s.\n", en->key, en->value);
+-            if (avctx->err_recognition & AV_EF_EXPLODE)
+-                return AVERROR(EINVAL);
++            av_log(avctx, AV_LOG_ERROR, "Error parsing option %s: %s.\n", en->key, en->value);
++            return AVERROR(EINVAL);
+         }
+     }
+ #else
+     if (av_dict_count(svt_enc->svtav1_opts)) {
+-        int level = (avctx->err_recognition & AV_EF_EXPLODE) ? AV_LOG_ERROR : AV_LOG_WARNING;
+-        av_log(avctx, level, "svt-params needs libavcodec to be compiled with SVT-AV1 "
++        av_log(avctx, AV_LOG_ERROR, "svt-params needs libavcodec to be compiled with SVT-AV1 "
+                              "headers >= 0.9.1.\n");
+-        if (avctx->err_recognition & AV_EF_EXPLODE)
+-            return AVERROR(ENOSYS);
++        return AVERROR(ENOSYS);
+     }
+ #endif
+     if (avctx->flags & AV_CODEC_FLAG_PASS2) {
+diff --git a/libavcodec/libx264.c b/libavcodec/libx264.c
+--- a/libavcodec/libx264.c
++++ b/libavcodec/libx264.c
+@@ -1382,13 +1382,14 @@ static av_cold int X264_init(AVCodecContext *avctx)
+         const AVDictionaryEntry *en = NULL;
+         while (en = av_dict_iterate(x4->x264_params, en)) {
+            if ((ret = x264_param_parse(&x4->params, en->key, en->value)) < 0) {
+-               av_log(avctx, AV_LOG_WARNING,
++               av_log(avctx, AV_LOG_ERROR,
+                       "Error parsing option '%s = %s'.\n",
+                        en->key, en->value);
+ #if X264_BUILD >= 161
+                if (ret == X264_PARAM_ALLOC_FAILED)
+                    return AVERROR(ENOMEM);
+ #endif
++               return AVERROR(EINVAL);
+            }
+         }
+     }
+diff --git a/libavcodec/libx265.c b/libavcodec/libx265.c
+--- a/libavcodec/libx265.c
++++ b/libavcodec/libx265.c
+@@ -536,13 +536,13 @@ static av_cold int libx265_encode_init(AVCodecContext *avctx)
+             parse_ret = ctx->api->param_parse(ctx->params, en->key, en->value);
+             switch (parse_ret) {
+             case X265_PARAM_BAD_NAME:
+-                av_log(avctx, AV_LOG_WARNING,
++                av_log(avctx, AV_LOG_ERROR,
+                       "Unknown option: %s.\n", en->key);
+-                break;
++                return AVERROR(EINVAL);
+             case X265_PARAM_BAD_VALUE:
+-                av_log(avctx, AV_LOG_WARNING,
++                av_log(avctx, AV_LOG_ERROR,
+                       "Invalid value for %s: %s.\n", en->key, en->value);
+-                break;
++                return AVERROR(EINVAL);
+             default:
+                 break;
+             }
+PATCH
+}
+
 verify_full_ffmpeg_config() {
   local cfg="$1" ff_stage="$2" key
   local required=(
@@ -1760,26 +1867,67 @@ verify_full_ffmpeg_config() {
     CONFIG_LIBOPENCORE_AMRNB CONFIG_LIBOPENCORE_AMRWB CONFIG_LIBVO_AMRWBENC
     CONFIG_ICONV CONFIG_LIBPLACEBO_FILTER CONFIG_VULKAN
     CONFIG_LIBVPL CONFIG_AV1_QSV_ENCODER CONFIG_HEVC_QSV_ENCODER
+    CONFIG_LIBAOM_AV1_ENCODER CONFIG_LIBSVTAV1_ENCODER
+    CONFIG_LIBX264_ENCODER CONFIG_LIBX265_ENCODER CONFIG_LIBVVENC_ENCODER
+    HAVE_STRUCT_MFXCONFIGINTERFACE
     CONFIG_VAPOURSYNTH_DEMUXER
   )
   if [[ "$CUDA_ENABLE" == "1" ]]; then
     required+=(
-      CONFIG_CUDA_NVCC CONFIG_CUVID CONFIG_AV1_NVENC_ENCODER
+      CONFIG_CUDA_NVCC CONFIG_NVDEC CONFIG_AV1_NVENC_ENCODER
       CONFIG_HEVC_NVENC_ENCODER CONFIG_SCALE_CUDA_FILTER
-      CONFIG_AV1_CUVID_DECODER CONFIG_H264_CUVID_DECODER
-      CONFIG_HEVC_CUVID_DECODER CONFIG_MJPEG_CUVID_DECODER
-      CONFIG_MPEG1_CUVID_DECODER CONFIG_MPEG2_CUVID_DECODER
-      CONFIG_MPEG4_CUVID_DECODER CONFIG_VC1_CUVID_DECODER
-      CONFIG_VP8_CUVID_DECODER CONFIG_VP9_CUVID_DECODER
+      CONFIG_AV1_NVDEC_HWACCEL CONFIG_H264_NVDEC_HWACCEL
+      CONFIG_HEVC_NVDEC_HWACCEL CONFIG_MJPEG_NVDEC_HWACCEL
+      CONFIG_MPEG1_NVDEC_HWACCEL CONFIG_MPEG2_NVDEC_HWACCEL
+      CONFIG_MPEG4_NVDEC_HWACCEL CONFIG_VC1_NVDEC_HWACCEL
+      CONFIG_VP8_NVDEC_HWACCEL CONFIG_VP9_NVDEC_HWACCEL
     )
   fi
   for key in "${required[@]}"; do
     grep -q "^$key=yes$" "$cfg" || { echo "FFmpeg required feature disabled: $key"; exit 1; }
   done
+  if grep -Eq '^CONFIG_(CUVID|.*_CUVID_DECODER)=yes$' "$cfg"; then
+    echo "FFmpeg legacy CUVID decoder is unexpectedly enabled"
+    exit 1
+  fi
   grep -Rqs '"aac_nmr_speed"' "$ff_stage/libavcodec" || {
     echo "FFmpeg source does not contain the NMR AAC speed option"
     exit 1
   }
+}
+
+encoder_smoke() {
+  local ffmpeg="$1"
+  shift
+  "$ffmpeg" -hide_banner -loglevel error \
+    -f lavfi -i "color=c=black:s=64x64:r=1" -frames:v 1 \
+    "$@" -f null - >/dev/null 2>&1
+}
+
+expect_encoder_param_rejected() {
+  local ffmpeg="$1" encoder="$2" option="$3"
+  shift 3
+  if encoder_smoke "$ffmpeg" "$@" -c:v "$encoder" "$option" definitely_invalid=1; then
+    echo "$encoder silently accepted an invalid $option value"
+    exit 1
+  fi
+}
+
+verify_encoder_params() {
+  local ffmpeg="$1"
+  echo "== Verify encoder parameter forwarding =="
+  encoder_smoke "$ffmpeg" -c:v libaom-av1 -b:v 0 -crf 30 -tune iq
+  encoder_smoke "$ffmpeg" -c:v libaom-av1 -b:v 0 -crf 30 -aom-params tune=iq
+  encoder_smoke "$ffmpeg" -c:v libsvtav1 -svtav1-params tune=0
+  encoder_smoke "$ffmpeg" -c:v libx264 -x264-params keyint=1
+  encoder_smoke "$ffmpeg" -c:v libx265 -x265-params keyint=1
+  encoder_smoke "$ffmpeg" -pix_fmt yuv420p10le -c:v libvvenc -vvenc-params QP=32
+
+  expect_encoder_param_rejected "$ffmpeg" libaom-av1 -aom-params
+  expect_encoder_param_rejected "$ffmpeg" libsvtav1 -svtav1-params
+  expect_encoder_param_rejected "$ffmpeg" libx264 -x264-params
+  expect_encoder_param_rejected "$ffmpeg" libx265 -x265-params
+  expect_encoder_param_rejected "$ffmpeg" libvvenc -vvenc-params -pix_fmt yuv420p10le
 }
 
 run_stage() {
@@ -3024,6 +3172,7 @@ EOF
       ff_stage="$(stage_src "ffmpeg-source")"
       patch_ffmpeg_libplacebo_vulkan_import "$ff_stage"
       patch_ffmpeg_cxx_runtime "$ff_stage"
+      patch_ffmpeg_encoder_params "$ff_stage"
       pushd "$ff_stage" >/dev/null
       rm -f config.h config.mak config.log
 
@@ -3220,7 +3369,7 @@ EOF
         --enable-ffprobe \
         --enable-ffmpeg \
         --enable-ffnvcodec \
-        --enable-cuvid \
+        --disable-cuvid \
         --enable-nvenc \
         --enable-nvdec \
         --enable-libopus \
@@ -3309,6 +3458,7 @@ EOF
       verify_full_ffmpeg_config ffbuild/config.mak "$ff_stage"
       make -j"$FFMPEG_JOBS"
       make install
+      verify_encoder_params "$PREFIX/bin/ffmpeg.exe"
       popd >/dev/null
 
       # 拷贝编译好的可执行文件至 full 目录并剥离调试信息
