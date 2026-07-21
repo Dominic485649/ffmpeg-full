@@ -52,6 +52,10 @@ TOOLCHAIN_EXTRA_LIBS="${TOOLCHAIN_EXTRA_LIBS:-}"
 JOBS="${JOBS:-$(nproc)}"
 FFMPEG_JOBS="${FFMPEG_JOBS:-$JOBS}"
 FFMPEG_REF="${FFMPEG_REF:-master}"
+AUDIO_TOOLBOX_WRAPPER_REPO="${AUDIO_TOOLBOX_WRAPPER_REPO:-https://github.com/dantmnf/AudioToolboxWrapper.git}"
+APPLE_ITUNES_URL="${APPLE_ITUNES_URL:-https://www.apple.com/itunes/download/win64/}"
+APPLE_ITUNES_INSTALLER="${APPLE_ITUNES_INSTALLER:-$ROOT/toolchains/source-archives/iTunes64Setup.exe}"
+APPLE_AUDIO_RUNTIME_DIR="${APPLE_AUDIO_RUNTIME_DIR:-$ROOT/toolchains/apple-application-support}"
 
 # 编译优化选项
 OPT_CFLAGS_BASE="${OPT_CFLAGS_BASE:--O3 -pipe -DNDEBUG -funwind-tables -fexceptions}"
@@ -143,6 +147,7 @@ declare -A URLS=(
   [libgsm]="https://github.com/timothytylee/libgsm.git"
   [opencore-amr]="https://github.com/BelledonneCommunications/opencore-amr.git"
   [vo-amrwbenc]="https://github.com/mstorsjo/vo-amrwbenc.git"
+  [AudioToolboxWrapper]="$AUDIO_TOOLBOX_WRAPPER_REPO"
 )
 
 # Git 源码版本 Tag 匹配正则
@@ -215,6 +220,7 @@ declare -A TAG_REGEX=(
   [libgsm]='^v?[0-9]+(\.[0-9]+)*([_-]pl[0-9]+)?$'
   [opencore-amr]='^v?[0-9]+(\.[0-9]+)+$'
   [vo-amrwbenc]='^v?[0-9]+(\.[0-9]+)+$'
+  [AudioToolboxWrapper]='^v?[0-9]+(\.[0-9]+)*$'
 )
 
 # 编译依赖阶段列表
@@ -283,6 +289,7 @@ STAGES=(
   "vmaf"
   "vvenc"
   "vvdec"
+  "AudioToolboxWrapper"
   "sdl2"
   "amf"
   "avisynth"
@@ -296,7 +303,7 @@ as_root() {
   if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
     "$@"
   else
-    sudo "$@"
+    sudo -S -p '' "$@"
   fi
 }
 
@@ -679,8 +686,33 @@ first_tool() {
   exit 1
 }
 
+toolchain_ready() {
+  local tool
+  for tool in curl git cmake ninja meson nasm clang-linux 7z pkg-config; do
+    command -v "$tool" >/dev/null 2>&1 || return 1
+  done
+  case "$TOOLCHAIN_FLAVOR" in
+    llvm-mingw)
+      [[ -x "$LLVM_MINGW_ROOT/bin/$TARGET-clang" && -x "$LLVM_MINGW_ROOT/bin/$TARGET-clang++" ]] || return 1
+      ;;
+    xpack-mingw64-gcc)
+      [[ -x "$XPACK_MINGW_ROOT/bin/$TARGET-gcc" && -x "$XPACK_MINGW_ROOT/bin/$TARGET-g++" ]] || return 1
+      ;;
+    system)
+      command -v "$TARGET-gcc" >/dev/null 2>&1 || return 1
+      command -v "$TARGET-g++" >/dev/null 2>&1 || return 1
+      ;;
+    *) return 1 ;;
+  esac
+  [[ "$CUDA_ENABLE" != "1" ]] || command -v nvcc >/dev/null 2>&1
+}
+
 run_tool() {
   echo "===> [子命令: tool] 检测与安装构建工具链..."
+  if [[ "${TOOLCHAIN_REFRESH:-0}" != "1" ]] && toolchain_ready; then
+    echo "Reuse existing toolchain. Set TOOLCHAIN_REFRESH=1 to refresh it."
+    return
+  fi
 
   local IS_WSL=0
   if grep -qi wsl /proc/version 2>/dev/null; then
@@ -705,11 +737,11 @@ run_tool() {
   local CUDA_TOOLKIT_ENABLE="${CUDA_TOOLKIT_ENABLE:-1}"
 
   echo "== Update apt bootstrap packages =="
-  sudo apt update
+  as_root apt update
 
   echo
   echo "== Install bootstrap packages (latest toolchains are downloaded below, not from apt) =="
-  sudo apt install -y --no-install-recommends \
+  as_root apt install -y --no-install-recommends \
     build-essential \
     autoconf automake libtool make \
     pkg-config xxd \
@@ -728,7 +760,7 @@ run_tool() {
   install_7zip_latest
 
   if [[ "$TOOLCHAIN_FLAVOR" == "system" ]]; then
-    sudo apt install -y --no-install-recommends \
+    as_root apt install -y --no-install-recommends \
       mingw-w64 mingw-w64-tools \
       binutils-mingw-w64-x86-64 \
       gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 \
@@ -747,11 +779,11 @@ run_tool() {
       tmpdeb="$(mktemp --suffix=.deb)"
       curl -fL --retry 3 --retry-all-errors --connect-timeout 20 \
         -o "$tmpdeb" "$CUDA_KEYRING"
-      sudo dpkg -i "$tmpdeb"
+      as_root dpkg -i "$tmpdeb"
       rm -f "$tmpdeb"
     fi
 
-    sudo apt update
+    as_root apt update
 
     echo
     echo "== CUDA package candidate =="
@@ -759,12 +791,12 @@ run_tool() {
 
     echo
     echo "== Upgrade latest nvcc / CUDA Toolkit =="
-    sudo apt install -y --no-install-recommends cuda-toolkit
+    as_root apt install -y --no-install-recommends cuda-toolkit
 
     echo
     echo "== Configure CUDA environment =="
     if [ -d /usr/local/cuda ]; then
-      sudo tee /etc/profile.d/cuda.sh >/dev/null <<'EOF'
+      as_root tee /etc/profile.d/cuda.sh >/dev/null <<'EOF'
 export CUDA_HOME=/usr/local/cuda
 export CUDA_PATH=/usr/local/cuda
 export PATH=/usr/local/cuda/bin:$PATH
@@ -1102,6 +1134,7 @@ run_update() {
     vmaf
     vvenc
     vvdec
+    AudioToolboxWrapper
     sdl2
     zlib
     bzip2
@@ -1241,6 +1274,7 @@ normalize_stage() {
     vmaf) echo "vmaf" ;;
     vvenc) echo "vvenc" ;;
     vvdec) echo "vvdec" ;;
+    audiotoolboxwrapper|audiotoolbox|atw) echo "AudioToolboxWrapper" ;;
     sdl2) echo "sdl2" ;;
     amf) echo "amf" ;;
     avisynth) echo "avisynth" ;;
@@ -1664,18 +1698,123 @@ is_system_runtime_dll() {
     WS2_32.DLL|CRYPT32.DLL|BCRYPT.DLL|VERSION.DLL|SHLWAPI.DLL|SECUR32.DLL|IPHLPAPI.DLL|NCRYPT.DLL) return 0 ;;
     CFGMGR32.DLL|RUNTIMEOBJECT.DLL|RPCRT4.DLL) return 0 ;;
     D3D*.DLL|D2D1.DLL|DWRITE.DLL|DXGI.DLL|MF*.DLL|EVR.DLL|AVRT.DLL|PROPSYS.DLL|RTWORKQ.DLL) return 0 ;;
-    AVICAP32.DLL|IMM32.DLL|SETUPAPI.DLL|WINMM.DLL|NVCUDA.DLL|NVENCODEAPI64.DLL|VULKAN-1.DLL) return 0 ;;
+    AVICAP32.DLL|IMM32.DLL|SETUPAPI.DLL|WINMM.DLL|DSOUND.DLL|NVCUDA.DLL|NVENCODEAPI64.DLL|VULKAN-1.DLL) return 0 ;;
   esac
   return 1
+}
+
+require_wsl_tool() {
+  local tool="$1" path
+  path="$(type -P "$tool" || true)"
+  [[ -n "$path" ]] || { echo "缺少 WSL 原生命令: $tool" >&2; exit 1; }
+  case "$(realpath "$path")" in
+    /mnt/*|*.exe) echo "$tool 必须是 WSL 原生程序: $path" >&2; exit 1 ;;
+  esac
+}
+
+download_apple_installer() {
+  local url="$1" installer="$2"
+  [[ -s "$installer" ]] && 7z t "$installer" >/dev/null 2>&1 && return 0
+  rm -f -- "$installer"
+  if [[ -s "$installer.part" ]]; then
+    curl --fail --location --retry 4 --retry-all-errors --connect-timeout 30 \
+      --continue-at - --user-agent 'Mozilla/5.0' --output "$installer.part" "$url" || \
+      rm -f -- "$installer.part"
+  fi
+  if [[ ! -s "$installer.part" ]]; then
+    curl --fail --location --retry 4 --retry-all-errors --connect-timeout 30 \
+      --user-agent 'Mozilla/5.0' --output "$installer.part" "$url"
+  fi
+  if ! 7z t "$installer.part" >/dev/null; then
+    rm -f -- "$installer.part"
+    curl --fail --location --retry 4 --retry-all-errors --connect-timeout 30 \
+      --user-agent 'Mozilla/5.0' --output "$installer.part" "$url"
+    7z t "$installer.part" >/dev/null
+  fi
+  mv -f -- "$installer.part" "$installer"
+}
+
+extract_apple_audio_runtime() {
+  local installer="$1" tmp msi core file dll_name target
+  tmp="$(mktemp -d)"
+  if ! 7z x -y "-o$tmp/itunes" "$installer" >/dev/null; then
+    rm -rf -- "$tmp"
+    return 1
+  fi
+  while IFS= read -r -d '' msi; do
+    rm -rf -- "$tmp/apple"
+    mkdir -p "$tmp/apple"
+    7z x -y "-o$tmp/apple" "$msi" >/dev/null || continue
+    while IFS= read -r -d '' file; do
+      if ! llvm-objdump -f "$file" 2>/dev/null | grep 'file format coff-x86-64' >/dev/null; then
+        continue
+      fi
+      dll_name="$(llvm-objdump -p "$file" 2>/dev/null | sed -n 's/^[[:space:]]*DLL name: //p' || true)"
+      [[ "$dll_name" =~ ^[A-Za-z0-9._-]+\.dll$ ]] || continue
+      target="$(dirname "$file")/$dll_name"
+      [[ "$target" == "$file" ]] && continue
+      if [[ -e "$target" ]]; then
+        # ponytail: 7z exposes duplicate MSI streams without component paths; keep the first x64 DLL and let the AAC smoke test reject an incompatible duplicate.
+        cmp -s "$file" "$target" || echo "保留首个 x64 Apple DLL: $dll_name" >&2
+        rm -f -- "$file"
+      else
+        mv -f -- "$file" "$target"
+      fi
+    done < <(find "$tmp/apple" -type f -name 'fil*' -print0)
+    core="$(find "$tmp/apple" -type f -iname 'CoreAudioToolbox.dll' -print -quit)"
+    [[ -n "$core" ]] || continue
+    rm -rf -- "$APPLE_AUDIO_RUNTIME_DIR"
+    mkdir -p "$APPLE_AUDIO_RUNTIME_DIR"
+    find "$tmp/apple" -type f -iname '*.dll' -exec cp -a {} "$APPLE_AUDIO_RUNTIME_DIR/" \;
+    rm -rf -- "$tmp"
+    return 0
+  done < <(find "$tmp/itunes" -type f \( -iname 'AppleApplicationSupport*.msi' -o -iname 'iTunes*.msi' \) -print0)
+  rm -rf -- "$tmp"
+  return 1
+}
+
+prepare_apple_audio_runtime() {
+  [[ "$APPLE_AUDIO_RUNTIME_DIR" == "$ROOT/toolchains/"* ]] || {
+    echo "APPLE_AUDIO_RUNTIME_DIR 必须位于 $ROOT/toolchains" >&2
+    exit 1
+  }
+  if find "$APPLE_AUDIO_RUNTIME_DIR" -type f -iname 'CoreAudioToolbox.dll' -print -quit 2>/dev/null | grep -q .; then
+    return
+  fi
+
+  require_wsl_tool curl
+  require_wsl_tool 7z
+  mkdir -p "$(dirname "$APPLE_ITUNES_INSTALLER")"
+  download_apple_installer "$APPLE_ITUNES_URL" "$APPLE_ITUNES_INSTALLER"
+  extract_apple_audio_runtime "$APPLE_ITUNES_INSTALLER" || {
+    echo "Apple Application Support 中未找到 CoreAudioToolbox.dll" >&2
+    exit 1
+  }
+}
+
+seed_apple_audio_runtime() {
+  local core
+  prepare_apple_audio_runtime
+  core="$(find "$APPLE_AUDIO_RUNTIME_DIR" -type f -iname 'CoreAudioToolbox.dll' -print -quit)"
+  [[ -n "$core" ]] || { echo "缺少 CoreAudioToolbox.dll" >&2; exit 1; }
+  cp -f -- "$core" "$ROOT/full/"
+}
+
+is_apple_audio_runtime_dll() {
+  [[ "$1" == "$APPLE_AUDIO_RUNTIME_DIR/"* ]]
 }
 
 find_runtime_dll() {
   local dll="$1" dir found
   for dir in \
-    "$ROOT/full" "$PREFIX/bin" \
+    "$ROOT/full" "$APPLE_AUDIO_RUNTIME_DIR" "$PREFIX/bin" \
     "$LLVM_MINGW_ROOT/bin" "$LLVM_MINGW_ROOT/$TARGET/bin" "$(dirname "$CC")"; do
     [[ -d "$dir" ]] || continue
-    found="$(find "$dir" -maxdepth 1 -type f -iname "$dll" -print -quit 2>/dev/null || true)"
+    if [[ "$dir" == "$APPLE_AUDIO_RUNTIME_DIR" ]]; then
+      found="$(find "$dir" -type f -iname "$dll" -print -quit 2>/dev/null || true)"
+    else
+      found="$(find "$dir" -maxdepth 1 -type f -iname "$dll" -print -quit 2>/dev/null || true)"
+    fi
     if [[ -n "$found" ]]; then
       printf '%s\n' "$found"
       return 0
@@ -1709,7 +1848,7 @@ copy_runtime_dll_closure() {
       src="$(find_runtime_dll "$dll" || true)"
       if [[ -n "$src" ]]; then
         cp -f "$src" "$dst/"
-        "$STRIP" "$dst/$(basename "$src")" 2>/dev/null || true
+        is_apple_audio_runtime_dll "$src" || "$STRIP" "$dst/$(basename "$src")" 2>/dev/null || true
         changed=1
       else
         printf '%s\n' "$dll" >> "$tmp/missing"
@@ -1827,7 +1966,7 @@ PATCH
 verify_full_ffmpeg_config() {
   local cfg="$1" ff_stage="$2" key
   local required=(
-    CONFIG_AAC_ENCODER CONFIG_LIBSOXR CONFIG_LIBSSH CONFIG_OPENCL CONFIG_D3D12VA
+    CONFIG_AAC_ENCODER CONFIG_AUDIOTOOLBOX CONFIG_AAC_AT_ENCODER CONFIG_LIBSOXR CONFIG_LIBSSH CONFIG_OPENCL CONFIG_D3D12VA
     CONFIG_OPENGL CONFIG_LIBSNAPPY CONFIG_LIBTHEORA CONFIG_LIBSPEEX CONFIG_LIBTWOLAME
     CONFIG_LIBMYSOFA CONFIG_LIBOPENMPT CONFIG_LIBDVDREAD CONFIG_LIBDVDNAV
     CONFIG_CHROMAPRINT CONFIG_LIBZMQ CONFIG_LIBZVBI CONFIG_LIBGSM
@@ -1894,6 +2033,19 @@ verify_encoder_params() {
   expect_encoder_param_rejected "$ffmpeg" libx264 -x264-params
   expect_encoder_param_rejected "$ffmpeg" libx265 -x265-params
   expect_encoder_param_rejected "$ffmpeg" libvvenc -vvenc-params -pix_fmt yuv420p10le
+}
+
+verify_aac_at() {
+  local ffmpeg="$1" encoders
+  [[ -f "$(dirname "$ffmpeg")/CoreAudioToolbox.dll" ]] || {
+    echo "CoreAudioToolbox.dll is missing beside ffmpeg.exe" >&2
+    exit 1
+  }
+  encoders="$("$ffmpeg" -hide_banner -encoders 2>/dev/null)"
+  grep -q 'aac_at' <<<"$encoders" || { echo "aac_at encoder is missing" >&2; exit 1; }
+  "$ffmpeg" -hide_banner -h encoder=aac_at >/dev/null
+  "$ffmpeg" -hide_banner -loglevel error -f lavfi -i 'sine=frequency=1000:sample_rate=48000' \
+    -t 0.25 -c:a aac_at -b:a 128k -f null - >/dev/null
 }
 
 run_stage() {
@@ -3068,6 +3220,19 @@ EOF
       echo "AviSynth Headers successfully copied to $PREFIX/include/avisynth/"
       ;;
 
+    AudioToolboxWrapper)
+      prepare_apple_audio_runtime
+      build_cmake AudioToolboxWrapper
+      [[ -f "$PREFIX/lib/libAudioToolboxWrapper.a" ]] || {
+        echo "缺少 AudioToolboxWrapper 静态库" >&2
+        exit 1
+      }
+      [[ -x "$PREFIX/bin/atw_ldwrapper" ]] || {
+        echo "缺少 atw_ldwrapper" >&2
+        exit 1
+      }
+      ;;
+
     ffmpeg)
       # 自动修复 srt.pc 和 haisrt.pc 中可能存在的 mbedtls 绝对路径导致 static 链接失败的 Bug
       if [[ -f "$PREFIX/lib/pkgconfig/srt.pc" ]]; then
@@ -3300,6 +3465,9 @@ EOF
       fi
 
       local vs_flags=(--enable-vapoursynth)
+      local atw_ld="$PREFIX/bin/atw_ldwrapper"
+      [[ -x "$atw_ld" ]] || { echo "缺少 atw_ldwrapper" >&2; exit 1; }
+      export ATW_TRUELD="$CXX"
 
       ./configure \
         --prefix="$PREFIX" \
@@ -3310,7 +3478,7 @@ EOF
         --enable-cross-compile \
         --cc="$CC" \
         --cxx="$CXX" \
-        --ld="$CXX" \
+        --ld="$atw_ld" \
         --ar="$AR" \
         --ranlib="$RANLIB" \
         --pkg-config="$PKG_CONFIG" \
@@ -3401,6 +3569,7 @@ EOF
         --enable-libopencore-amrwb \
         --enable-libvo-amrwbenc \
         --enable-iconv \
+        --enable-audiotoolbox \
         "${lto_flags[@]}" \
         "${cuda_flags[@]}" \
         "${vs_flags[@]}" \
@@ -3419,7 +3588,8 @@ EOF
         --enable-encoder=libfdk_aac \
         --enable-encoder=libvpx_vp8 \
         --enable-encoder=libvpx_vp9 \
-        --enable-encoder=aac
+        --enable-encoder=aac \
+        --enable-encoder=aac_at
 
       verify_full_ffmpeg_config ffbuild/config.mak "$ff_stage"
       make -j"$FFMPEG_JOBS"
@@ -3443,7 +3613,9 @@ EOF
       find "$PREFIX/bin" -maxdepth 1 -type f -iname "*.dll" -exec cp -f {} "$ROOT/full/" \;
 
       # 递归补齐非系统 DLL 依赖，覆盖 Clang/GCC 运行时和第三方 DLL。
+      seed_apple_audio_runtime
       copy_runtime_dll_closure
+      verify_aac_at "$ROOT/full/ffmpeg.exe"
       ;;
 
     *)
