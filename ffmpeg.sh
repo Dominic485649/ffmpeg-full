@@ -391,7 +391,7 @@ install_xpack_mingw() {
   asset_file="$tmp/.asset_url"
   echo "== Install xPack MinGW-w64 GCC latest stable globally =="
   echo "$asset_url"
-  curl -fL --retry 3 -o "$archive" "$asset_url"
+  download_file_retry "$archive" "$asset_url"
   mkdir -p "$extract"
   tar -xzf "$archive" -C "$extract"
   found="$(find "$extract" -type f -path "*/bin/$TARGET-gcc" -perm -u+x | head -n 1)"
@@ -436,7 +436,7 @@ install_llvm_mingw() {
   asset_file="$tmp/.asset_url"
   echo "== Install latest llvm-mingw/Clang globally =="
   echo "$asset_url"
-  curl -fL --retry 3 -o "$archive" "$asset_url"
+  download_file_retry "$archive" "$asset_url"
   mkdir -p "$extract"
   tar -xJf "$archive" -C "$extract"
   found="$(find "$extract" -path "*/bin/$TARGET-clang" | head -n 1)"
@@ -488,7 +488,7 @@ install_llvm_linux() {
   else
     echo "== Install latest stable native LLVM/Clang/LLD from apt.llvm.org =="
     tmp="$(mktemp)"
-    curl -fsSL --retry 3 -o "$tmp" https://apt.llvm.org/llvm.sh
+    download_file_retry "$tmp" https://apt.llvm.org/llvm.sh
     chmod +x "$tmp"
     as_root env DEBIAN_FRONTEND=noninteractive bash "$tmp" "$major" all
     rm -f "$tmp"
@@ -519,7 +519,7 @@ install_7zip_latest() {
     archive="$tmp/7zip.tar.xz"
     next_root="$SEVENZIP_ROOT.tmp"
     echo "== Install latest stable 7-Zip globally =="
-    curl -fL --retry 3 -o "$archive" "$url"
+    download_file_retry "$archive" "$url"
     tar -xJf "$archive" -C "$tmp"
     [[ -x "$tmp/7zz" ]] || { echo "7-Zip archive does not contain 7zz"; exit 1; }
     as_root rm -rf "$next_root"
@@ -555,7 +555,7 @@ install_cmake_latest() {
     next_root="$CMAKE_ROOT.tmp"
     echo "== Install latest stable CMake globally =="
     echo "$asset_url"
-    curl -fL --retry 3 -o "$archive" "$asset_url"
+    download_file_retry "$archive" "$asset_url"
     mkdir -p "$extract"
     tar -xzf "$archive" -C "$extract"
     found="$(find "$extract" -type f -path "*/bin/cmake" -perm -u+x | head -n 1)"
@@ -595,7 +595,7 @@ install_ninja_latest() {
     next_root="$NINJA_ROOT.tmp"
     echo "== Install latest stable Ninja globally =="
     echo "$asset_url"
-    curl -fL --retry 3 -o "$archive" "$asset_url"
+    download_file_retry "$archive" "$asset_url"
     mkdir -p "$extract"
     unzip -q "$archive" -d "$extract"
     [[ -x "$extract/ninja" ]] || { echo "下载包里找不到 ninja"; exit 1; }
@@ -654,7 +654,7 @@ install_nasm_latest() {
     next_root="$NASM_ROOT.tmp"
     echo "== Build/install latest stable NASM globally =="
     echo "$NASM_REPO $tag"
-    git clone --depth 1 --branch "$tag" "$NASM_REPO" "$src"
+    git_clone_retry "$NASM_REPO" "$src" "$tag"
     pushd "$src" >/dev/null
     ./autogen.sh
     ./configure --prefix="$NASM_ROOT"
@@ -781,8 +781,7 @@ run_tool() {
     else
       local tmpdeb
       tmpdeb="$(mktemp --suffix=.deb)"
-      curl -fL --retry 3 --retry-all-errors --connect-timeout 20 \
-        -o "$tmpdeb" "$CUDA_KEYRING"
+      download_file_retry "$tmpdeb" "$CUDA_KEYRING"
       as_root dpkg -i "$tmpdeb"
       rm -f "$tmpdeb"
     fi
@@ -1026,7 +1025,11 @@ git_fetch_retry() {
 }
 
 git_clone_retry() {
-  local canonical_url="$1" dir="$2" candidate mode attempt=0
+  local canonical_url="$1" dir="$2" ref="${3:-}" candidate mode attempt=0
+  local clone_args=(git -c http.version=HTTP/1.1 clone --filter=blob:none)
+  if [[ -n "$ref" ]]; then
+    clone_args+=(--depth 1 --branch "$ref")
+  fi
   while IFS= read -r candidate; do
     for mode in proxy direct; do
       [[ "$mode" != proxy ]] || has_network_proxy || continue
@@ -1034,7 +1037,7 @@ git_clone_retry() {
       rm -rf "$dir"
       echo "git clone: ${candidate%%:*} via $mode (attempt $attempt)"
       if run_network_command "$mode" "$SOURCE_FETCH_TIMEOUT" \
-        git -c http.version=HTTP/1.1 clone --filter=blob:none "$candidate" "$dir"; then
+        "${clone_args[@]}" "$candidate" "$dir"; then
         git -C "$dir" remote set-url origin "$canonical_url"
         return 0
       fi
@@ -1866,22 +1869,8 @@ download_apple_installer() {
   local url="$1" installer="$2"
   [[ -s "$installer" ]] && 7z t "$installer" >/dev/null 2>&1 && return 0
   rm -f -- "$installer"
-  if [[ -s "$installer.part" ]]; then
-    curl --fail --location --retry 4 --retry-all-errors --connect-timeout 30 \
-      --continue-at - --user-agent 'Mozilla/5.0' --output "$installer.part" "$url" || \
-      rm -f -- "$installer.part"
-  fi
-  if [[ ! -s "$installer.part" ]]; then
-    curl --fail --location --retry 4 --retry-all-errors --connect-timeout 30 \
-      --user-agent 'Mozilla/5.0' --output "$installer.part" "$url"
-  fi
-  if ! 7z t "$installer.part" >/dev/null; then
-    rm -f -- "$installer.part"
-    curl --fail --location --retry 4 --retry-all-errors --connect-timeout 30 \
-      --user-agent 'Mozilla/5.0' --output "$installer.part" "$url"
-    7z t "$installer.part" >/dev/null
-  fi
-  mv -f -- "$installer.part" "$installer"
+  download_file_retry "$installer" "$url"
+  7z t "$installer" >/dev/null
 }
 
 extract_apple_audio_runtime() {
