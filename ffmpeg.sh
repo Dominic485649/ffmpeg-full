@@ -1086,7 +1086,7 @@ download_file_retry() {
 }
 
 local_source_is_usable() {
-  local name="$1" repo_dir="$2" tag
+  local name="$1" repo_dir="$2" tag head upstream branch
   git -C "$repo_dir" diff --quiet && git -C "$repo_dir" diff --cached --quiet
   case "$name" in
     ffmpeg-source) return 1 ;;
@@ -1094,8 +1094,16 @@ local_source_is_usable() {
       [[ "$(git -C "$repo_dir" rev-parse HEAD)" == "$NVCODEC_VMAF_CUDA_REF" ]]
       ;;
     *)
-      tag="$(git -C "$repo_dir" describe --tags --exact-match 2>/dev/null)" || return 1
-      [[ "$tag" =~ ${TAG_REGEX[$name]} ]]
+      tag="$(git -C "$repo_dir" describe --tags --exact-match 2>/dev/null || true)"
+      if [[ -n "$tag" && "$tag" =~ ${TAG_REGEX[$name]} ]]; then
+        return 0
+      fi
+      head="$(git -C "$repo_dir" rev-parse HEAD)"
+      for branch in master main; do
+        upstream="$(git -C "$repo_dir" rev-parse --verify "refs/remotes/origin/$branch" 2>/dev/null)" || continue
+        [[ "$head" == "$upstream" ]] && return 0
+      done
+      return 1
       ;;
   esac
 }
