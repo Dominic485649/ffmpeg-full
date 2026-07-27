@@ -2216,7 +2216,7 @@ verify_vmaf() {
       -init_hw_device cuda=vmaf:0 -filter_hw_device vmaf \
       -f lavfi -i 'color=c=black:s=320x180:r=1' \
       -f lavfi -i 'color=c=black:s=320x180:r=1' \
-      -filter_complex '[0:v]format=yuv420p,hwupload_cuda[dist];[1:v]format=yuv420p,hwupload_cuda[ref];[dist][ref]libvmaf_cuda=model=version=vmaf_v1.0.16_3d0h' \
+      -filter_complex '[0:v]format=yuv420p,hwupload_cuda[dist];[1:v]format=yuv420p,hwupload_cuda[ref];[dist][ref]libvmaf_cuda' \
       -frames:v 1 -f null - >/dev/null
   fi
 }
@@ -3303,12 +3303,17 @@ EOF
         --default-library=static \
         -Doptimization=3 \
         -Dbuilt_in_models=true \
+        -Denable_float=true \
         -Denable_tests=false \
         -Denable_asm=true \
         "${extra_opts[@]}"
 
       meson compile -C "$bld" -j "$JOBS"
       meson install -C "$bld"
+      meson configure "$bld" | grep -Eq '^  enable_float +true ' || {
+        echo "libvmaf floating-point features are not enabled" >&2
+        exit 1
+      }
       if [[ "$CUDA_ENABLE" == "1" ]]; then
         [[ -f "$PREFIX/include/libvmaf/libvmaf_cuda.h" ]] || {
           echo "libvmaf CUDA 头文件未安装"
