@@ -56,7 +56,7 @@ AUDIO_TOOLBOX_WRAPPER_REPO="${AUDIO_TOOLBOX_WRAPPER_REPO:-https://github.com/dan
 APPLE_ITUNES_URL="${APPLE_ITUNES_URL:-https://www.apple.com/itunes/download/win64/}"
 APPLE_ITUNES_INSTALLER="${APPLE_ITUNES_INSTALLER:-$ROOT/toolchains/source-archives/iTunes64Setup.exe}"
 APPLE_AUDIO_RUNTIME_DIR="${APPLE_AUDIO_RUNTIME_DIR:-$ROOT/toolchains/apple-application-support}"
-SOURCE_FETCH_TIMEOUT="${SOURCE_FETCH_TIMEOUT:-90}"
+SOURCE_FETCH_TIMEOUT="${SOURCE_FETCH_TIMEOUT:-30}"
 SOURCE_DOWNLOAD_TIMEOUT="${SOURCE_DOWNLOAD_TIMEOUT:-600}"
 
 # 编译优化选项
@@ -1085,11 +1085,19 @@ download_file_retry() {
   return 1
 }
 
-libiconv_local_release_is_usable() {
-  local repo_dir="$1" tag
-  tag="$(git -C "$repo_dir" describe --tags --exact-match 2>/dev/null)" || return 1
-  [[ "$tag" =~ ${TAG_REGEX[libiconv]} ]] || return 1
+local_source_is_usable() {
+  local name="$1" repo_dir="$2" tag
   git -C "$repo_dir" diff --quiet && git -C "$repo_dir" diff --cached --quiet
+  case "$name" in
+    ffmpeg-source) return 1 ;;
+    nv-codec-headers)
+      [[ "$(git -C "$repo_dir" rev-parse HEAD)" == "$NVCODEC_VMAF_CUDA_REF" ]]
+      ;;
+    *)
+      tag="$(git -C "$repo_dir" describe --tags --exact-match 2>/dev/null)" || return 1
+      [[ "$tag" =~ ${TAG_REGEX[$name]} ]]
+      ;;
+  esac
 }
 
 clone_if_missing() {
@@ -1205,8 +1213,8 @@ update_one() {
 
   echo "===> fetch $name"
   if ! git_fetch_retry "$repo_dir" "$url"; then
-    if [[ "$name" == "libiconv" ]] && libiconv_local_release_is_usable "$repo_dir"; then
-      echo "libiconv upstream unavailable; using the clean local release tag"
+    if local_source_is_usable "$name" "$repo_dir"; then
+      echo "$name upstream Git unavailable; using the clean pinned local ref"
       return 0
     fi
     return 1
