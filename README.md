@@ -9,6 +9,7 @@
 - 包含 Apple AudioToolbox 的 `aac_at` 编码器，可用 `-c:a aac_at`。Release 将其 Apple Application Support 运行时单独放在 `aac_at_dlc.7z`；使用时把 DLC 中 DLL 解压到 `ffmpeg.exe` 同目录。
 - 校验 libaom、SVT-AV1、x264、x265 和 VVenC 参数透传；例如 libaom 使用 `-aom-params tune=iq`。未知参数会直接报错，避免警告后继续编码。
 - 支持 VapourSynth 输入；BM3D CUDA 不随压缩包分发，请按 [BM3D CUDA Wiki](https://github.com/Dominic485649/ffmpeg-nvenc-lite/wiki/BM3D%E2%80%90CUDA%E2%80%90%E9%99%8D%E5%99%AA%E6%95%99%E7%A8%8B) 安装 Python 插件。
+- 内置 Netflix VMAF v1.0.16 的 1080p、手机、4K 和 HFR 模型；标准 1080p 3H 模型为 vmaf_v1.0.16_3d0h。CUDA 环境还提供仅接收 CUDA 帧的 libvmaf_cuda 滤镜。
 - 默认针对 x86-64-v3 处理器优化。
 
 ## 构建

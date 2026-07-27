@@ -76,6 +76,8 @@ NVCC_OPTFLAGS="${NVCC_OPTFLAGS:--O3 --extra-device-vectorization}"
 NVCC_THREADS="${NVCC_THREADS:-0}"
 NVCC_PTXAS_FLAGS="${NVCC_PTXAS_FLAGS:--O3}"
 NVCC_FAST_MATH="${NVCC_FAST_MATH:-1}"
+# libvmaf CUDA requires CUDA driver-table functions added after n13.0.19.0.
+NVCODEC_VMAF_CUDA_REF="876af32a202d0de83bd1d36fe74ee0f7fcf86b0d"
 
 # Git 源码库 URL 映射
 declare -A URLS=(
@@ -1089,6 +1091,8 @@ update_one() {
   local tag=""
   if [[ "$name" == "ffmpeg-source" ]]; then
     tag="$FFMPEG_REF"
+  elif [[ "$name" == "nv-codec-headers" ]]; then
+    tag="$NVCODEC_VMAF_CUDA_REF"
   else
     tag="$(latest_stable_tag "$name")"
   fi
@@ -1463,12 +1467,18 @@ meson_quote_array() {
 
 write_meson_cross() {
   local meson_lto=false
+  local meson_cuda=""
   [[ "$LTO_ENABLE" == "1" ]] && meson_lto=true
+  if [[ "$CUDA_ENABLE" == "1" ]]; then
+    setup_cuda
+    meson_cuda="cuda = '$NVCC'"
+  fi
 
   cat > "$BUILDROOT/mingw-cross.txt" <<EOF
 [binaries]
 c = '$CC'
 cpp = '$CXX'
+$meson_cuda
 ar = '$AR'
 strip = '$STRIP'
 windres = '$WINDRES'
@@ -1975,6 +1985,7 @@ verify_full_ffmpeg_config() {
     CONFIG_LIBVPL CONFIG_AV1_QSV_ENCODER CONFIG_HEVC_QSV_ENCODER
     CONFIG_LIBAOM_AV1_ENCODER CONFIG_LIBSVTAV1_ENCODER
     CONFIG_LIBX264_ENCODER CONFIG_LIBX265_ENCODER CONFIG_LIBVVENC_ENCODER
+    CONFIG_LIBVMAF_FILTER
     HAVE_STRUCT_MFXCONFIGINTERFACE
     CONFIG_VAPOURSYNTH_DEMUXER
   )
@@ -1982,6 +1993,7 @@ verify_full_ffmpeg_config() {
     required+=(
       CONFIG_CUDA_NVCC CONFIG_NVDEC CONFIG_AV1_NVENC_ENCODER
       CONFIG_HEVC_NVENC_ENCODER CONFIG_SCALE_CUDA_FILTER
+      CONFIG_LIBVMAF_CUDA_FILTER
       CONFIG_AV1_NVDEC_HWACCEL CONFIG_H264_NVDEC_HWACCEL
       CONFIG_HEVC_NVDEC_HWACCEL CONFIG_MJPEG_NVDEC_HWACCEL
       CONFIG_MPEG1_NVDEC_HWACCEL CONFIG_MPEG2_NVDEC_HWACCEL
@@ -2048,6 +2060,27 @@ verify_aac_at() {
     -t 0.25 -c:a aac_at -b:a 128k -f null - >/dev/null
 }
 
+verify_vmaf() {
+  local ffmpeg="$1" filters
+  echo "== Verify VMAF v1 and CUDA =="
+  filters="$("$ffmpeg" -hide_banner -filters 2>/dev/null)"
+  grep -q 'libvmaf' <<<"$filters" || { echo "libvmaf filter is missing" >&2; exit 1; }
+  "$ffmpeg" -hide_banner -loglevel error \
+    -f lavfi -i 'color=c=black:s=320x180:r=1' \
+    -f lavfi -i 'color=c=black:s=320x180:r=1' \
+    -filter_complex '[0:v][1:v]libvmaf=model=version=vmaf_v1.0.16_3d0h' \
+    -frames:v 1 -f null - >/dev/null
+  if [[ "$CUDA_ENABLE" == "1" ]]; then
+    grep -q 'libvmaf_cuda' <<<"$filters" || { echo "libvmaf_cuda filter is missing" >&2; exit 1; }
+    "$ffmpeg" -hide_banner -loglevel error \
+      -init_hw_device cuda=vmaf:0 -filter_hw_device vmaf \
+      -f lavfi -i 'color=c=black:s=320x180:r=1' \
+      -f lavfi -i 'color=c=black:s=320x180:r=1' \
+      -filter_complex '[0:v]format=yuv420p,hwupload_cuda[dist];[1:v]format=yuv420p,hwupload_cuda[ref];[dist][ref]libvmaf_cuda=model=version=vmaf_v1.0.16_3d0h' \
+      -frames:v 1 -f null - >/dev/null
+  fi
+}
+
 run_stage() {
   local stage="$1"
   CURRENT_STAGE="$stage"
@@ -2070,6 +2103,15 @@ run_stage() {
         echo "pkg-config 无法识别 ffnvcodec"
         exit 1
       }
+      if [[ "$CUDA_ENABLE" == "1" ]]; then
+        local cuda_symbol
+        for cuda_symbol in cuCtxSynchronize cuCtxGetStreamPriorityRange cuMemHostAlloc cuMemFreeHost cuMemFreeAsync cuStreamCreateWithPriority; do
+          grep -q "$cuda_symbol" "$PREFIX/include/ffnvcodec/dynlink_loader.h" || {
+            echo "nv-codec-headers 缺少 libvmaf CUDA 所需函数: $cuda_symbol"
+            exit 1
+          }
+        done
+      fi
       ;;
 
     zlib)
@@ -3095,10 +3137,15 @@ EOF
     vmaf)
       local stage
       stage="$(stage_src "vmaf")/libvmaf"
-      local bld="$BUILDROOT/vmaf"
+      # Upstream CUDA custom targets use paths relative to libvmaf/build/src.
+      local bld="$stage/build-mingw"
       rm -rf "$bld"
 
       local extra_opts=("-Denable_cuda=false")
+      if [[ "$CUDA_ENABLE" == "1" ]]; then
+        setup_cuda
+        extra_opts=("-Denable_cuda=true" "-Denable_nvcc=true")
+      fi
 
       meson setup "$bld" "$stage" \
         --cross-file "$BUILDROOT/mingw-cross.txt" \
@@ -3113,6 +3160,12 @@ EOF
 
       meson compile -C "$bld" -j "$JOBS"
       meson install -C "$bld"
+      if [[ "$CUDA_ENABLE" == "1" ]]; then
+        [[ -f "$PREFIX/include/libvmaf/libvmaf_cuda.h" ]] || {
+          echo "libvmaf CUDA 头文件未安装"
+          exit 1
+        }
+      fi
       ;;
 
     vvenc)
@@ -3595,6 +3648,7 @@ EOF
       make -j"$FFMPEG_JOBS"
       make install
       verify_encoder_params "$PREFIX/bin/ffmpeg.exe"
+      verify_vmaf "$PREFIX/bin/ffmpeg.exe"
       popd >/dev/null
 
       # 拷贝编译好的可执行文件至 full 目录并剥离调试信息
