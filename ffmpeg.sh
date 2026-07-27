@@ -2195,8 +2195,8 @@ verify_vmaf() {
   filters="$("$ffmpeg" -hide_banner -filters 2>/dev/null)"
   grep -q 'libvmaf' <<<"$filters" || { echo "libvmaf filter is missing" >&2; exit 1; }
   "$ffmpeg" -hide_banner -loglevel error \
-    -f lavfi -i 'color=c=black:s=320x180:r=1' \
-    -f lavfi -i 'color=c=black:s=320x180:r=1' \
+    -f lavfi -i 'testsrc2=size=1920x1080:rate=1' \
+    -f lavfi -i 'testsrc2=size=1920x1080:rate=1' \
     -filter_complex '[0:v][1:v]libvmaf=model=version=vmaf_v1.0.16_3d0h' \
     -frames:v 1 -f null - >/dev/null
   if [[ "$CUDA_ENABLE" == "1" ]]; then
