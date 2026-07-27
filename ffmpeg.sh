@@ -1086,7 +1086,13 @@ update_one() {
   git -C "$repo_dir" remote set-url origin "$url" 2>/dev/null || true
 
   echo "===> fetch $name"
-  git_retry git -C "$repo_dir" fetch --tags --prune --force origin
+  if ! git_retry git -C "$repo_dir" fetch --tags --prune --force origin; then
+    if [[ "$name" == "libiconv" ]] && git -C "$repo_dir" describe --tags --exact-match >/dev/null 2>&1; then
+      echo "libiconv official Git remote unavailable; using the clean local release tag"
+      return 0
+    fi
+    return 1
+  fi
 
   local tag=""
   if [[ "$name" == "ffmpeg-source" ]]; then
