@@ -56,6 +56,8 @@ AUDIO_TOOLBOX_WRAPPER_REPO="${AUDIO_TOOLBOX_WRAPPER_REPO:-https://github.com/dan
 APPLE_ITUNES_URL="${APPLE_ITUNES_URL:-https://www.apple.com/itunes/download/win64/}"
 APPLE_ITUNES_INSTALLER="${APPLE_ITUNES_INSTALLER:-$ROOT/toolchains/source-archives/iTunes64Setup.exe}"
 APPLE_AUDIO_RUNTIME_DIR="${APPLE_AUDIO_RUNTIME_DIR:-$ROOT/toolchains/apple-application-support}"
+SOURCE_FETCH_TIMEOUT="${SOURCE_FETCH_TIMEOUT:-90}"
+SOURCE_DOWNLOAD_TIMEOUT="${SOURCE_DOWNLOAD_TIMEOUT:-600}"
 
 # 编译优化选项
 OPT_CFLAGS_BASE="${OPT_CFLAGS_BASE:--O3 -pipe -DNDEBUG -funwind-tables -fexceptions}"
@@ -690,7 +692,7 @@ first_tool() {
 
 toolchain_ready() {
   local tool
-  for tool in curl git cmake ninja meson nasm clang-linux 7z pkg-config; do
+  for tool in curl aria2c git cmake ninja meson nasm clang-linux 7z pkg-config; do
     command -v "$tool" >/dev/null 2>&1 || return 1
   done
   case "$TOOLCHAIN_FLAVOR" in
@@ -747,7 +749,7 @@ run_tool() {
     build-essential \
     autoconf automake libtool make \
     pkg-config xxd \
-    git curl ca-certificates tar xz-utils unzip \
+    git curl aria2 ca-certificates tar xz-utils unzip \
     python3 python3-venv perl gnupg lsb-release \
     gettext autopoint gperf
 
@@ -946,34 +948,148 @@ normalize_version() {
   esac
 }
 
+has_network_proxy() {
+  [[ -n "${http_proxy:-}${https_proxy:-}${HTTP_PROXY:-}${HTTPS_PROXY:-}${ALL_PROXY:-}${all_proxy:-}" ]]
+}
+
+run_network_command() {
+  local mode="$1" duration="$2"
+  shift 2
+  if [[ "$mode" == "proxy" ]]; then
+    timeout "$duration" "$@"
+  else
+    env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u all_proxy \
+      timeout "$duration" "$@"
+  fi
+}
+
+git_url_variants() {
+  local url="$1" rest
+  printf '%s\n' "$url"
+  case "$url" in
+    https://*)
+      rest="${url#https://}"
+      printf 'http://%s\ngit://%s\n' "$rest" "$rest"
+      ;;
+    http://*)
+      rest="${url#http://}"
+      printf 'https://%s\ngit://%s\n' "$rest" "$rest"
+      ;;
+    git://*)
+      rest="${url#git://}"
+      printf 'https://%s\nhttp://%s\n' "$rest" "$rest"
+      ;;
+  esac
+}
+
+archive_url_variants() {
+  local url="$1" rest
+  printf '%s\n' "$url"
+  case "$url" in
+    https://*) printf 'http://%s\n' "${url#https://}" ;;
+    http://*) printf 'https://%s\n' "${url#http://}" ;;
+  esac
+}
+
 git_retry() {
-  local attempt
-  for attempt in 1 2 3 4; do
-    if (( attempt % 2 == 1 )); then
-      "$@" && return 0
-    else
-      env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u all_proxy "$@" && return 0
+  local mode attempt=0
+  for mode in proxy direct; do
+    [[ "$mode" != proxy ]] || has_network_proxy || continue
+    attempt=$((attempt + 1))
+    if run_network_command "$mode" "$SOURCE_FETCH_TIMEOUT" "$@"; then
+      return 0
     fi
-    echo "git command failed (attempt $attempt/4), retrying..." >&2
-    sleep "$((attempt * 5))"
+    echo "git command failed ($mode attempt $attempt), retrying..." >&2
+    sleep 3
   done
   return 1
 }
 
-git_clone_retry() {
-  local url="$1" dir="$2" attempt
-  for attempt in 1 2 3 4; do
-    rm -rf "$dir"
-    if (( attempt % 2 == 1 )); then
-      git clone --filter=blob:none "$url" "$dir" && return 0
-    else
-      env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u all_proxy \
-        git clone --filter=blob:none "$url" "$dir" && return 0
-    fi
-    echo "git clone failed (attempt $attempt/4), retrying..." >&2
-    sleep "$((attempt * 5))"
-  done
+git_fetch_retry() {
+  local repo_dir="$1" canonical_url="$2" candidate mode attempt=0
+  while IFS= read -r candidate; do
+    for mode in proxy direct; do
+      [[ "$mode" != proxy ]] || has_network_proxy || continue
+      attempt=$((attempt + 1))
+      git -C "$repo_dir" remote set-url origin "$candidate"
+      echo "git fetch: ${candidate%%:*} via $mode (attempt $attempt)"
+      if run_network_command "$mode" "$SOURCE_FETCH_TIMEOUT" \
+        git -c http.version=HTTP/1.1 -C "$repo_dir" fetch --tags --prune --force origin; then
+        git -C "$repo_dir" remote set-url origin "$canonical_url"
+        return 0
+      fi
+      sleep 3
+    done
+  done < <(git_url_variants "$canonical_url")
+  git -C "$repo_dir" remote set-url origin "$canonical_url" || true
   return 1
+}
+
+git_clone_retry() {
+  local canonical_url="$1" dir="$2" candidate mode attempt=0
+  while IFS= read -r candidate; do
+    for mode in proxy direct; do
+      [[ "$mode" != proxy ]] || has_network_proxy || continue
+      attempt=$((attempt + 1))
+      rm -rf "$dir"
+      echo "git clone: ${candidate%%:*} via $mode (attempt $attempt)"
+      if run_network_command "$mode" "$SOURCE_FETCH_TIMEOUT" \
+        git -c http.version=HTTP/1.1 clone --filter=blob:none "$candidate" "$dir"; then
+        git -C "$dir" remote set-url origin "$canonical_url"
+        return 0
+      fi
+      sleep 3
+    done
+  done < <(git_url_variants "$canonical_url")
+  return 1
+}
+
+download_file_retry() {
+  local destination="$1" canonical_url="$2" temporary="${1}.part" candidate mode attempt=0
+  mkdir -p "$(dirname "$destination")"
+  rm -f "$temporary" "$temporary.aria2"
+
+  while IFS= read -r candidate; do
+    for mode in proxy direct; do
+      [[ "$mode" != proxy ]] || has_network_proxy || continue
+      attempt=$((attempt + 1))
+      echo "aria2c download: $(basename "$destination") via ${candidate%%:*}/$mode (attempt $attempt)"
+      if run_network_command "$mode" "$SOURCE_DOWNLOAD_TIMEOUT" \
+        aria2c --allow-overwrite=true --auto-file-renaming=false --file-allocation=none \
+          --max-connection-per-server=8 --split=8 --min-split-size=1M \
+          --connect-timeout=15 --timeout=30 --max-tries=3 --retry-wait=3 --summary-interval=0 \
+          --dir "$(dirname "$temporary")" --out "$(basename "$temporary")" "$candidate" \
+        && [[ -s "$temporary" ]]; then
+        mv -f -- "$temporary" "$destination"
+        rm -f "$temporary.aria2"
+        return 0
+      fi
+      rm -f "$temporary" "$temporary.aria2"
+    done
+  done < <(archive_url_variants "$canonical_url")
+
+  while IFS= read -r candidate; do
+    for mode in proxy direct; do
+      [[ "$mode" != proxy ]] || has_network_proxy || continue
+      echo "curl fallback: $(basename "$destination") via ${candidate%%:*}/$mode"
+      if run_network_command "$mode" "$SOURCE_DOWNLOAD_TIMEOUT" \
+        curl -fL --retry 3 --retry-all-errors --connect-timeout 15 --max-time "$SOURCE_DOWNLOAD_TIMEOUT" \
+          -o "$temporary" "$candidate" \
+        && [[ -s "$temporary" ]]; then
+        mv -f -- "$temporary" "$destination"
+        return 0
+      fi
+      rm -f "$temporary"
+    done
+  done < <(archive_url_variants "$canonical_url")
+  return 1
+}
+
+libiconv_local_release_is_usable() {
+  local repo_dir="$1" tag
+  tag="$(git -C "$repo_dir" describe --tags --exact-match 2>/dev/null)" || return 1
+  [[ "$tag" =~ ${TAG_REGEX[libiconv]} ]] || return 1
+  git -C "$repo_dir" diff --quiet && git -C "$repo_dir" diff --cached --quiet
 }
 
 clone_if_missing() {
@@ -987,7 +1103,8 @@ clone_if_missing() {
       mkdir -p "$repo_dir"
       local aom_ver="v3.12.0"
       echo "Downloading libaom archive $aom_ver..."
-      curl -L -f -o "$repo_dir/aom.tar.gz" "https://aomedia.googlesource.com/aom/+archive/${aom_ver}.tar.gz"
+      download_file_retry "$repo_dir/aom.tar.gz" "https://aomedia.googlesource.com/aom/+archive/${aom_ver}.tar.gz" \
+        || { rm -rf "$repo_dir"; return 1; }
       tar -C "$repo_dir" -xzf "$repo_dir/aom.tar.gz"
       rm -f "$repo_dir/aom.tar.gz"
       git -C "$repo_dir" init -b master
@@ -1001,7 +1118,8 @@ clone_if_missing() {
       mkdir -p "$repo_dir"
       local vpx_ver="v1.15.0"
       echo "Downloading libvpx archive $vpx_ver..."
-      curl -L -f -o "$repo_dir/vpx.tar.gz" "https://chromium.googlesource.com/webm/libvpx/+archive/${vpx_ver}.tar.gz"
+      download_file_retry "$repo_dir/vpx.tar.gz" "https://chromium.googlesource.com/webm/libvpx/+archive/${vpx_ver}.tar.gz" \
+        || { rm -rf "$repo_dir"; return 1; }
       tar -C "$repo_dir" -xzf "$repo_dir/vpx.tar.gz"
       rm -f "$repo_dir/vpx.tar.gz"
       git -C "$repo_dir" init -b master
@@ -1052,8 +1170,8 @@ checkout_stable() {
 
   if [[ "$name" == "ffmpeg-source" ]]; then
     echo "     -> Switching $name to branch $tag..."
-    git -C "$repo_dir" checkout "$tag" 2>/dev/null || git -C "$repo_dir" switch "$tag"
-    git_retry git -C "$repo_dir" pull --ff-only origin "$tag"
+    git -C "$repo_dir" checkout -B "$tag" "origin/$tag" 2>/dev/null || \
+      git -C "$repo_dir" switch "$tag"
   else
     git -C "$repo_dir" switch --detach "$tag" 2>/dev/null || \
     git -C "$repo_dir" checkout --detach "$tag"
@@ -1081,14 +1199,14 @@ update_one() {
     clone_if_missing "$name"
   fi
 
-  # 强制使用 HTTPS 远程源以防 SSH 连接超时
+  # Keep the canonical URL after trying alternate transports below.
   local url="${URLS[$name]}"
   git -C "$repo_dir" remote set-url origin "$url" 2>/dev/null || true
 
   echo "===> fetch $name"
-  if ! git_retry git -C "$repo_dir" fetch --tags --prune --force origin; then
-    if [[ "$name" == "libiconv" ]] && git -C "$repo_dir" describe --tags --exact-match >/dev/null 2>&1; then
-      echo "libiconv official Git remote unavailable; using the clean local release tag"
+  if ! git_fetch_retry "$repo_dir" "$url"; then
+    if [[ "$name" == "libiconv" ]] && libiconv_local_release_is_usable "$repo_dir"; then
+      echo "libiconv upstream unavailable; using the clean local release tag"
       return 0
     fi
     return 1
@@ -2214,17 +2332,26 @@ EOF
       local iconv_stage iconv_version iconv_archive iconv_cache
       iconv_stage="$(stage_src "libiconv")"
       iconv_version="$(git -C "$iconv_stage" describe --tags --always | sed 's/^v//')"
+      [[ "$iconv_version" =~ ^[0-9]+(\.[0-9]+)+$ ]] || {
+        echo "libiconv source is not pinned to an exact release tag: $iconv_version" >&2
+        exit 1
+      }
       iconv_cache="$ROOT/toolchains/source-archives"
       iconv_archive="$iconv_cache/libiconv-$iconv_version.tar.gz"
+      if [[ -f "$iconv_archive" ]] && ! tar -tzf "$iconv_archive" >/dev/null 2>&1; then
+        echo "Discarding invalid cached libiconv archive: $iconv_archive" >&2
+        rm -f "$iconv_archive"
+      fi
       if [[ ! -f "$iconv_archive" ]]; then
         mkdir -p "$iconv_cache"
-        curl -fL --connect-timeout 15 -o "$iconv_archive.tmp" \
-          "https://ftp.gnu.org/pub/gnu/libiconv/libiconv-$iconv_version.tar.gz" || \
-          env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u all_proxy \
-            curl -fL --retry 4 --retry-all-errors --connect-timeout 20 \
-              -o "$iconv_archive.tmp" \
-              "https://ftp.gnu.org/pub/gnu/libiconv/libiconv-$iconv_version.tar.gz"
-        mv "$iconv_archive.tmp" "$iconv_archive"
+        download_file_retry "$iconv_archive" \
+          "https://ftp.gnu.org/pub/gnu/libiconv/libiconv-$iconv_version.tar.gz" \
+          || { echo "Unable to download libiconv $iconv_version" >&2; exit 1; }
+        tar -tzf "$iconv_archive" >/dev/null 2>&1 || {
+          echo "Downloaded libiconv archive is invalid: $iconv_archive" >&2
+          rm -f "$iconv_archive"
+          exit 1
+        }
       fi
       rm -rf "$iconv_stage"
       mkdir -p "$iconv_stage"
