@@ -2151,6 +2151,34 @@ encoder_smoke() {
     "$@" -f null - >/dev/null 2>&1
 }
 
+encoder_bitdepth_smoke() {
+  local ffmpeg="$1" encoder="$2" pix_fmt="$3"
+  local ffprobe actual muxer=matroska
+  [[ "$encoder" == libaom-av1 ]] && muxer=nut
+  ffprobe="$(dirname "$ffmpeg")/ffprobe.exe"
+  [[ -x "$ffprobe" ]] || {
+    echo "ffprobe is missing beside $ffmpeg" >&2
+    exit 1
+  }
+
+  actual="$(
+    "$ffmpeg" -hide_banner -loglevel error \
+      -f lavfi -i "testsrc2=size=192x108:rate=1,format=$pix_fmt" \
+      -frames:v 2 -an -c:v "$encoder" -pix_fmt "$pix_fmt" \
+      -f "$muxer" - |
+    "$ffprobe" -hide_banner -v error -select_streams v:0 \
+      -show_entries stream=pix_fmt -of csv=p=0 -
+  )" || {
+    echo "$encoder failed $pix_fmt encode" >&2
+    exit 1
+  }
+  actual="${actual//$'\r'/}"
+  [[ "$actual" == "$pix_fmt" ]] || {
+    echo "$encoder produced $actual instead of $pix_fmt" >&2
+    exit 1
+  }
+}
+
 expect_encoder_param_rejected() {
   local ffmpeg="$1" encoder="$2" option="$3"
   shift 3
@@ -2174,6 +2202,28 @@ verify_encoder_params() {
   expect_encoder_param_rejected "$ffmpeg" libx264 -x264-params
   expect_encoder_param_rejected "$ffmpeg" libx265 -x265-params
   expect_encoder_param_rejected "$ffmpeg" libvvenc -vvenc-params -pix_fmt yuv420p10le
+}
+
+verify_encoder_bitdepths() {
+  local ffmpeg="$1"
+  echo "== Verify encoder bit-depth output =="
+  encoder_bitdepth_smoke "$ffmpeg" libx264 yuv420p10le
+  encoder_bitdepth_smoke "$ffmpeg" libx264 yuv422p10le
+  encoder_bitdepth_smoke "$ffmpeg" libx264 yuv444p10le
+
+  encoder_bitdepth_smoke "$ffmpeg" libx265 yuv420p10le
+  encoder_bitdepth_smoke "$ffmpeg" libx265 yuv422p10le
+  encoder_bitdepth_smoke "$ffmpeg" libx265 yuv444p10le
+  encoder_bitdepth_smoke "$ffmpeg" libx265 yuv420p12le
+  encoder_bitdepth_smoke "$ffmpeg" libx265 yuv422p12le
+  encoder_bitdepth_smoke "$ffmpeg" libx265 yuv444p12le
+
+  encoder_bitdepth_smoke "$ffmpeg" libvpx-vp9 yuv420p10le
+  encoder_bitdepth_smoke "$ffmpeg" libvpx-vp9 yuv420p12le
+  encoder_bitdepth_smoke "$ffmpeg" libaom-av1 yuv420p10le
+  encoder_bitdepth_smoke "$ffmpeg" libaom-av1 yuv420p12le
+  encoder_bitdepth_smoke "$ffmpeg" libsvtav1 yuv420p10le
+  encoder_bitdepth_smoke "$ffmpeg" libvvenc yuv420p10le
 }
 
 verify_aac_at() {
@@ -2514,6 +2564,7 @@ EOF
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_INSTALL_PREFIX="$PREFIX" \
         -DBUILD_SHARED_LIBS=OFF \
+        -DCONFIG_AV1_HIGHBITDEPTH=1 \
         -DENABLE_EXAMPLES=OFF \
         -DENABLE_TESTS=OFF \
         -DENABLE_TOOLS=OFF \
@@ -3239,6 +3290,7 @@ EOF
         --enable-static \
         --enable-pic \
         --disable-cli \
+        --bit-depth=all \
         --extra-cflags="$CFLAGS" \
         --extra-ldflags="$LDFLAGS"
       make -j"$JOBS"
@@ -3254,22 +3306,72 @@ EOF
       sed -i 's/cmake_policy(SET CMP0054 OLD)/cmake_policy(SET CMP0054 NEW)/g' "$stage/CMakeLists.txt"
       local bld="$BUILDROOT/x265"
       rm -rf "$bld"
-      cmake -S "$stage" -B "$bld" -G Ninja \
-        -DCMAKE_SYSTEM_NAME=Windows \
-        -DCMAKE_SYSTEM_PROCESSOR=x86_64 \
-        -DCMAKE_C_COMPILER="$CC" \
-        -DCMAKE_CXX_COMPILER="$CXX" \
-        -DCMAKE_RC_COMPILER="$WINDRES" \
-        -DCMAKE_AR="$AR" \
-        -DCMAKE_RANLIB="$RANLIB" \
-        -DCMAKE_BUILD_TYPE=Release \
-        -DCMAKE_INSTALL_PREFIX="$PREFIX" \
-        -DBUILD_SHARED_LIBS=OFF \
-        -DENABLE_SHARED=OFF \
-        -DENABLE_CLI=OFF \
+      local bld8="$bld/8bit"
+      local bld10="$bld/10bit"
+      local bld12="$bld/12bit"
+      local common_cmake_args=(
+        -DCMAKE_SYSTEM_NAME=Windows
+        -DCMAKE_SYSTEM_PROCESSOR=x86_64
+        -DCMAKE_C_COMPILER="$CC"
+        -DCMAKE_CXX_COMPILER="$CXX"
+        -DCMAKE_RC_COMPILER="$WINDRES"
+        -DCMAKE_AR="$AR"
+        -DCMAKE_RANLIB="$RANLIB"
+        -DCMAKE_BUILD_TYPE=Release
+        -DCMAKE_INSTALL_PREFIX="$PREFIX"
+        -DBUILD_SHARED_LIBS=OFF
+        -DENABLE_SHARED=OFF
+        -DENABLE_CLI=OFF
         -DCMAKE_POLICY_VERSION_MINIMUM=3.5
-      cmake --build "$bld" --parallel "$JOBS"
-      cmake --install "$bld"
+      )
+
+      # x265's FFmpeg integration needs one archive containing the 8/10/12-bit
+      # implementations. Building only the default 8-bit library makes FFmpeg
+      # silently convert high-bit-depth input back to 8-bit.
+      cmake -S "$stage" -B "$bld12" -G Ninja \
+        "${common_cmake_args[@]}" \
+        -DEXPORT_C_API=OFF \
+        -DHIGH_BIT_DEPTH=ON \
+        -DMAIN12=ON
+      cmake --build "$bld12" --parallel "$JOBS"
+
+      cmake -S "$stage" -B "$bld10" -G Ninja \
+        "${common_cmake_args[@]}" \
+        -DEXPORT_C_API=OFF \
+        -DHIGH_BIT_DEPTH=ON
+      cmake --build "$bld10" --parallel "$JOBS"
+
+      mkdir -p "$bld8"
+      cp -f "$bld10/libx265.a" "$bld8/x265_main10.a"
+      cp -f "$bld12/libx265.a" "$bld8/x265_main12.a"
+      cmake -S "$stage" -B "$bld8" -G Ninja \
+        "${common_cmake_args[@]}" \
+        -DEXTRA_LIB='x265_main10.a;x265_main12.a' \
+        -DEXTRA_LINK_FLAGS=-L. \
+        -DLINKED_10BIT=ON \
+        -DLINKED_12BIT=ON
+      cmake --build "$bld8" --parallel "$JOBS"
+
+      mv "$bld8/libx265.a" "$bld8/libx265_main.a"
+      "$AR" -M <<EOF
+CREATE $bld8/libx265.a
+ADDLIB $bld8/libx265_main.a
+ADDLIB $bld8/x265_main10.a
+ADDLIB $bld8/x265_main12.a
+SAVE
+END
+EOF
+
+      grep -q '^HIGH_BIT_DEPTH:BOOL=ON$' "$bld10/CMakeCache.txt"
+      grep -q '^HIGH_BIT_DEPTH:BOOL=ON$' "$bld12/CMakeCache.txt"
+      grep -q '^MAIN12:BOOL=ON$' "$bld12/CMakeCache.txt"
+      grep -q '^LINKED_10BIT:BOOL=ON$' "$bld8/CMakeCache.txt"
+      grep -q '^LINKED_12BIT:BOOL=ON$' "$bld8/CMakeCache.txt"
+      [[ -s "$bld8/libx265.a" ]] || {
+        echo "x265 multilib archive was not created" >&2
+        exit 1
+      }
+      cmake --install "$bld8"
       ;;
 
     vmaf)
@@ -3791,6 +3893,7 @@ EOF
       make -j"$FFMPEG_JOBS"
       make install
       verify_encoder_params "$PREFIX/bin/ffmpeg.exe"
+      verify_encoder_bitdepths "$PREFIX/bin/ffmpeg.exe"
       verify_vmaf "$PREFIX/bin/ffmpeg.exe"
       popd >/dev/null
 
