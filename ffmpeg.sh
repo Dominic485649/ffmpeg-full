@@ -2,6 +2,9 @@
 # ==============================================================================
 # FFmpeg 全功能交叉编译集成脚本 (MinGW-w64 x86_64-w64-mingw32)
 # ==============================================================================
+export LANG=C.UTF-8
+export LC_ALL=C.UTF-8
+export PYTHONIOENCODING=UTF-8
 set -Eeuo pipefail
 
 # 1. 运行路径安全校验
@@ -60,6 +63,7 @@ SOURCE_FETCH_TIMEOUT="${SOURCE_FETCH_TIMEOUT:-30}"
 SOURCE_DOWNLOAD_TIMEOUT="${SOURCE_DOWNLOAD_TIMEOUT:-600}"
 
 # 编译优化选项
+BUILD_STARTED_AT=""
 OPT_CFLAGS_BASE="${OPT_CFLAGS_BASE:--O3 -pipe -DNDEBUG -funwind-tables -fexceptions}"
 INLINE_ENABLE="${INLINE_ENABLE:-1}"
 INLINE_FLAGS="${INLINE_FLAGS:--finline-functions}"
@@ -70,7 +74,7 @@ CPU_FLAGS="${CPU_FLAGS:--march=x86-64-v3 -mtune=generic}"
 
 # CUDA/NVENC 配置
 CUDA_ENABLE="${CUDA_ENABLE:-1}"
-CUDA_REDIST_ROOT="${CUDA_REDIST_ROOT:-$ROOT/toolchains/cuda-redist-13.3.0/install/linux}"
+CUDA_REDIST_ROOT="${CUDA_REDIST_ROOT:-}"
 CUDA_HOME="${CUDA_HOME:-}"
 NVCC="${NVCC:-}"
 NVCC_GENCODE_FLAGS="${NVCC_GENCODE_FLAGS:--gencode arch=compute_75,code=sm_75 -gencode arch=compute_80,code=sm_80 -gencode arch=compute_86,code=sm_86 -gencode arch=compute_89,code=sm_89 -gencode arch=compute_120,code=sm_120 -gencode arch=compute_120,code=compute_120}"
@@ -78,9 +82,6 @@ NVCC_OPTFLAGS="${NVCC_OPTFLAGS:--O3 --extra-device-vectorization}"
 NVCC_THREADS="${NVCC_THREADS:-0}"
 NVCC_PTXAS_FLAGS="${NVCC_PTXAS_FLAGS:--O3}"
 NVCC_FAST_MATH="${NVCC_FAST_MATH:-1}"
-# libvmaf CUDA requires CUDA driver-table functions added after n13.0.19.0.
-NVCODEC_VMAF_CUDA_REF="876af32a202d0de83bd1d36fe74ee0f7fcf86b0d"
-
 # Git 源码库 URL 映射
 declare -A URLS=(
   [ffmpeg-source]="https://github.com/FFmpeg/FFmpeg.git"
@@ -98,7 +99,7 @@ declare -A URLS=(
   [expat]="https://github.com/libexpat/libexpat.git"
   [brotli]="https://github.com/google/brotli.git"
   [dav1d]="https://code.videolan.org/videolan/dav1d.git"
-  [svtav1hdr]="https://github.com/juliobbv-p/svt-av1-hdr.git"
+  [svtav1]="https://gitlab.com/AOMediaCodec/SVT-AV1.git"
   [libvpl]="https://github.com/intel/libvpl.git"
   [vapoursynth]="https://github.com/vapoursynth/vapoursynth.git"
   [x264]="https://github.com/mirror/x264.git"
@@ -171,7 +172,7 @@ declare -A TAG_REGEX=(
   [expat]='^R_[0-9]+(_[0-9]+)+$'
   [brotli]='^v?[0-9]+(\.[0-9]+)*$'
   [dav1d]='^[0-9]+(\.[0-9]+)*$'
-  [svtav1hdr]='^v[0-9]+(\.[0-9]+)*$'
+  [svtav1]='^v[0-9]+(\.[0-9]+)*$'
   [libvpl]='^v2\.[0-9]+(\.[0-9]+)*$'
   [vapoursynth]='^R[0-9]+(\.[0-9]+)*$'
   [x264]='stable|master'
@@ -219,12 +220,12 @@ declare -A TAG_REGEX=(
   [libdvdread]='^v?[0-9]+(\.[0-9]+)+$'
   [libdvdnav]='^v?[0-9]+(\.[0-9]+)+$'
   [chromaprint]='^v?[0-9]+(\.[0-9]+)+$'
-  [libzmq]='^v?[0-9]+(\.[0-9]+)+$'
+  [libzmq]='master'
   [libzvbi]='^v?[0-9]+(\.[0-9]+)+$'
-  [libgsm]='^v?[0-9]+(\.[0-9]+)*([_-]pl[0-9]+)?$'
+  [libgsm]='master'
   [opencore-amr]='^v?[0-9]+(\.[0-9]+)+$'
   [vo-amrwbenc]='^v?[0-9]+(\.[0-9]+)+$'
-  [AudioToolboxWrapper]='^v?[0-9]+(\.[0-9]+)*$'
+  [AudioToolboxWrapper]='master'
 )
 
 # 编译依赖阶段列表
@@ -285,7 +286,7 @@ STAGES=(
   "brotli"
   "libjxl"
   "dav1d"
-  "svtav1hdr"
+  "svtav1"
   "libvpl"
   "vapoursynth"
   "x264"
@@ -1093,9 +1094,6 @@ local_source_is_usable() {
   git -C "$repo_dir" diff --quiet && git -C "$repo_dir" diff --cached --quiet
   case "$name" in
     ffmpeg-source) return 1 ;;
-    nv-codec-headers)
-      [[ "$(git -C "$repo_dir" rev-parse HEAD)" == "$NVCODEC_VMAF_CUDA_REF" ]]
-      ;;
     *)
       tag="$(git -C "$repo_dir" describe --tags --exact-match 2>/dev/null || true)"
       if [[ -n "$tag" && "$tag" =~ ${TAG_REGEX[$name]} ]]; then
@@ -1118,42 +1116,9 @@ clone_if_missing() {
 
   if [[ ! -d "$repo_dir/.git" ]]; then
     echo "===> clone $name from $url"
-    if [[ "$name" == "libaom" ]]; then
-      mkdir -p "$repo_dir"
-      local aom_ver="v3.12.0"
-      echo "Downloading libaom archive $aom_ver..."
-      download_file_retry "$repo_dir/aom.tar.gz" "https://aomedia.googlesource.com/aom/+archive/${aom_ver}.tar.gz" \
-        || { rm -rf "$repo_dir"; return 1; }
-      tar -C "$repo_dir" -xzf "$repo_dir/aom.tar.gz"
-      rm -f "$repo_dir/aom.tar.gz"
-      git -C "$repo_dir" init -b master
-      git -C "$repo_dir" config user.email "build@example.com"
-      git -C "$repo_dir" config user.name "Builder"
-      git -C "$repo_dir" add .
-      git -C "$repo_dir" commit -m "Import libaom $aom_ver"
-      git -C "$repo_dir" tag "$aom_ver"
-      git -C "$repo_dir" remote add origin "$url"
-    elif [[ "$name" == "libvpx" ]]; then
-      mkdir -p "$repo_dir"
-      local vpx_ver="v1.15.0"
-      echo "Downloading libvpx archive $vpx_ver..."
-      download_file_retry "$repo_dir/vpx.tar.gz" "https://chromium.googlesource.com/webm/libvpx/+archive/${vpx_ver}.tar.gz" \
-        || { rm -rf "$repo_dir"; return 1; }
-      tar -C "$repo_dir" -xzf "$repo_dir/vpx.tar.gz"
-      rm -f "$repo_dir/vpx.tar.gz"
-      git -C "$repo_dir" init -b master
-      git -C "$repo_dir" config user.email "build@example.com"
-      git -C "$repo_dir" config user.name "Builder"
-      git -C "$repo_dir" add .
-      git -C "$repo_dir" commit -m "Import libvpx $vpx_ver"
-      git -C "$repo_dir" tag "$vpx_ver"
-      git -C "$repo_dir" remote add origin "$url"
-
-    else
-      git config --global http.version HTTP/1.1 || true
-      git config --global http.postBuffer 1048576000 || true
-      git_clone_retry "$url" "$repo_dir"
-    fi
+    git config --global http.version HTTP/1.1 || true
+    git config --global http.postBuffer 1048576000 || true
+    git_clone_retry "$url" "$repo_dir"
   fi
 }
 
@@ -1161,17 +1126,34 @@ latest_stable_tag() {
   local name="$1"
   local repo_dir="$ROOT/$name"
   local regex="${TAG_REGEX[$name]}"
+  local tag branch
 
-  git -C "$repo_dir" for-each-ref --format='%(refname:short)' refs/tags \
+  tag="$(git -C "$repo_dir" for-each-ref --format='%(refname:short)' refs/tags \
     | sed 's/\^{}$//' \
     | sort -u \
     | { grep -E "$regex" || true; } \
     | while read -r tag; do
-        printf "%s\t%s\n" "$(normalize_version "$name" "$tag")" "$tag"
+        printf "%s	%s
+" "$(normalize_version "$name" "$tag")" "$tag"
       done \
     | sort -V \
     | tail -n 1 \
-    | cut -f2
+    | cut -f2)"
+  if [[ -n "$tag" ]]; then
+    printf '%s
+' "$tag"
+    return 0
+  fi
+
+  # x264 publishes stable source as branches rather than version tags.
+  for branch in stable master main; do
+    if [[ "$regex" == *"$branch"* ]] \
+      && git -C "$repo_dir" show-ref --verify --quiet "refs/remotes/origin/$branch"; then
+      printf '%s
+' "$branch"
+      return 0
+    fi
+  done
 }
 
 sanitize_repo() {
@@ -1191,6 +1173,9 @@ checkout_stable() {
     echo "     -> Switching $name to branch $tag..."
     git -C "$repo_dir" checkout -B "$tag" "origin/$tag" 2>/dev/null || \
       git -C "$repo_dir" switch "$tag"
+  elif git -C "$repo_dir" show-ref --verify --quiet "refs/remotes/origin/$tag"; then
+    echo "     -> Switching $name to branch $tag..."
+    git -C "$repo_dir" checkout -B "$tag" "origin/$tag"
   else
     git -C "$repo_dir" switch --detach "$tag" 2>/dev/null || \
     git -C "$repo_dir" checkout --detach "$tag"
@@ -1224,29 +1209,25 @@ update_one() {
 
   echo "===> fetch $name"
   if ! git_fetch_retry "$repo_dir" "$url"; then
-    if local_source_is_usable "$name" "$repo_dir"; then
-      echo "$name upstream Git unavailable; using the clean pinned local ref"
-      return 0
+    if [[ "${ALLOW_OFFLINE_STABLE_SOURCE:-0}" == "1" ]] \
+      && local_source_is_usable "$name" "$repo_dir"; then
+      echo "$name upstream Git unavailable; using existing verified stable source" >&2
+    else
+      echo "$name upstream Git unavailable; refusing to reuse a possibly stale source" >&2
+      return 1
     fi
-    return 1
   fi
 
   local tag=""
   if [[ "$name" == "ffmpeg-source" ]]; then
     tag="$FFMPEG_REF"
-  elif [[ "$name" == "nv-codec-headers" ]]; then
-    tag="$NVCODEC_VMAF_CUDA_REF"
   else
     tag="$(latest_stable_tag "$name")"
   fi
 
   if [[ -z "$tag" ]]; then
-    # 若无匹配 Tag，退回到 master/main 分支
-    tag="master"
-    if ! git -C "$repo_dir" show-ref --verify --quiet "refs/remotes/origin/$tag"; then
-      tag="main"
-    fi
-    echo "No stable tag matched for $name, falling back to branch $tag"
+    echo "No stable release tag matched for $name; refusing to build an unversioned source" >&2
+    return 1
   fi
 
   checkout_stable "$name" "$tag"
@@ -1273,7 +1254,7 @@ run_update() {
     expat
     brotli
     dav1d
-    svtav1hdr
+    svtav1
     libvpl
     vapoursynth
     x264
@@ -1413,7 +1394,7 @@ normalize_stage() {
     brotli) echo "brotli" ;;
     libjxl|jxl) echo "libjxl" ;;
     dav1d) echo "dav1d" ;;
-    svtav1hdr|svtav1|svt-av1|svt) echo "svtav1hdr" ;;
+    svtav1|svt-av1|svt) echo "svtav1" ;;
     libvpl|vpl) echo "libvpl" ;;
     vapoursynth|vs) echo "vapoursynth" ;;
     x264) echo "x264" ;;
@@ -3067,7 +3048,10 @@ EOF
       ;;
 
     zimg)
-      build_autotools zimg --disable-openmp
+      # LLVM 23 libc++ no longer provides std::exception_ptr through zimg's
+      # transitive <stdexcept> include; inject the standard owning header only
+      # for zimg without changing its source/update policy.
+      CXXFLAGS="$CXXFLAGS -include exception" build_autotools zimg --disable-openmp
       ;;
 
     freetype)
@@ -3227,8 +3211,8 @@ EOF
         -Denable_asm=true
       ;;
 
-    svtav1hdr)
-      build_cmake svtav1hdr \
+    svtav1)
+      build_cmake svtav1 \
         -DENABLE_AVX512=ON \
         -DBUILD_DEC=ON \
         -DBUILD_ENC=ON \
@@ -3377,6 +3361,16 @@ EOF
     vmaf)
       local stage
       stage="$(stage_src "vmaf")/libvmaf"
+
+      # LLVM 23 libc++ performs unqualified swap() calls in vector internals.
+      # libvmaf 3.2.0's bundled libsvm also defines a global swap() template,
+      # which becomes an ambiguous ADL candidate. Rename only that private
+      # helper in the staged copy; keep the upstream source/update policy intact.
+      local svm_cpp="$stage/src/svm.cpp"
+      if grep -Fq 'template <class T> static inline void swap(T& x, T& y)' "$svm_cpp"; then
+        perl -0pi -e 's/\bswap\(/vmaf_svm_swap(/g' "$svm_cpp"
+      fi
+
       # Upstream CUDA custom targets use paths relative to libvmaf/build/src.
       local bld="$stage/build-mingw"
       rm -rf "$bld"
@@ -3430,6 +3424,7 @@ EOF
         -DCMAKE_INSTALL_PREFIX="$PREFIX" \
         -DBUILD_SHARED_LIBS=OFF \
         -DVVENC_ENABLE_LINK_TIME_OPT=OFF \
+        -DVVENC_ENABLE_WERROR=OFF \
         -DCMAKE_POLICY_VERSION_MINIMUM=3.5
       cmake --build "$bld" --parallel "$JOBS"
       cmake --install "$bld"
@@ -3452,6 +3447,7 @@ EOF
         -DCMAKE_INSTALL_PREFIX="$PREFIX" \
         -DBUILD_SHARED_LIBS=OFF \
         -DVVDEC_ENABLE_LINK_TIME_OPT=OFF \
+        -DVVDEC_ENABLE_WERROR=OFF \
         -DCMAKE_POLICY_VERSION_MINIMUM=3.5
       cmake --build "$bld" --parallel "$JOBS"
       cmake --install "$bld"
@@ -3611,7 +3607,7 @@ EOF
         exit 1
       }
       PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" "$PKG_CONFIG" --exists SvtAv1Enc || {
-        echo "缺少 SvtAv1Enc，请先编译 svtav1hdr 阶段"
+        echo "缺少 SvtAv1Enc，请先编译 svtav1 阶段"
         exit 1
       }
       PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" "$PKG_CONFIG" --exists x264 || {
@@ -3892,18 +3888,13 @@ EOF
       verify_full_ffmpeg_config ffbuild/config.mak "$ff_stage"
       make -j"$FFMPEG_JOBS"
       make install
-      verify_encoder_params "$PREFIX/bin/ffmpeg.exe"
-      verify_encoder_bitdepths "$PREFIX/bin/ffmpeg.exe"
-      verify_vmaf "$PREFIX/bin/ffmpeg.exe"
-      popd >/dev/null
+      # Stage the exact packaged runtime before executing the Windows binaries.
 
-      # 拷贝编译好的可执行文件至 full 目录并剥离调试信息
       "$STRIP" "$PREFIX/bin/ffmpeg.exe" || true
       "$STRIP" "$PREFIX/bin/ffprobe.exe" || true
       "$STRIP" "$PREFIX/bin/ffplay.exe" || true
       "$STRIP" "$PREFIX/bin/"*.dll 2>/dev/null || true
       
-      # 仅拷贝 FFmpeg 程序和运行时 DLL。
       mkdir -p "$ROOT/full"
       find "$ROOT/full" -maxdepth 1 -type f \( -iname "*.exe" -o -iname "*.dll" \) -delete
       rm -rf "$ROOT/full/plugins"
@@ -3912,9 +3903,12 @@ EOF
       cp -f "$PREFIX/bin/ffplay.exe" "$ROOT/full/ffplay.exe" 2>/dev/null || true
       find "$PREFIX/bin" -maxdepth 1 -type f -iname "*.dll" -exec cp -f {} "$ROOT/full/" \;
 
-      # 递归补齐非系统 DLL 依赖，覆盖 Clang/GCC 运行时和第三方 DLL。
       seed_apple_audio_runtime
       copy_runtime_dll_closure
+      verify_encoder_params "$ROOT/full/ffmpeg.exe"
+      verify_encoder_bitdepths "$ROOT/full/ffmpeg.exe"
+      verify_vmaf "$ROOT/full/ffmpeg.exe"
+      popd >/dev/null
       verify_aac_at "$ROOT/full/ffmpeg.exe"
       ;;
 
@@ -3935,13 +3929,32 @@ is_in_array() {
   return 1
 }
 
+write_full_manifest() {
+  python3 "$ROOT/build-manifests/write_manifest.py" \
+    --root "$ROOT" \
+    --build-name full \
+    --prefix "$PREFIX" \
+    --artifact-dir "$ROOT/full" \
+    --configure-file "$BUILDROOT/_src/ffmpeg-source/ffbuild/config.log" \
+    --config-mak "$BUILDROOT/_src/ffmpeg-source/ffbuild/config.mak" \
+    --started "$BUILD_STARTED_AT" \
+    --target-platform "Windows x86_64 via $TARGET" \
+    --cpu-minimum "$CPU_FLAGS" \
+    --validate "Full configure enabled libopus and native AAC" \
+    --validate "Full shared FFmpeg build and runtime DLL closure completed" \
+    --validate "Full FFmpeg version and configured feature listing checked"
+  echo "Build source manifest written for full"
+}
+
 run_build() {
+  BUILD_STARTED_AT="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
   local start_arg="${1:-}"
   shift || true
   local only_args=("$@")
   local START_STAGE=""
   local only_stages=()
   local FULL_BUILD=1
+  local BUILT_FFMPEG=0
 
   if [[ ${#only_args[@]} -gt 0 ]]; then
     local arg
@@ -3992,6 +4005,7 @@ run_build() {
     if [[ ${#only_stages[@]} -gt 0 ]]; then
       if is_in_array "$stage" "${only_stages[@]}"; then
         run_stage "$stage"
+        [[ "$stage" == "ffmpeg" ]] && BUILT_FFMPEG=1
       fi
     else
       if [[ "$FULL_BUILD" -eq 1 ]]; then
@@ -4002,11 +4016,15 @@ run_build() {
 
       if [[ "$RUN" -eq 1 ]]; then
         run_stage "$stage"
+        [[ "$stage" == "ffmpeg" ]] && BUILT_FFMPEG=1
       fi
     fi
   done
 
   CURRENT_STAGE=""
+  if [[ "$FULL_BUILD" -eq 1 || "$BUILT_FFMPEG" -eq 1 ]]; then
+    write_full_manifest
+  fi
   echo
   echo "============================================================"
   if [[ ${#only_stages[@]} -gt 0 ]]; then
