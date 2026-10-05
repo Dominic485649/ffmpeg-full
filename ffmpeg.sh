@@ -62,7 +62,7 @@ APPLE_ITUNES_INSTALLER="${APPLE_ITUNES_INSTALLER:-$ROOT/toolchains/source-archiv
 APPLE_AUDIO_RUNTIME_DIR="${APPLE_AUDIO_RUNTIME_DIR:-$ROOT/toolchains/apple-application-support}"
 SOURCE_FETCH_TIMEOUT="${SOURCE_FETCH_TIMEOUT:-30}"
 SOURCE_DOWNLOAD_TIMEOUT="${SOURCE_DOWNLOAD_TIMEOUT:-600}"
-INCREMENTAL_BUILD="${INCREMENTAL_BUILD:-0}"
+INCREMENTAL_BUILD="${INCREMENTAL_BUILD:-1}"
 
 # 编译优化选项
 BUILD_STARTED_AT=""
@@ -747,8 +747,8 @@ toolchain_ready() {
 
 run_tool() {
   echo "===> [子命令: tool] 检测与安装构建工具链..."
-  if [[ "${TOOLCHAIN_REFRESH:-0}" != "1" ]] && toolchain_ready; then
-    echo "Reuse existing toolchain. Set TOOLCHAIN_REFRESH=1 to refresh it."
+  if [[ "${TOOLCHAIN_REFRESH:-1}" != "1" ]] && toolchain_ready; then
+    echo "Reuse existing toolchain by request (TOOLCHAIN_REFRESH=0)."
     return
   fi
 
@@ -1150,7 +1150,7 @@ clone_if_missing() {
   local repo_dir="$ROOT/$name"
   local url="${URLS[$name]}"
 
-  if [[ ! -d "$repo_dir/.git" ]]; then
+  if [[ ! -e "$repo_dir/.git" ]]; then
     echo "===> clone $name from $url"
     git config --global http.version HTTP/1.1 || true
     git config --global http.postBuffer 1048576000 || true
@@ -1192,10 +1192,18 @@ latest_stable_tag() {
   done
 }
 
-sanitize_repo() {
-  local repo_dir="$1"
-  git -C "$repo_dir" reset --hard
-  git -C "$repo_dir" clean -fdx
+verify_source_repo_clean() {
+  local repo_dir="$1" status
+  git -C "$repo_dir" rev-parse --git-dir >/dev/null 2>&1 || {
+    echo "无效的 Git 源码仓库: $repo_dir；为避免丢失内容，不会自动删除或重克隆" >&2
+    return 1
+  }
+  status="$(git -C "$repo_dir" status --porcelain --untracked-files=normal)"
+  if [[ -n "$status" ]]; then
+    echo "源码仓库有本地修改，停止更新以保护现场: $repo_dir" >&2
+    printf '%s\n' "$status" >&2
+    return 1
+  fi
 }
 
 checkout_stable() {
@@ -1232,12 +1240,8 @@ update_one() {
 
   clone_if_missing "$name"
 
-  echo "===> sanitize $name"
-  if ! sanitize_repo "$repo_dir"; then
-    echo "incomplete source tree detected, recloning $name"
-    rm -rf "$repo_dir"
-    clone_if_missing "$name"
-  fi
+  echo "===> verify clean source tree $name"
+  verify_source_repo_clean "$repo_dir" || return 1
 
   # Keep the canonical URL after trying alternate transports below.
   local url="${URLS[$name]}"
@@ -1687,7 +1691,10 @@ build_autotools() {
 
   pushd "$stage" >/dev/null
 
-  if [[ ! -x ./configure ]]; then
+  if [[ "$name" == "opencore-amr" ]]; then
+    # Its generated configure and tracked ltmain.sh can use different libtool versions.
+    autoreconf -fiv
+  elif [[ ! -x ./configure ]]; then
     if [[ "$name" == "libtwolame" ]]; then
       # twolame's autogen.sh immediately configures in maintainer mode and then
       # requires asciidoc. Generate the release build system without that step.
@@ -1725,6 +1732,35 @@ build_autotools() {
   popd >/dev/null
 }
 
+build_cache_fingerprint() {
+  local name="$1" stage="$2" kind="$3"
+  shift 3
+  local key tool var file
+  {
+    printf 'kind=%s\nname=%s\nstage=%s\n' "$kind" "$name" "$stage"
+    for key in "$@"; do printf 'arg=%s\n' "$key"; done
+    for var in TARGET PREFIX CC CXX AR RANLIB STRIP WINDRES DLLTOOL CFLAGS CXXFLAGS LDFLAGS OPT_FLAGS CPU_FLAGS LTO_ENABLE; do
+      declare -p "$var" 2>/dev/null || printf '%s=<unset>\n' "$var"
+    done
+    for tool in "$CC" "$CXX" "$AR" cmake ninja meson; do
+      [[ -n "$tool" ]] || continue
+      printf 'tool=%s\n' "$tool"
+      command -v "$tool" 2>/dev/null || true
+      "$tool" --version 2>/dev/null | head -n 1 || true
+    done
+    if [[ -f "$BUILDROOT/mingw-cross.txt" ]]; then sha256sum "$BUILDROOT/mingw-cross.txt"; fi
+    if git -C "$stage" rev-parse --git-dir >/dev/null 2>&1; then
+      git -C "$stage" rev-parse HEAD
+      git -C "$stage" diff --binary HEAD | sha256sum
+      while IFS= read -r -d '' file; do
+        [[ -f "$stage/$file" ]] && sha256sum "$stage/$file"
+      done < <(git -C "$stage" ls-files --others --exclude-standard -z)
+    else
+      find "$stage" -type f -not -path "$stage/.git/*" -print0 | sort -z | xargs -0 -r sha256sum
+    fi
+  } | sha256sum | awk '{print $1}'
+}
+
 build_cmake() {
   local name="$1"
   shift
@@ -1750,10 +1786,21 @@ else:
 PYVPLMINGW
   fi
   local bld="$BUILDROOT/$name"
-  local ipo=OFF
+  local ipo=OFF cache_key cache_stamp
   [[ "$LTO_ENABLE" == "1" ]] && ipo=ON
-
-  rm -rf "$bld"
+  cache_stamp="$BUILDROOT/.cache-keys/$name.cmake.sha256"
+  if [[ "$INCREMENTAL_BUILD" == "1" ]]; then
+    cache_key="$(build_cache_fingerprint "$name" "$stage" cmake "$@")"
+    if [[ -d "$bld" && -f "$cache_stamp" && "$(<"$cache_stamp")" == "$cache_key" ]]; then
+      echo "复用 $name 的 CMake 缓存（源码、工具链、配置指纹一致）"
+    else
+      rm -rf "$bld"
+      rm -f "$cache_stamp"
+    fi
+  else
+    rm -rf "$bld"
+    rm -f "$cache_stamp"
+  fi
 
   cmake -S "$stage" -B "$bld" -G Ninja \
     -DCMAKE_SYSTEM_NAME=Windows \
@@ -1779,6 +1826,11 @@ PYVPLMINGW
 
   cmake --build "$bld" --parallel "$JOBS"
   cmake --install "$bld"
+  if [[ "$INCREMENTAL_BUILD" == "1" ]]; then
+    mkdir -p "$(dirname "$cache_stamp")"
+    printf '%s\n' "$cache_key" >"$cache_stamp.tmp"
+    mv -f "$cache_stamp.tmp" "$cache_stamp"
+  fi
 }
 
 build_meson() {
@@ -1787,6 +1839,7 @@ build_meson() {
   local stage
   stage="$(stage_src "$name")"
   local bld="$BUILDROOT/$name"
+  local cache_key cache_stamp cache_hit=0
 
   if [[ "$name" == "libdvdread" ]]; then
     # Its optional ChangeLog target runs `git log` from the Meson build dir.
@@ -1794,18 +1847,46 @@ build_meson() {
     rm -f "$stage/.git/logs/HEAD"
   fi
 
-  rm -rf "$bld"
+  cache_stamp="$BUILDROOT/.cache-keys/$name.meson.sha256"
+  if [[ "$INCREMENTAL_BUILD" == "1" ]]; then
+    cache_key="$(build_cache_fingerprint "$name" "$stage" meson "$@" --cross-file "$BUILDROOT/mingw-cross.txt" --prefix "$PREFIX")"
+    if [[ -d "$bld" && -f "$cache_stamp" && "$(<"$cache_stamp")" == "$cache_key" ]]; then
+      cache_hit=1
+      echo "复用 $name 的 Meson 缓存（源码、工具链、配置指纹一致）"
+    else
+      rm -rf "$bld"
+      rm -f "$cache_stamp"
+    fi
+  else
+    rm -rf "$bld"
+    rm -f "$cache_stamp"
+  fi
 
-  meson setup "$bld" "$stage" \
-    --cross-file "$BUILDROOT/mingw-cross.txt" \
-    --prefix "$PREFIX" \
-    --buildtype release \
-    --default-library=static \
-    -Doptimization=3 \
-    "$@"
+  if ((cache_hit)); then
+    meson setup --reconfigure "$bld" "$stage" \
+      --cross-file "$BUILDROOT/mingw-cross.txt" \
+      --prefix "$PREFIX" \
+      --buildtype release \
+      --default-library=static \
+      -Doptimization=3 \
+      "$@"
+  else
+    meson setup "$bld" "$stage" \
+        --cross-file "$BUILDROOT/mingw-cross.txt" \
+      --prefix "$PREFIX" \
+      --buildtype release \
+      --default-library=static \
+      -Doptimization=3 \
+      "$@"
+  fi
 
   meson compile -C "$bld" -j "$JOBS"
   meson install -C "$bld"
+  if [[ "$INCREMENTAL_BUILD" == "1" ]]; then
+    mkdir -p "$(dirname "$cache_stamp")"
+    printf '%s\n' "$cache_key" >"$cache_stamp.tmp"
+    mv -f "$cache_stamp.tmp" "$cache_stamp"
+  fi
 }
 
 setup_build_env() {
@@ -2493,13 +2574,14 @@ PYJXR
 
 verify_jxr_binary() {
   local exe="$1" test_dir="${2:-$BUILDROOT/jxr-validation}"
-  local encoders decoders
+  local encoders decoders win_test_dir
   encoders="$("$exe" -hide_banner -encoders 2>/dev/null | tr -d '\r')"
   decoders="$("$exe" -hide_banner -decoders 2>/dev/null | tr -d '\r')"
   grep -q '[[:space:]]libjxr[[:space:]]' <<<"$encoders" || { echo "libjxr encoder missing" >&2; exit 1; }
   grep -q '[[:space:]]libjxr[[:space:]]' <<<"$decoders" || { echo "libjxr decoder missing" >&2; exit 1; }
   rm -rf "$test_dir"
   mkdir -p "$test_dir"
+  win_test_dir="$(wslpath -w "$test_dir")"
   python3 - "$test_dir/input.rgb" <<'PYRGB'
 from pathlib import Path
 import sys
@@ -2511,10 +2593,10 @@ for y in range(h):
 Path(sys.argv[1]).write_bytes(buf)
 PYRGB
   "$exe" -hide_banner -loglevel error \
-    -f rawvideo -pixel_format rgb24 -video_size 16x16 -i "$test_dir/input.rgb" \
-    -frames:v 1 -c:v libjxr "$test_dir/test.jxr"
+    -f rawvideo -pixel_format rgb24 -video_size 16x16 -i "$win_test_dir/input.rgb" \
+    -frames:v 1 -c:v libjxr "$win_test_dir/test.jxr"
   "$exe" -hide_banner -loglevel error \
-    -i "$test_dir/test.jxr" -frames:v 1 -pix_fmt rgb24 -f rawvideo "$test_dir/output.rgb"
+    -i "$win_test_dir/test.jxr" -frames:v 1 -pix_fmt rgb24 -f rawvideo "$win_test_dir/output.rgb"
   cmp -s "$test_dir/input.rgb" "$test_dir/output.rgb" || {
     echo "JPEG XR lossless RGB24 round-trip mismatch" >&2
     exit 1
@@ -2678,6 +2760,162 @@ index 5ea094e095..0b138e1ccd 100644
      if (!ctx->udu_sei)
          return sei_count;
 PATCH_NVENC_HDR10PLUS
+}
+
+patch_ffmpeg_nvenc_dovi_p8_p10() {
+  local ff_stage="$1"
+  local nvenc_c="$ff_stage/libavcodec/nvenc.c"
+  local nvenc_h="$ff_stage/libavcodec/nvenc.h"
+
+  if grep -q 'nvenc_alloc_dovi_payload' "$nvenc_c"; then
+    echo "FFmpeg NVENC HEVC Profile 8 / AV1 Profile 10 Dolby Vision RPU patch already applied"
+    return 0
+  fi
+
+  echo "== Patch FFmpeg NVENC HEVC P8 / AV1 P10 Dolby Vision RPU injection =="
+  python3 - "$nvenc_h" "$nvenc_c" <<'PYDOVINVENC'
+from pathlib import Path
+import sys
+
+header, source = map(Path, sys.argv[1:])
+
+def replace_once(path, old, new):
+    text = path.read_text()
+    if text.count(old) != 1:
+        raise SystemExit(f"{path}: expected one patch anchor, found {text.count(old)}: {old[:72]!r}")
+    path.write_text(text.replace(old, new, 1))
+
+replace_once(
+    header,
+    '#include "avcodec.h"\n',
+    '#include "avcodec.h"\n#include "dovi_rpu.h"\n',
+)
+replace_once(
+    header,
+    '    NV_ENC_SEI_PAYLOAD *sei_data;\n    int sei_data_size;\n',
+    '    NV_ENC_SEI_PAYLOAD *sei_data;\n    int sei_data_size;\n    DOVIContext dovi;\n',
+)
+replace_once(
+    source,
+    '    int i, res;\n\n    if (ctx->a53_cc && av_frame_get_side_data(frame, AV_FRAME_DATA_A53_CC)) {\n',
+    r'''    int i, res;
+
+#if CONFIG_AV1_NVENC_ENCODER || CONFIG_HEVC_NVENC_ENCODER
+    if (avctx->codec->id == AV_CODEC_ID_AV1 ||
+        avctx->codec->id == AV_CODEC_ID_HEVC) {
+        uint8_t *dovi_data = NULL;
+        int dovi_size = 0;
+
+        res = nvenc_alloc_dovi_payload(avctx, ctx, frame, &dovi_data, &dovi_size);
+        if (res < 0)
+            goto error;
+        if (dovi_data) {
+            void *tmp;
+            if (dovi_size <= 0) {
+                av_free(dovi_data);
+                res = AVERROR_INVALIDDATA;
+                goto error;
+            }
+            tmp = av_fast_realloc(ctx->sei_data, &ctx->sei_data_size,
+                                  (sei_count + 1) * sizeof(*ctx->sei_data));
+            if (!tmp) {
+                av_free(dovi_data);
+                res = AVERROR(ENOMEM);
+                goto error;
+            }
+            ctx->sei_data = tmp;
+            ctx->sei_data[sei_count].payloadSize = (uint32_t)dovi_size;
+            if (avctx->codec->id == AV_CODEC_ID_AV1)
+                ctx->sei_data[sei_count].payloadType = AV1_METADATA_TYPE_ITUT_T35;
+            else
+                ctx->sei_data[sei_count].payloadType = SEI_TYPE_USER_DATA_REGISTERED_ITU_T_T35;
+            ctx->sei_data[sei_count].payload = dovi_data;
+            sei_count++;
+        }
+    }
+#endif
+
+    if (!ctx->extra_sei)
+        return sei_count;
+
+    if (ctx->a53_cc && av_frame_get_side_data(frame, AV_FRAME_DATA_A53_CC)) {
+''',
+)
+replace_once(
+    source,
+    'static int prepare_sei_data_array(AVCodecContext *avctx, const AVFrame *frame)\n',
+    r'''#if CONFIG_AV1_NVENC_ENCODER || CONFIG_HEVC_NVENC_ENCODER
+static int nvenc_alloc_dovi_payload(AVCodecContext *avctx, NvencContext *ctx,
+                                        const AVFrame *frame, uint8_t **data,
+                                        int *size)
+{
+    const AVFrameSideData *sd =
+        av_frame_get_side_data(frame, AV_FRAME_DATA_DOVI_METADATA);
+
+    *data = NULL;
+    *size = 0;
+    if (!sd)
+        return 0;
+    if (!ctx->dovi.cfg.dv_profile) {
+        av_log(avctx, AV_LOG_ERROR,
+               "Dolby Vision metadata is present, but a valid Dolby Vision codec configuration "
+               "could not be derived. Preserve 10-bit 4:2:0 and the source color tags.\n");
+        return AVERROR_INVALIDDATA;
+    }
+
+    return ff_dovi_rpu_generate(&ctx->dovi,
+                                (const AVDOVIMetadata *)sd->data,
+                                FF_DOVI_WRAP_T35, data, size);
+}
+#endif
+
+static int prepare_sei_data_array(AVCodecContext *avctx, const AVFrame *frame)
+''',
+)
+replace_once(
+    source,
+    '        if (ctx->extra_sei) {\n            res = prepare_sei_data_array(avctx, frame);\n',
+    r'''        if (ctx->extra_sei
+#if CONFIG_AV1_NVENC_ENCODER || CONFIG_HEVC_NVENC_ENCODER
+            || ((avctx->codec->id == AV_CODEC_ID_AV1 ||
+                 avctx->codec->id == AV_CODEC_ID_HEVC) &&
+                av_frame_get_side_data(frame, AV_FRAME_DATA_DOVI_METADATA))
+#endif
+        ) {
+            res = prepare_sei_data_array(avctx, frame);
+''',
+)
+replace_once(
+    source,
+    '    NvencContext *ctx = avctx->priv_data;\n    int ret;\n\n    if (IS_HWACCEL(avctx->pix_fmt)) {\n',
+    r'''    NvencContext *ctx = avctx->priv_data;
+    int ret;
+
+#if CONFIG_AV1_NVENC_ENCODER || CONFIG_HEVC_NVENC_ENCODER
+    if (avctx->codec->id == AV_CODEC_ID_AV1 ||
+        avctx->codec->id == AV_CODEC_ID_HEVC) {
+        const enum AVPixelFormat pix_fmt = avctx->pix_fmt;
+
+        ctx->dovi.logctx = avctx;
+        ctx->dovi.enable = FF_DOVI_AUTOMATIC;
+        if (ctx->data_pix_fmt == AV_PIX_FMT_P010)
+            avctx->pix_fmt = AV_PIX_FMT_YUV420P10;
+        ret = ff_dovi_configure(&ctx->dovi, avctx);
+        avctx->pix_fmt = pix_fmt;
+        if (ret < 0)
+            return ret;
+    }
+#endif
+
+    if (IS_HWACCEL(avctx->pix_fmt)) {
+''',
+)
+replace_once(
+    source,
+    '    int i, res;\n\n    /* the encoder has to be flushed before it can be closed */\n',
+    '    int i, res;\n\n#if CONFIG_AV1_NVENC_ENCODER || CONFIG_HEVC_NVENC_ENCODER\n    ff_dovi_ctx_unref(&ctx->dovi);\n#endif\n\n    /* the encoder has to be flushed before it can be closed */\n',
+)
+PYDOVINVENC
 }
 
 patch_ffmpeg_libx265_hdr10plus() {
@@ -3289,6 +3527,149 @@ PYQSVHDR10PLUS
   }
 }
 
+
+patch_ffmpeg_qsv_dovi_p8() {
+  local ff_stage="$1"
+  local qsv_c="$ff_stage/libavcodec/qsvenc.c"
+  local qsv_h="$ff_stage/libavcodec/qsvenc.h"
+
+  if grep -q 'set_dovi_rpu_payload' "$qsv_c"; then
+    grep -q 'DOVIContext dovi;' "$qsv_h" || { echo "Partial QSV Dolby Vision patch detected"; exit 1; }
+    echo "FFmpeg QSV HEVC Dolby Vision P8 patch already applied"
+    return 0
+  fi
+
+  echo "== Patch FFmpeg QSV HEVC Dolby Vision P8 payload =="
+  python3 - "$qsv_c" "$qsv_h" <<'PYQSVDOVI'
+from pathlib import Path
+import sys
+
+c_path, h_path = map(Path, sys.argv[1:])
+s = c_path.read_text()
+hs = h_path.read_text()
+
+def replace_once(text, old, new, label):
+    count = text.count(old)
+    if count != 1:
+        raise SystemExit(f"{label}: patch anchor count={count}, expected 1")
+    return text.replace(old, new, 1)
+
+if '#include "dovi_rpu.h"' not in hs:
+    hs = replace_once(hs, '#include "qsv_internal.h"\n',
+                      '#include "qsv_internal.h"\n#include "dovi_rpu.h"\n', h_path)
+if '    DOVIContext dovi;\n' not in hs:
+    hs = replace_once(hs, '    int a53_cc;\n',
+                      '    int a53_cc;\n    DOVIContext dovi;\n', h_path)
+
+helper = r"""static int set_dovi_rpu_payload(AVCodecContext *avctx, const AVFrame *frame,
+                                 QSVEncContext *q, mfxEncodeCtrl *enc_ctrl)
+{
+    const AVFrameSideData *sd;
+    mfxPayload *payload;
+    uint8_t *rpu = NULL, *buf, *dst;
+    size_t rpu_size, size_bytes, total;
+    int rpu_size_int, ret;
+
+    if (avctx->codec_id != AV_CODEC_ID_HEVC)
+        return 0;
+    sd = av_frame_get_side_data(frame, AV_FRAME_DATA_DOVI_METADATA);
+    if (!sd)
+        return 0;
+    if (!q->dovi.cfg.dv_profile) {
+        av_log(avctx, AV_LOG_ERROR,
+               "Dolby Vision metadata is present, but no HEVC Dolby Vision configuration is available\n");
+        return AVERROR_INVALIDDATA;
+    }
+    if (enc_ctrl->NumPayload >= QSV_MAX_ENC_PAYLOAD) {
+        av_log(avctx, AV_LOG_ERROR, "No oneVPL payload slot remains for the Dolby Vision RPU\n");
+        return AVERROR(ENOSPC);
+    }
+
+    ret = ff_dovi_rpu_generate(&q->dovi, (const AVDOVIMetadata *)sd->data,
+                               FF_DOVI_WRAP_T35, &rpu, &rpu_size_int);
+    if (ret < 0)
+        return ret;
+    if (rpu_size_int <= 0) {
+        av_free(rpu);
+        return AVERROR_INVALIDDATA;
+    }
+
+    rpu_size = rpu_size_int;
+    size_bytes = rpu_size / 255 + 1;
+    total = 1 + size_bytes + rpu_size;
+    if (total > UINT16_MAX) {
+        av_free(rpu);
+        av_log(avctx, AV_LOG_ERROR, "Dolby Vision RPU exceeds the oneVPL payload limit\n");
+        return AVERROR(EINVAL);
+    }
+
+    buf = av_malloc(total);
+    payload = av_mallocz(sizeof(*payload));
+    if (!buf || !payload) {
+        av_free(buf);
+        av_free(payload);
+        av_free(rpu);
+        return AVERROR(ENOMEM);
+    }
+
+    dst = buf;
+    bytestream_put_byte(&dst, SEI_TYPE_USER_DATA_REGISTERED_ITU_T_T35);
+    while (rpu_size >= 255) {
+        bytestream_put_byte(&dst, 0xFF);
+        rpu_size -= 255;
+    }
+    bytestream_put_byte(&dst, (uint8_t)rpu_size);
+    bytestream_put_buffer(&dst, rpu, rpu_size_int);
+    av_free(rpu);
+
+    payload->Data    = buf;
+    payload->BufSize = (mfxU16)total;
+    payload->NumBit  = (mfxU32)(total * 8);
+    payload->Type    = SEI_TYPE_USER_DATA_REGISTERED_ITU_T_T35;
+    enc_ctrl->Payload[enc_ctrl->NumPayload++] = payload;
+    return 0;
+}
+
+"""
+
+helper_anchor = 'static int set_roi_encode_ctrl(AVCodecContext *avctx, const AVFrame *frame,'
+s = replace_once(s, helper_anchor, helper + helper_anchor, c_path)
+
+init_anchor = '    q->param.AsyncDepth = q->async_depth;\n'
+init_code = """    if (avctx->codec_id == AV_CODEC_ID_HEVC) {
+        q->dovi.logctx = avctx;
+        q->dovi.enable = FF_DOVI_AUTOMATIC;
+        ret = ff_dovi_configure(&q->dovi, avctx);
+        if (ret < 0)
+            return ret;
+    }
+
+"""
+s = replace_once(s, init_anchor, init_code + init_anchor, c_path)
+
+close_anchor = '    av_freep(&q->extparam);\n\n    return 0;\n'
+s = replace_once(s, close_anchor,
+                 '    av_freep(&q->extparam);\n    ff_dovi_ctx_unref(&q->dovi);\n\n    return 0;\n', c_path)
+
+call_anchor = ('        ret = set_hdr10plus_payload(avctx, frame, enc_ctrl);\n'
+               '        if (ret < 0)\n'
+               '            goto free;\n')
+call_code = (call_anchor +
+             '        ret = set_dovi_rpu_payload(avctx, frame, q, enc_ctrl);\n'
+             '        if (ret < 0)\n'
+             '            goto free;\n')
+s = replace_once(s, call_anchor, call_code, c_path)
+
+c_path.write_text(s)
+h_path.write_text(hs)
+PYQSVDOVI
+
+  grep -q 'set_dovi_rpu_payload(avctx, frame, q, enc_ctrl)' "$qsv_c" || {
+    echo "FFmpeg QSV HEVC Dolby Vision P8 RPU injection is missing"
+    exit 1
+  }
+}
+
 patch_ffmpeg_encoder_params() {
   local ff_stage="$1"
   echo "== Patch FFmpeg encoder parameter handling =="
@@ -3377,6 +3758,10 @@ verify_full_ffmpeg_config() {
     CONFIG_LIBAOM_AV1_ENCODER CONFIG_LIBSVTAV1_ENCODER
     CONFIG_LIBX264_ENCODER CONFIG_LIBX265_ENCODER CONFIG_LIBVVENC_ENCODER
     CONFIG_LIBVMAF_FILTER
+    CONFIG_HEVC_DECODER CONFIG_AV1_DECODER CONFIG_LIBDAV1D_DECODER
+    CONFIG_DOVI_RPUDEC CONFIG_DOVI_RPUENC CONFIG_DOVI_RPU_BSF CONFIG_DOVI_SPLIT_BSF
+    CONFIG_MOV_DEMUXER CONFIG_MOV_MUXER CONFIG_MATROSKA_DEMUXER CONFIG_MATROSKA_MUXER
+    CONFIG_MPEGTS_DEMUXER
     HAVE_STRUCT_MFXCONFIGINTERFACE
     CONFIG_VAPOURSYNTH_DEMUXER
   )
@@ -3399,6 +3784,26 @@ verify_full_ffmpeg_config() {
     echo "FFmpeg legacy CUVID decoder is unexpectedly enabled"
     exit 1
   fi
+  grep -q 'nvenc_alloc_dovi_payload' "$ff_stage/libavcodec/nvenc.c" || {
+    echo "FFmpeg NVENC Dolby Vision HEVC P8 / AV1 P10 injection is missing"
+    exit 1
+  }
+  grep -q 'set_dovi_rpu_payload(avctx, frame, q, enc_ctrl)' "$ff_stage/libavcodec/qsvenc.c" || {
+    echo "FFmpeg QSV HEVC Dolby Vision Profile 8 injection is missing"
+    exit 1
+  }
+  grep -q 'DOVIContext dovi;' "$ff_stage/libavcodec/qsvenc.h" || {
+    echo "FFmpeg QSV Dolby Vision state is missing"
+    exit 1
+  }
+  grep -q 'ff_dovi_rpu_parse' "$ff_stage/libavcodec/hevc/hevcdec.c" || {
+    echo "FFmpeg HEVC Dolby Vision RPU decoding is missing"
+    exit 1
+  }
+  grep -q 'ff_itut_t35_parse_payload_to_frame' "$ff_stage/libavcodec/libdav1d.c" || {
+    echo "FFmpeg AV1 Dolby Vision metadata decoding is missing"
+    exit 1
+  }
   grep -Rqs '"aac_nmr_speed"' "$ff_stage/libavcodec" || {
     echo "FFmpeg source does not contain the NMR AAC speed option"
     exit 1
@@ -3510,6 +3915,89 @@ verify_encoder_bitdepths() {
   encoder_bitdepth_smoke "$ffmpeg" libaom-av1 yuv420p12le
   encoder_bitdepth_smoke "$ffmpeg" libsvtav1 yuv420p10le
   encoder_bitdepth_smoke "$ffmpeg" libvvenc yuv420p10le
+}
+
+verify_dolby_vision_support() {
+  local ffmpeg="$1" decoders encoders bsfs muxers filters codec help
+  echo "== Verify Dolby Vision Profile 8/10 support surfaces =="
+  decoders="$("$ffmpeg" -hide_banner -decoders 2>&1 | tr -d '\r')" || {
+    echo "Cannot query FFmpeg decoders" >&2
+    exit 1
+  }
+  encoders="$("$ffmpeg" -hide_banner -encoders 2>&1 | tr -d '\r')" || {
+    echo "Cannot query FFmpeg encoders" >&2
+    exit 1
+  }
+  bsfs="$("$ffmpeg" -hide_banner -bsfs 2>&1 | tr -d '\r')" || {
+    echo "Cannot query FFmpeg bitstream filters" >&2
+    exit 1
+  }
+  muxers="$("$ffmpeg" -hide_banner -muxers 2>&1 | tr -d '\r')" || {
+    echo "Cannot query FFmpeg muxers" >&2
+    exit 1
+  }
+  filters="$("$ffmpeg" -hide_banner -filters 2>&1 | tr -d '\r')" || {
+    echo "Cannot query FFmpeg filters" >&2
+    exit 1
+  }
+
+  for codec in hevc av1 libdav1d; do
+    grep -Eq "[[:space:]]$codec([[:space:]]|$)" <<<"$decoders" || {
+      echo "Dolby Vision decoder path is missing: $codec" >&2
+      exit 1
+    }
+  done
+  for codec in libx265 libaom-av1 libsvtav1; do
+    grep -Eq "[[:space:]]$codec([[:space:]]|$)" <<<"$encoders" || {
+      echo "Dolby Vision software encoder path is missing: $codec" >&2
+      exit 1
+    }
+    help="$("$ffmpeg" -hide_banner -h "encoder=$codec" 2>&1)" || {
+      echo "Cannot query encoder options: $codec" >&2
+      exit 1
+    }
+    grep -q -- "-dolbyvision" <<<"$help" || {
+      echo "Dolby Vision RPU option is missing: $codec" >&2
+      exit 1
+    }
+  done
+  grep -Eq "[[:space:]]libplacebo([[:space:]]|$)" <<<"$filters" || {
+    echo "Dolby Vision libplacebo filter is missing" >&2
+    exit 1
+  }
+  help="$("$ffmpeg" -hide_banner -h filter=libplacebo 2>&1)" || {
+    echo "Cannot query libplacebo Dolby Vision options" >&2
+    exit 1
+  }
+  grep -q 'apply_dolbyvision' <<<"$help" || {
+    echo "libplacebo Dolby Vision metadata application is missing" >&2
+    exit 1
+  }
+  for bsf in dovi_rpu dovi_split; do
+    grep -Eq "(^|[[:space:]])$bsf([[:space:]]|$)" <<<"$bsfs" || {
+      echo "Dolby Vision bitstream filter is missing: $bsf" >&2
+      exit 1
+    }
+  done
+  for codec in mp4 matroska; do
+    grep -Eq "[[:space:]]$codec([[:space:]]|$)" <<<"$muxers" || {
+      echo "Dolby Vision container muxer is missing: $codec" >&2
+      exit 1
+    }
+  done
+  if grep -Eq "[[:space:]]hevc_nvenc([[:space:]]|$)" <<<"$encoders"; then
+    grep -Eq "[[:space:]]av1_nvenc([[:space:]]|$)" <<<"$encoders" || {
+      echo "NVENC AV1 Profile 10 encoder is missing" >&2
+      exit 1
+    }
+    for codec in hevc_nvenc av1_nvenc; do
+      "$ffmpeg" -hide_banner -h "encoder=$codec" >/dev/null 2>&1 || {
+        echo "Cannot query $codec options" >&2
+        exit 1
+      }
+    done
+  fi
+  echo "Dolby Vision Profile 8/10 capability surfaces passed"
 }
 
 verify_aac_at() {
@@ -4393,6 +4881,19 @@ EOF
     libplacebo)
       local stage
       stage="$(stage_src "libplacebo")"
+      # This target is static; PL_EXPORT would leak placebo symbols from avfilter.dll.
+      python3 - "$stage/src/meson.build" <<'PY'
+from pathlib import Path
+import sys
+p = Path(sys.argv[1])
+s = p.read_text()
+old = "  c_args: ['-DPL_EXPORT'],"
+new = "  c_args: ['-DPL_STATIC'],"
+if s.count(old) == 1:
+    p.write_text(s.replace(old, new, 1))
+elif s.count(new) != 1:
+    raise SystemExit(f"unexpected libplacebo export definition in {p}")
+PY
       local bld="$BUILDROOT/libplacebo"
       rm -rf "$bld"
       meson setup "$bld" "$stage" \
@@ -4405,9 +4906,19 @@ EOF
         -Dvulkan=enabled \
         -Dshaderc=enabled \
         -Dopengl=disabled \
-        -Dlcms=enabled
+        -Dlcms=enabled \
+        -Ddovi=enabled \
+        -Dlibdovi=disabled
       meson compile -C "$bld" -j "$JOBS"
       meson install -C "$bld"
+      grep -q '^#define PL_HAVE_DOVI 1$' "$PREFIX/include/libplacebo/config.h" || {
+        echo "libplacebo Dolby Vision support is disabled"
+        exit 1
+      }
+      if strings "$PREFIX/lib/libplacebo.a" | grep -Eq '(/EXPORT:pl_|-export:pl_)'; then
+        echo "静态 libplacebo 仍包含 DLL 导出指令，不能安全链接到 FFmpeg DLL" >&2
+        exit 1
+      fi
       grep -q '^pl_has_vk_proc_addr=1' "$PREFIX/lib/pkgconfig/libplacebo.pc" || {
         echo "libplacebo 未链接 Windows Vulkan loader 的 vkGetInstanceProcAddr"
         exit 1
@@ -4972,11 +5483,13 @@ EOF
       patch_ffmpeg_libplacebo_vulkan_import "$ff_stage"
       patch_ffmpeg_cxx_runtime "$ff_stage"
       patch_ffmpeg_nvenc_hdr10plus "$ff_stage"
+      patch_ffmpeg_nvenc_dovi_p8_p10 "$ff_stage"
       patch_ffmpeg_libx265_hdr10plus "$ff_stage"
       patch_ffmpeg_svtav1_hdr10plus "$ff_stage"
       patch_ffmpeg_libaom_hdr_static "$ff_stage"
       patch_ffmpeg_nvenc_hdr_static "$ff_stage"
       patch_ffmpeg_qsv_hdr10plus "$ff_stage"
+      patch_ffmpeg_qsv_dovi_p8 "$ff_stage"
       patch_ffmpeg_encoder_params "$ff_stage"
       pushd "$ff_stage" >/dev/null
       rm -f config.h config.mak config.log
@@ -5109,7 +5622,7 @@ EOF
       }
 
       local extra_cflags="-I$PREFIX/include -DLIBTWOLAME_STATIC"
-      local extra_ldflags="-L$PREFIX/lib -Wl,--allow-multiple-definition $LDFLAGS"
+      local extra_ldflags="-L$PREFIX/lib $LDFLAGS"
       local extra_libs="$TOOLCHAIN_EXTRA_LIBS -lvulkan-1"
       if [[ "$TOOLCHAIN_FLAVOR" == "llvm-mingw" ]]; then
         # ponytail: librist uses mingw clock_gettime inline, which resolves to winpthread clock_gettime64.
@@ -5272,6 +5785,18 @@ EOF
 
       verify_full_ffmpeg_config ffbuild/config.mak "$ff_stage"
       make -j"$FFMPEG_JOBS"
+      local avfilter_import_lib="$ff_stage/libavfilter/libavfilter.dll.a"
+      [[ -f "$avfilter_import_lib" ]] || {
+        echo "找不到 libavfilter 导入库，无法验证 libplacebo 导出边界" >&2
+        exit 1
+      }
+      local llvm_nm leaked_placebo_symbols
+      llvm_nm="$(first_tool "$LLVM_MINGW_ROOT/bin/llvm-nm" llvm-nm)"
+      leaked_placebo_symbols="$("$llvm_nm" "$avfilter_import_lib" | awk '$NF ~ /^pl_[[:alnum:]_]+$/ { print $NF }')"
+      [[ -z "$leaked_placebo_symbols" ]] || {
+        printf 'libavfilter 导入库仍导出 libplacebo 符号:\n%s\n' "$leaked_placebo_symbols" >&2
+        exit 1
+      }
       make install
       # Stage the exact packaged runtime before executing the Windows binaries.
 
@@ -5292,6 +5817,7 @@ EOF
       copy_runtime_dll_closure
       verify_encoder_params "$ROOT/full/ffmpeg.exe"
       verify_encoder_bitdepths "$ROOT/full/ffmpeg.exe"
+      verify_dolby_vision_support "$ROOT/full/ffmpeg.exe"
       verify_vmaf "$ROOT/full/ffmpeg.exe"
       popd >/dev/null
       verify_aac_at "$ROOT/full/ffmpeg.exe"
@@ -5316,22 +5842,55 @@ is_in_array() {
 }
 
 write_full_manifest() {
-  # Name exactly the repos this build consumes. Without --source-repo the tool
-  # scans $ROOT and would also record stale checkouts that no stage uses.
-  local -a repo_args=()
-  local stage source
-  for stage in "${STAGES[@]}"; do
-    if [[ "$stage" == "ffmpeg" ]]; then
-      source="$ROOT/ffmpeg-source"
-      repo_args+=(--source-repo "ffmpeg-source=$source")
-    else
-      repo_args+=(--source-repo "$stage=$ROOT/$stage")
-    fi
+  local build_mode="$1" ffmpeg_built="$2"
+  shift 2
+  local -a repo_args=() manifest_args=()
+  local stage repo source
+  for stage in "$@"; do
+    if [[ "$stage" == "ffmpeg" ]]; then repo="ffmpeg-source"; else repo="$stage"; fi
+    source="$BUILDROOT/_src/$repo"
+    if [[ ! -d "$source/.git" && ! -f "$source/.git" ]]; then source="$ROOT/$repo"; fi
+    repo_args+=(--source-repo "$repo=$source" --built-stage "$stage")
   done
+
+  manifest_args+=(--validate "Requested Full build scope completed: ${BUILT_STAGES[*]}")
+  if [[ "$ffmpeg_built" == "1" ]]; then
+    manifest_args+=(--validate "FFmpeg stage configured, linked, and its runtime DLL closure was checked")
+  else
+    manifest_args+=(--skip "FFmpeg was not relinked; packaged executable/DLL hashes describe the pre-existing Full package, not this library-only build")
+  fi
+  if [[ "$ffmpeg_built" == "1" ]]; then
+    manifest_args+=(--validate "Dolby Vision P8/P10 decoders, software encoders, RPU filter, and MOV/Matroska muxers passed runtime capability checks")
+    if [[ "$CUDA_ENABLE" == "1" ]]; then
+      manifest_args+=(--skip "NVENC HEVC P8 / AV1 P10 RPU injection was not round-trip tested on compatible hardware with Dolby Vision samples")
+    fi
+  fi
+  manifest_args+=(
+    --skip "No representative Dolby Vision Profile 8/10 media was available for a decode/encode/remux round-trip test"
+    --skip "QSV HEVC P8 RPU injection was compiled but not round-trip tested on compatible hardware"
+    --validate "NVENC HEVC Profile 8 and AV1 Profile 10 per-frame Dolby Vision RPU injection patches are present in the compiled source; hardware round-trip remains unverified"
+    --validate "QSV HEVC Profile 8 per-frame Dolby Vision RPU injection patch is present in the compiled source; hardware round-trip remains unverified"
+    --skip "QSV AV1 Profile 10 RPU injection remains unavailable because oneVPL exposes no generic per-frame AV1 metadata payload channel"
+    --skip "MPEG-TS Dolby Vision metadata descriptor output is not implemented; demux and decode input support remains enabled"
+    --skip "No changing-scene HDR10+ HEVC/AV1 bitstream round-trip was run; compile-time path presence does not prove per-frame metadata survived encoding"
+    --skip "Dolby Vision Profile 7 FEL reconstruction and HDR10+ regeneration remain unavailable until a validated FEL reconstructor and frame-analysis generator are installed"
+    --skip "Audio Vivid AV3A encode/decode SDK integration and model loading were not built or tested"
+    --skip "av1_qsv HDR10+ metadata injection is not implemented; QSV dynamic-metadata paths are not runtime-verified"
+  )
+  if [[ "$ffmpeg_built" == "1" ]] && is_in_array jxrlib "$@"; then
+    manifest_args+=(--validate "JPEG XR jxrlib lossless RGB24 round-trip passed")
+  fi
+  if is_in_array x265 "$@"; then
+    manifest_args+=(--validate "libx265 Main10 build used ENABLE_HDR10_PLUS=ON")
+  fi
   python3 "$ROOT/build-manifests/write_manifest.py" \
     --root "$ROOT" \
     "${repo_args[@]}" \
     --build-name full \
+    --build-mode "$build_mode" \
+    --toolchain-flavor "$TOOLCHAIN_FLAVOR" \
+    --incremental-build "$INCREMENTAL_BUILD" \
+    --ffmpeg-built "$ffmpeg_built" \
     --prefix "$PREFIX" \
     --artifact-dir "$ROOT/full" \
     --configure-file "$BUILDROOT/_src/ffmpeg-source/ffbuild/config.log" \
@@ -5339,51 +5898,121 @@ write_full_manifest() {
     --started "$BUILD_STARTED_AT" \
     --target-platform "Windows x86_64 via $TARGET" \
     --cpu-minimum "$CPU_FLAGS" \
-    --validate "Full configure enabled libopus and native AAC" \
-    --validate "JPEG XR jxrlib encoder/decoder configured and lossless RGB24 round-trip passed" \
-    --validate "Full shared FFmpeg build and runtime DLL closure completed" \
-    --validate "NVENC and libx265 HDR10+ side-data passthrough compiled; libaom native HDR10+ path present" \
-    --validate "libsvtav1 passes HDR10+ through the AV1 T35 metadata OBU" \
-    --validate "libaom and NVENC emit the HDR10 static MDCV/CLL fallback for AV1" \
-    --validate "hevc_qsv carries HDR10+ through the oneVPL SEI payload channel" \
-    --validate "x265 Main10 was built with ENABLE_HDR10_PLUS=ON" \
-    --validate "Full FFmpeg version and configured feature listing checked"
-  echo "Build source manifest written for full"
+    "${manifest_args[@]}"
+  echo "Build source manifest written for full ($build_mode; stages: ${BUILT_STAGES[*]})"
+}
+
+is_known_stage() {
+  local candidate="$1" stage
+  for stage in "${STAGES[@]}"; do [[ "$stage" == "$candidate" ]] && return 0; done
+  return 1
+}
+
+BUILD_START_STAGE=""
+BUILD_ONLY_STAGES=()
+BUILD_FULL_BUILD=0
+BUILD_MODE="selective"
+BUILT_STAGES=()
+
+parse_only_build_args() {
+  local arg piece normalized
+  for arg in "$@"; do
+    [[ -n "$arg" && "$arg" != ,* && "$arg" != *, && "$arg" != *,,* ]] || {
+      echo "--only 的阶段列表为空或包含空项: $arg" >&2
+      return 1
+    }
+    [[ "$arg" != --* ]] || { echo "--only 后不接受选项: $arg" >&2; return 1; }
+    local -a pieces=()
+    IFS=',' read -r -a pieces <<<"$arg"
+    for piece in "${pieces[@]}"; do
+      piece="${piece//[[:space:]]/}"
+      [[ -n "$piece" ]] || { echo "--only 的阶段列表包含空项" >&2; return 1; }
+      normalized="$(normalize_stage "$piece")" || {
+        echo "未知编译阶段参数: $piece" >&2
+        return 1
+      }
+      is_known_stage "$normalized" || {
+        echo "未知编译阶段参数: $piece" >&2
+        return 1
+      }
+      is_in_array "$normalized" "${BUILD_ONLY_STAGES[@]}" && {
+        echo "--only 阶段重复: $normalized" >&2
+        return 1
+      }
+      BUILD_ONLY_STAGES+=("$normalized")
+    done
+  done
+  [[ ${#BUILD_ONLY_STAGES[@]} -gt 0 ]] || {
+    echo "--only 至少需要指定一个编译阶段" >&2
+    return 1
+  }
+  BUILD_MODE="selective"
+}
+
+parse_build_args() {
+  BUILD_START_STAGE=""
+  BUILD_ONLY_STAGES=()
+  BUILD_FULL_BUILD=0
+  BUILD_MODE="selective"
+  if [[ $# -eq 0 ]]; then
+    BUILD_FULL_BUILD=1
+    BUILD_MODE="full"
+    return 0
+  fi
+
+  case "$1" in
+    --only)
+      shift
+      parse_only_build_args "$@" || return 1
+      ;;
+    --only=*)
+      local list="${1#--only=}"
+      [[ -n "$list" ]] || { echo "--only= 后必须指定阶段" >&2; return 1; }
+      shift
+      parse_only_build_args "$list" "$@" || return 1
+      ;;
+    *)
+      [[ $# -eq 1 ]] || { echo "build [stage] 仅接受一个起始阶段；多个阶段请用 --only" >&2; return 1; }
+      BUILD_START_STAGE="$(normalize_stage "$1")" || {
+        echo "未知编译阶段参数: $1" >&2
+        return 1
+      }
+      is_known_stage "$BUILD_START_STAGE" || {
+        echo "未知编译阶段参数: $1" >&2
+        return 1
+      }
+      BUILD_MODE="resume"
+      ;;
+  esac
 }
 
 run_build() {
+  parse_build_args "$@" || exit 2
   BUILD_STARTED_AT="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-  local start_arg="${1:-}"
-  shift || true
-  local only_args=("$@")
-  local START_STAGE=""
-  local only_stages=()
-  local FULL_BUILD=1
+  local START_STAGE="$BUILD_START_STAGE"
+  local FULL_BUILD="$BUILD_FULL_BUILD"
+  local -a only_stages=("${BUILD_ONLY_STAGES[@]}")
   local BUILT_FFMPEG=0
+  BUILT_STAGES=()
 
-  if [[ ${#only_args[@]} -gt 0 ]]; then
-    local arg
-    for arg in "${only_args[@]}"; do
-      local norm
-      norm="$(normalize_stage "$arg")" || {
-        echo "未知编译阶段参数: $arg"
-        exit 1
-      }
-      only_stages+=("$norm")
-    done
-    FULL_BUILD=0
-  elif [[ -n "$start_arg" ]]; then
-    START_STAGE="$(normalize_stage "$start_arg")" || {
-      echo "未知编译阶段参数: $start_arg"
-      exit 1
-    }
-    FULL_BUILD=0
-  fi
+  # Preflight only requested source trees before toolchain setup or prefix cleanup.
+  local stage repo include=0 start_reached=0
+  for repo in "${STAGES[@]}"; do
+    include=0
+    if [[ "$FULL_BUILD" -eq 1 ]]; then
+      include=1
+    elif [[ ${#only_stages[@]} -gt 0 ]]; then
+      is_in_array "$repo" "${only_stages[@]}" && include=1
+    elif [[ -n "$START_STAGE" ]]; then
+      [[ "$repo" == "$START_STAGE" ]] && start_reached=1
+      ((start_reached)) && include=1
+    fi
+    ((include)) || continue
+    if [[ "$repo" == "ffmpeg" ]]; then need_repo "ffmpeg-source"; else need_repo "$repo"; fi
+  done
 
   echo "===> [子命令: build] 开始编译与链接依赖阶段..."
   setup_build_env
-
-  # 构建报错捕获
   trap on_error ERR
 
   if [[ "$FULL_BUILD" -eq 1 ]]; then
@@ -5391,25 +6020,12 @@ run_build() {
     rm -rf "$PREFIX/include" "$PREFIX/lib" "$PREFIX/share" "$PREFIX/bin"
   fi
 
-  # 依赖库源码目录校验
-  for repo in "${STAGES[@]}"; do
-    if [[ ${#only_stages[@]} -gt 0 ]]; then
-      if ! is_in_array "$repo" "${only_stages[@]}"; then
-        continue
-      fi
-    fi
-    if [[ "$repo" == "ffmpeg" ]]; then
-      need_repo "ffmpeg-source"
-    else
-      need_repo "$repo"
-    fi
-  done
-
   local RUN=0
   for stage in "${STAGES[@]}"; do
     if [[ ${#only_stages[@]} -gt 0 ]]; then
       if is_in_array "$stage" "${only_stages[@]}"; then
         run_stage "$stage"
+        BUILT_STAGES+=("$stage")
         [[ "$stage" == "ffmpeg" ]] && BUILT_FFMPEG=1
       fi
     else
@@ -5418,31 +6034,31 @@ run_build() {
       elif [[ "$stage" == "$START_STAGE" ]]; then
         RUN=1
       fi
-
       if [[ "$RUN" -eq 1 ]]; then
         run_stage "$stage"
+        BUILT_STAGES+=("$stage")
         [[ "$stage" == "ffmpeg" ]] && BUILT_FFMPEG=1
       fi
     fi
   done
 
   CURRENT_STAGE=""
-  if [[ "$FULL_BUILD" -eq 1 || "$BUILT_FFMPEG" -eq 1 ]]; then
-    write_full_manifest
-  fi
+  write_full_manifest "$BUILD_MODE" "$BUILT_FFMPEG" "${BUILT_STAGES[@]}"
   echo
   echo "============================================================"
   if [[ ${#only_stages[@]} -gt 0 ]]; then
     local list_str
     list_str="$(IFS=', '; echo "${only_stages[*]}")"
     echo "成功编译了: $list_str"
+  elif [[ -n "$START_STAGE" ]]; then
+    echo "从 $START_STAGE 起的构建阶段已完成"
+    echo "最终输出: $ROOT/full/ffmpeg.exe, $ROOT/full/ffprobe.exe, $ROOT/full/ffplay.exe"
   else
     echo "构建完成"
     echo "最终输出: $ROOT/full/ffmpeg.exe, $ROOT/full/ffprobe.exe, $ROOT/full/ffplay.exe"
   fi
   echo "============================================================"
 }
-
 # ==============================================================================
 # 子命令 4: 清理临时文件 (原 clean 行为与要求 6 规范)
 # ==============================================================================
@@ -5469,8 +6085,9 @@ show_help() {
   all             顺序执行完整构建流程: tool -> update -> build (默认)
   tool            仅安装本地构建环境与工具链 (包括 MinGW 和 CUDA)
   update          仅从官方源或镜像克隆/更新所有依赖库源码
-  build [stage]   执行依赖库和 FFmpeg 静态交叉编译构建。可选 [stage] 参数指定起始阶段
-  build --only [stages...]  仅编译指定的一个或多个库（用空格或逗号分隔，不构建后续依赖，且仅校验对应源码）
+  build [stage]   执行构建；可选 [stage] 从该阶段继续，仅接受一个起始阶段
+  build --only stage[,stage...]  仅构建明确列出的库，不自动补齐依赖、不清空安装前缀
+  --only 支持空格或逗号分隔；空列表、空项、重复项、未知阶段和多余参数都会在构建前拒绝
   clean           清理编译缓存和旧的编译产物，并删除 patch 临时包与 _bundle/ 目录
 
 工具链:
@@ -5487,10 +6104,20 @@ show_help() {
   $0 update
   $0 build
   $0 build --ffmpeg
-  $0 build --only libsoxr libxml2
+  $0 build --only libsoxr,libxml2
+  $0 build --only x265
   $0 clean
 EOF
 }
+
+if [[ "${FFMPEG_TEST_PARSE_BUILD_ARGS:-0}" == "1" ]]; then
+  [[ "${1:-}" == "build" ]] || { echo "测试入口只接受 build" >&2; exit 2; }
+  shift
+  parse_build_args "$@" || exit 2
+  printf 'full=%s;start=%s;only=%s\n' \
+    "$BUILD_FULL_BUILD" "$BUILD_START_STAGE" "$(IFS=,; echo "${BUILD_ONLY_STAGES[*]}")"
+  exit 0
+fi
 
 cmd="${1:-all}"
 shift || true
@@ -5499,7 +6126,7 @@ case "$cmd" in
   all)
     run_tool
     run_update
-    run_build ""
+    run_build
     ;;
   tool)
     run_tool
@@ -5508,22 +6135,7 @@ case "$cmd" in
     run_update "${1:-}"
     ;;
   build)
-    only_stages=()
-    start_stage=""
-    if [[ "${1:-}" == "--only" ]]; then
-      shift
-      while [[ $# -gt 0 ]]; do
-        only_stages+=("$1")
-        shift
-      done
-    elif [[ "${1:-}" =~ ^--only=(.*)$ ]]; then
-      IFS=',' read -r -a only_stages <<< "${BASH_REMATCH[1]}"
-      shift || true
-    else
-      start_stage="${1:-}"
-      shift || true
-    fi
-    run_build "$start_stage" "${only_stages[@]}"
+    run_build "$@"
     ;;
   clean)
     run_clean
