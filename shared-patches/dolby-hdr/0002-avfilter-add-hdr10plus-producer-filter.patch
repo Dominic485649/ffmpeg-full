@@ -1,0 +1,866 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: REPLACE-ME <you@example>
+Date: Sun, 04 Oct 2026 08:48:28 +0800
+Subject: [PATCH] avfilter: add hdr10plus dynamic-metadata producer filter
+
+Computes the per-picture ST 2094-40 statistics (maxscl, average_maxrgb and the
+nine distribution_maxrgb percentiles) and attaches them as
+AV_FRAME_DATA_DYNAMIC_HDR_PLUS, so encoder wrappers that already write that
+side data carry HDR10+ in-band unchanged: measured here on libaom-av1, 12/12
+pictures come back through a decoder with the values the filter produced
+(libsvtav1 needs the accompanying patch; its T35 channel was verified against
+the SVT-AV1 library directly). Serialisation is left to
+av_dynamic_hdr_plus_to_t35(); the filter never touches a bitstream.
+
+Granularity note for reviewers, because it is a property of the carrier and not of this
+filter: writing a metadata OBU is not the same as a consumer receiving one. Measured on
+this box, a libaom encode of a 12-picture HDR10+ source delivers 12/12 pictures with the
+metadata intact, while an unrelated per-picture T35 writer in a hardware wrapper
+delivered 7/12 - the pictures that lost it are those sharing a temporal unit with other
+picture OBUs. So per-picture statistics survive a one-picture-per-temporal-unit encode,
+and anything coarser should be checked decoder-side rather than assumed.
+
+The statistics are normalised by the 10000 cd/m2 PQ full scale, as 4.4 requires, so
+no reference peak enters them. TargetedSystemDisplayMaximumLuminance describes the
+display the metadata is aimed at and defaults to the 1000 cd/m2 reference display;
+peak= overrides it.
+
+For ApplicationVersion = 1 the nine percentile positions, the two reserved fixed
+entries and a single window are all mandated (8.5.4, 9.4), so none of that is
+offered as a knob: the only option is peak.
+
+Input whose transfer is not ST 2084, and studio-range RGB, are refused: the
+statistics are only meaningful on PQ code values, and a wrong-domain frame still
+serialises and decodes cleanly, so nothing downstream could tell the difference.
+
+Metadata already on the frame is replaced rather than added
+alongside it. An HEVC decoder attaches an authored HDR10+ block as
+AV_FRAME_DATA_DYNAMIC_HDR_PLUS, that entry survives the format
+conversions a normal graph does, and av_frame_new_side_data() appends
+- so a second entry would leave the authored one first, and every
+first-match reader, including the encoder wrappers that carry this
+type, would publish the input's numbers while the ones measured here
+went nowhere. Measured on a studio-authored 4K clip: before this
+replace, the plain, curve=rolloff, peak=4000 and even the no-producer
+graphs each produced the same 68,679-byte AV1 file, byte for byte.
+An input that carries nothing is unaffected: with nothing to replace,
+the encode is the same bytes the pre-change build made on the same
+input.
+
+Two depths are accepted, 10 and 12 bit planar RGB, because ST 2084's input is the
+NORMALISED code: a 12-bit full-scale sample is 4095/4095, and a filter that divides
+by 1023 regardless reports a 12-bit white as a quarter of one. Nothing else in the
+measurement changes with depth, so depth is carried as a runtime value - the code
+width comes from the pixel format descriptor, the distribution table is sized from
+it, and the sample mask is the same width instead of a constant 0x3FF. A frame whose
+depth is neither 10 nor 12 is refused rather than measured through a table that is
+too small for it: at depth 0 the mask would be `& 0`, every pixel would bin at code 0,
+and the payload would still serialise as a confident all-black picture.
+
+New filter plus its registration in one commit, so the tree builds at every
+step of the series.
+
+Signed-off-by: REPLACE-ME <you@example>
+---
+
+The tree this diff was generated against: ffmpeg (HEAD 8864fd0)
+Verification: compiles warning-free as one TU (cl -W3, MSVC 19.51) against
+this revision, control arm upstream's own vf_setparams.c, both at 0 warnings;
+filter_frame() executed on
+41 picture cases spanning BOTH accepted depths (179 assertions, the first of which
+rebuilds this file's bytes from the patch's own '+' lines and requires them to match
+what gets compiled); the code->coded mapping was walked exhaustively over all 1024
+10-bit and all 4096 12-bit codes against a reference implementation, every statistic
+field matched, and the serialised T35 body matched byte for byte. The filter was then
+built into a whole tree and run inside a real filtergraph: 25 assertions / 0 FAIL,
+whose first arms pin that the binary under test was compiled from these exact sources,
+and which were re-run after the side-data change below (upstream-kit/README.md).
+
+The second depth was also measured on a genuinely 12-bit source rather than on a
+converted one: a 2048x858 12-bit-per-component JPEG 2000 X'Y'Z' cinema master (the
+CC-BY-3.0 Sintel 2K DCP) decodes to xyz12le and reaches this filter as gbrp12le with
+12-bit codes actually in use - max 3270 of 4095, 75.1% of samples carrying information
+below the 10-bit boundary - and 24 of its pictures come out as 24 blocks that two
+builds other than the one that wrote them read back with identical values. Feeding the
+same 24 pictures at 10 bit instead moves all 24 payloads, which is what shows the
+depth is read rather than assumed. That graph's colour labels are asserted by the
+caller to keep the 12-bit path running, so it is a depth-path test and not a
+colorimetric claim: X'Y'Z' code values measured as if they were PQ are not HDR10+ for
+that film.
+Not verified: SIMD (the per-pixel loops are scalar double).
+
+diff --git a/libavfilter/Makefile b/libavfilter/Makefile
+index ceea328..674fd1a 100644
+--- a/libavfilter/Makefile
++++ b/libavfilter/Makefile
+@@ -342,6 +342,7 @@ OBJS-$(CONFIG_GRAYWORLD_FILTER)              += vf_grayworld.o
+ OBJS-$(CONFIG_GREYEDGE_FILTER)               += vf_colorconstancy.o
+ OBJS-$(CONFIG_GUIDED_FILTER)                 += vf_guided.o framesync.o
+ OBJS-$(CONFIG_HALDCLUT_FILTER)               += vf_lut3d.o framesync.o
++OBJS-$(CONFIG_HDR10PLUS_FILTER)              += vf_hdr10plus.o
+ OBJS-$(CONFIG_HFLIP_FILTER)                  += vf_hflip.o
+ OBJS-$(CONFIG_HFLIP_VULKAN_FILTER)           += vf_flip_vulkan.o vulkan.o
+ OBJS-$(CONFIG_HISTEQ_FILTER)                 += vf_histeq.o
+diff --git a/libavfilter/allfilters.c b/libavfilter/allfilters.c
+index 3b93fe1..4be8ee2 100644
+--- a/libavfilter/allfilters.c
++++ b/libavfilter/allfilters.c
+@@ -316,6 +316,7 @@ extern const FFFilter ff_vf_grayworld;
+ extern const FFFilter ff_vf_greyedge;
+ extern const FFFilter ff_vf_guided;
+ extern const FFFilter ff_vf_haldclut;
++extern const FFFilter ff_vf_hdr10plus;
+ extern const FFFilter ff_vf_hflip;
+ extern const FFFilter ff_vf_hflip_vulkan;
+ extern const FFFilter ff_vf_histeq;
+
+diff --git a/libavfilter/vf_hdr10plus.c b/libavfilter/vf_hdr10plus.c
+new file mode 100644
+--- /dev/null
++++ b/libavfilter/vf_hdr10plus.c
+@@ -0,0 +1,741 @@
++/*
++ * HDR10+ (SMPTE ST 2094-40) dynamic-metadata producer filter
++ *
++ * Computes the per-picture statistics that a HDR10+ metadata_block carries and
++ * attaches them as AV_FRAME_DATA_DYNAMIC_HDR_PLUS, so that every encoder wrapper
++ * which already knows how to write that side data (libaom today; libsvtav1 with
++ * the accompanying patch) can put it in-band unchanged. Serialization stays in
++ * av_dynamic_hdr_plus_to_t35(); this file never touches a bitstream.
++ *
++ * Numbers below were all measured before being written down:
++ *  - coded statistics are fractions of 1/100000, and feeding 65535 / 79999 /
++ *    50001 through a real producer and back through the decoder returns them
++ *    unrounded, so nothing here needs coarser quantization;
++ *  - a single-window nine-percentile metadata_block is 43 bytes; the in-band T35
++ *    payload is 49 because the carrier prepends the 6-byte identity
++ *    (b5 00 3c 00 01 04) - measured through av_dynamic_hdr_plus_to_t35(), whose
++ *    own documentation says the header is excluded from what it writes;
++ *  - across a real clip the fields that change per picture are maxscl,
++ *    average_maxrgb and the percentile list, which is what this filter computes.
++ *
++ * Compile-and-run status, because "not verified" should never be left implicit. The file
++ * compiles with no warning of its own (cl -W3 and -Wall, MSVC 19.51) as a single translation
++ * unit against FFmpeg master 8864fd0aec, with upstream's own vf_setparams.c as the control arm,
++ * and its filter_frame() has been executed through upstream-kit/test_hdr10plus_host.c on 41
++ * picture cases covering both accepted depths: the code->coded mapping was walked exhaustively
++ * (all 1024 10-bit and all 4096 12-bit codes) against a reference implementation, every statistic
++ * field matched, and the serialised T35 body agreed byte for byte. Executing it is also what
++ * found the fraction_bright_pixels denominator below - reading the code had it as a harmless
++ * zero, and av_dynamic_hdr_plus_to_t35() divides through that denominator unconditionally, so
++ * {0,0} is a crash rather than a "not calculated" marker.
++ * The file has also been built into two whole trees (one configured --disable-x86asm, one with
++ * nasm) and run inside a real filtergraph, driven by upstream-kit/check_in_graph.py: 24
++ * assertions per build, same metadata values from both. What that found is in the two notes
++ * below - a shared DLL build does not export the ff_* a filter needs, so the earlier single-TU
++ * harness could not reach negotiation, and negotiation is where the 12-bit path lives.
++ * The 12-bit path is not judged only through swscale: upstream-kit/check_12bit_decoder_source.py
++ * writes a picture, puts it through FFV1 level 3 at gbrp12le, proves the round trip byte for
++ * byte, and then measures the DECODER's frames with no format= step anywhere in the graph - all
++ * three maxscl components, the average and all nine percentiles match a reference recomputed
++ * from the decoded samples, at both depths (15 assertions, same on both trees). Whoever reads
++ * those numbers back should use ffprobe's flat writer: it prints maxscl once per component under
++ * a single key (fftools/ffprobe.c:784), so a json reader is handed only the last of the three.
++ * What is NOT verified: SIMD (the per-pixel loops here are scalar double). The second depth is no
++ * longer only synthetic: a 12-bit-per-component JPEG 2000 X'Y'Z' cinema master (2048x858, xyz12le,
++ * 75.1% of samples carrying information below the 10-bit boundary) reaches this filter as
++ * gbrp12le, and the same 24 pictures handed to it at 10 bit come out with 24 different payloads -
++ * suite check_real_12bit_dcp.py. The colour labels on that graph are asserted by the caller:
++ * X'Y'Z' code values measured as if they were PQ exercise the depth path, they are not HDR10+ for
++ * that film.
++ * The curve (curve=preserve|rolloff) and the FractionBrightPixels measurement (fbp=1) were added
++ * on 2026-10-01 and are off by default, on purpose: a census of the HDR10+ blocks on this box
++ * found 2 carrying a curve against 410 carrying statistics only, and a default that changes every
++ * payload would invalidate the byte-level comparisons the sections above rest on. With both off,
++ * the payload is byte-identical to the pre-change build's on the same graph (gate arm B).
++ * The evaluation in curve_eval() is transcribed from the only open implementation of it
++ * (libplacebo src/tone_mapping.c, st2094_40()); Annex B.4.1 explicitly leaves the *derivation* of
++ * knee and anchors to the vendor, so the two policies here are this filter's own, chosen for
++ * properties that can be asserted: identity within the 1/1023 anchor grid, slope 1 below the knee,
++ * f(1) = 1, and Eq 2 monotonicity measured against a finite difference. They are not a claim to
++ * match anybody's look. Verified by upstream-kit/check_hdr10plus_curve_in_graph.py (14 assertions:
++ * inertness, both policies, the 58-byte curve-bearing payload, and FBP against hand-computed
++ * proxy fixtures).
++ * The registration skeleton follows libavfilter/vf_setparams.c.
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++
++/**
++ * @file
++ * HDR10+ dynamic metadata producer
++ */
++
++#include <math.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "libavutil/frame.h"
++#include "libavutil/hdr_dynamic_metadata.h"
++#include "libavutil/mem.h"
++#include "libavutil/opt.h"
++#include "libavutil/pixdesc.h"
++#include "libavutil/pixfmt.h"
++
++#include "avfilter.h"
++#include "filters.h"
++#include "formats.h"
++#include "video.h"
++
++#define PQ_M1 (2610.0 / 16384.0)
++#define PQ_M2 (2523.0 / 4096.0 * 128.0)
++#define PQ_C1 (3424.0 / 4096.0)
++#define PQ_C2 (2413.0 / 4096.0 * 32.0)
++#define PQ_C3 (2392.0 / 4096.0 * 32.0)
++
++#define NB_PERCENTILES 9
++
++/* The distribution is kept in the picture's OWN code values, so the table has to be as wide as
++ * the deepest format accepted below (12-bit -> 4096 bins). Collapsing 12-bit codes into 10-bit
++ * bins is not a rounding difference that can be waved through: near maxscl one 10-bit step is
++ * worth ~57 units of the 1/100000 output scale (measured, report 52.4), so a 10-bit bin would
++ * move the numbers this filter exists to produce by up to that much, while one 12-bit step is
++ * ~57/4 = 14 units. Depth is therefore carried as a runtime parameter, not a constant. */
++#define NB_CODES_MAX 4096   /* widest accepted depth: 12-bit */
++
++/* ST 2094-40:2020 8.5.4: for ApplicationVersion = 1 the nine percentile positions are not a
++ * choice - they are mandated, and two of them carry constants instead of measurements. */
++static const uint8_t hdr_plus_j[NB_PERCENTILES] = { 1, 5, 10, 25, 50, 75, 90, 95, 99 };
++
++typedef struct HDR10PlusContext {
++    const AVClass *class;
++
++    /* TargetedSystemDisplayMaximumLuminance (8.2), in cd/m2. This is a description of the
++     * display the metadata is aimed at; it is not a normalizing term - 4.4 fixes the
++     * statistics to the 10000 cd/m2 PQ full scale - so it defaults to the 1000 cd/m2
++     * reference display instead of being inferred from the mastering metadata. */
++    double peak;
++
++    /* Both of these default to off, and that is load-bearing: a census of the HDR10+ blocks
++     * on this box (57 files, 410 blocks) found 2 with a tone-mapping curve and 408 with
++     * statistics only, so "no curve" is what shipped content actually looks like. Turning a
++     * curve on by default would also change every payload this filter has already been
++     * verified against, byte for byte. */
++    int    curve;      /* 0 = leave the curve block absent, 1 = identity, 2 = rolloff */
++    int    fbp;        /* compute FractionBrightPixels per 10.4 instead of writing the 0 marker */
++    /* hold: temporal hysteresis on the knee, in 1/4095 knee codes. 0 = off (per-picture curve).
++     * Measured on 600 consecutive pictures of a real 4K master, read at 1280x720 with
++     * curve=rolloff:peak=400. 587 of the 600 payloads carry a knee at all - the other 13 are the
++     * identity 0/0 pair, which passes through regardless of hold - so the figure that matters is
++     * the 585 transitions whose two neighbours were both engaged: 343 of them moved the knee, over
++     * 25 distinct codes inside a 2943..4006 band, largest step 542 codes. hold=150 takes that to 15
++     * moves over 11 codes; hold=400 to 1 move, the same knee then held for 385 pictures - which is
++     * no longer adaptation at all, so the default stays 0 and the value is the caller's trade.
++     * At native 3840x2160 the ordering survives but the magnitudes do not: 302 of the 585 engaged
++     * transitions move the knee (7 distinct codes, band 3340..3559, largest step 126), hold=150
++     * leaves 1 move, hold=400 leaves none - so a figure quoted for one size does not transfer to
++     * another, which is why each measurement above names the size it was taken at.
++     * On the default chain none of this can bite: with no curve written (tone_mapping_flag=0 on all
++     * 600 payloads) hold=0, 150 and 400 produced the same payload on every one of the 600 pictures.
++     * Why a hold is legitimate: ST 2094-40 describes a SCENE (9.1 puts the numbers inside a
++     * TimeInterval), so a per-picture curve is already an approximation, and holding the knee a few
++     * pictures costs less than showing the display a different curve every frame. */
++    int    hold;
++    int    have_prev_ks;
++    int    prev_ks;    /* the knee code currently in force */
++
++    /* One-time warnings: these fire from filter_frame, which runs per picture. */
++    int warned_curve;
++    int warned_fbp;
++    int warned_existing;
++} HDR10PlusContext;
++
++enum { CURVE_OFF = 0, CURVE_PRESERVE = 1, CURVE_ROLLOFF = 2 };
++
++static int query_formats(const AVFilterContext *ctx,
++                         AVFilterFormatsConfig **cfg_in,
++                         AVFilterFormatsConfig **cfg_out)
++{
++    /* RGB planar 10 and 12 bit: maxscl is defined on the colour components, and these are the
++     * two depths HDR is actually shipped in (ST 2094-40 measures PQ codes, so the only thing a
++     * depth changes here is the divisor - see pq_eotf()). Anything else has to be converted by
++     * the caller rather than silently resampled here.
++     * ff_set_common_formats_from_list2() takes a list of ints, verified against
++     * libavfilter/formats.h on master 2026-09-28. */
++    static const int pix_fmts[] = {
++        AV_PIX_FMT_GBRP10LE,
++        AV_PIX_FMT_GBRAP10LE,
++        AV_PIX_FMT_GBRP12LE,
++        AV_PIX_FMT_GBRAP12LE,
++        AV_PIX_FMT_NONE
++    };
++
++    return ff_set_common_formats_from_list2(ctx, cfg_in, cfg_out, pix_fmts);
++}
++
++/* encoded code value to absolute luminance in cd/m2 (ST 2084 EOTF).
++ * maxval is (1 << depth) - 1: ST 2084's input is the NORMALISED code, so the same picture
++ * encoded at 10 bit (1023/1023) and at 12 bit (4095/4095) has to land on 10000 cd/m2 in both
++ * cases. Hard-coding /1023 here would make the 12-bit arm read a full-scale white as a quarter
++ * of white - silently, because everything downstream still serialises and decodes cleanly. */
++static double pq_eotf(int code, int maxval)
++{
++    double e  = code / (double)maxval;
++    double p  = pow(e, 1.0 / PQ_M2);
++    double nm = fmax(p - PQ_C1, 0.0);
++    double de = PQ_C2 - PQ_C3 * p;
++
++    if (de <= 0.0)
++        return 0.0;
++    return 10000.0 * pow(nm / de, 1.0 / PQ_M1);
++}
++
++/* ST 2094-40:2020 4.4: a linearized signal is "output linear light levels in the range
++ * [0,1]" obtained through ST 2084:2014 Equation 4.1, and 8.3/8.4/8.5.2 all state the
++ * metadata range as [0,1] in multiples of 0.00001. So the denominator is the 10000
++ * cd/m2 PQ full scale - NOT the mastering peak, which is a separate metadata item (8.2). */
++static uint32_t norm_light(double nits)
++{
++    return (uint32_t)av_clip64(llround(nits * 100000.0 / 10000.0), 0, 100000);
++}
++
++/* ------------------------------------------------------------------------ *
++ * Tone-mapping curve (8.7) - evaluation plus the two policies this filter
++ * offers. The curve is the piece the standard does NOT define: Annex B.4.1
++ * says "there can be varying implementations of how the scene values are
++ * processed depending up on the vendor", and a survey of open code found no
++ * generator of knee/bezier at all. So what is implemented here is (a) the
++ * evaluation, transcribed from the one open implementation that exists -
++ * libplacebo src/tone_mapping.c, st2094_40() - and (b) two deliberately
++ * simple policies, each with a measurable acceptance property. Nothing here
++ * claims a vendor's look.
++ * ------------------------------------------------------------------------ */
++
++#define CURVE_ORDER 10   /* N in 8.7: anchors transmitted = N - 1 = 9, as in both real samples */
++
++static double binom(int n, int k)
++{
++    double r = 1.0;
++
++    if (k < 0 || k > n)
++        return 0.0;
++    if (k > n - k)
++        k = n - k;
++    for (int i = 1; i <= k; i++)
++        r = r * (n - k + i) / i;   /* kept within double range for n <= 16 */
++    return r;
++}
++
++/* B_N(t) = sum C(N,p) P[p] t^p (1-t)^(N-p), with P[0] = 0 and P[N] = 1 forced (8.7). */
++static double bez_eval(const double *P, int N, double t)
++{
++    double acc = 0.0;
++
++    for (int p = 0; p <= N; p++)
++        acc += binom(N, p) * P[p] * pow(t, p) * pow(1.0 - t, N - p);
++    return acc;
++}
++
++/* The standard's own monotonicity condition (Eq 2): the derivative is a Bernstein sum with
++ * control points N*(P[p+1]-P[p]), so it is >= 0 wherever those are all >= 0. Checking the
++ * control points is exact and cheap; the sampled form below is kept because it is what the
++ * gate measures against a finite difference. */
++static double bez_min_slope(const double *P, int N, int samples)
++{
++    double worst = HUGE_VAL;       /* MSVC rejects 1.0/0.0 as a constant expression (C2124) */
++
++    for (int i = 0; i < samples; i++) {
++        double t = i / (double)(samples - 1);
++        double d = 0.0;
++
++        for (int p = 0; p < N; p++)
++            d += binom(N - 1, p) * (P[p + 1] - P[p]) * pow(t, p) * pow(1.0 - t, N - 1 - p);
++        d *= N;
++        if (d < worst)
++            worst = d;
++    }
++    return worst;
++}
++
++/* The consumer-side evaluation, transcribed from libplacebo st2094_40(): a linear part below the
++ * knee, and above it the Bernstein polynomial is evaluated on a RE-MAPPED input axis, then scaled
++ * into [KF, 1]. Getting this wrong is not a rounding difference - the reading I tried first
++ * (subtract B(Ks), divide by 1-B(Ks)) is off by 6.6 code values on a real producer's curve, and
++ * both forms are continuous at the knee, so no structural argument separates them. Only a second
++ * implementation does.
++ */
++static double curve_eval(double x, double Ks, double KF, const double *P, int N)
++{
++    double t;
++
++    if (x <= Ks && Ks > 0.0)
++        return x * KF / Ks;
++    t = (x - Ks) / (1.0 - Ks);
++    return KF + (1.0 - KF) * bez_eval(P, N, t);
++}
++
++/* Write the curve block for one window. snorm and target are both in the 8.4/8.2 domain
++ * (1.0 = 10000 cd/m2). Nothing is returned: a result that fails its own checks degrades to the
++ * identity curve and says so once, because "no curve" and "curve that clips to black" are not
++ * equally safe things to ship.
++ */
++static void fill_curve(AVFilterContext *ctx, AVHDRPlusColorTransformParams *p0,
++                       double snorm, double target)
++{
++    HDR10PlusContext *s = ctx->priv;
++    const int N = CURVE_ORDER;
++    double P[CURVE_ORDER + 1], Ks, KF;
++
++    if (s->curve == CURVE_OFF)
++        return;                       /* tone_mapping_flag stays 0: the block is not present */
++
++    if (s->curve == CURVE_ROLLOFF && snorm > 0.0 && target > 0.0 && target < snorm) {
++        /* Below the target nothing moves (slope 1); the scene peak lands exactly on the target.
++         * With KF == Ks the slope-matched first anchor collapses to a_1 = 1/N, the same closed
++         * form libplacebo solves in st2094_intercept().
++         * When the target is at or above the scene peak there is nothing to fit, and this
++         * deliberately falls through to the identity branch instead of inventing a grade.
++         */
++        Ks = KF = fmin(fmax(target / snorm, 1.0 / 4095.0), 1.0 - 1.0 / 4095.0);
++        P[0] = 0.0;
++        P[1] = 1.0 / N;
++        for (int i = 2; i < N; i++) {
++            double u = (i - 1) / (double)(N - 1);
++            P[i] = P[1] + (1.0 - P[1]) * (1.0 - (1.0 - u) * (1.0 - u) * (1.0 - u));
++        }
++        P[N] = 1.0;
++    } else {
++        /* Identity: B(t) = t needs P[p] = p/N, which makes f(x) = x wherever the curve applies. */
++        Ks = KF = 0.0;
++        for (int p = 0; p <= N; p++)
++            P[p] = p / (double)N;
++    }
++
++    p0->tone_mapping_flag        = 1;
++    /* Hysteresis. Only between two engaged knees: an identity knee (Ks == 0) always wins
++     * immediately, because holding a compressing curve onto a picture whose peak is already
++     * below the target is an invented grade, not a stability measure.
++     */
++    {
++        int ks_code = (int)llround(Ks * 4095.0);
++
++        if (s->hold > 0 && ks_code > 0 && s->have_prev_ks && s->prev_ks > 0 &&
++            labs(ks_code - s->prev_ks) < s->hold)
++            ks_code = s->prev_ks;
++        if (s->hold > 0) {
++            s->prev_ks = ks_code;
++            s->have_prev_ks = 1;
++        }
++        /* KF == Ks keeps the slope below the knee at exactly 1, so the held value has to move the
++         * vertical knee with it - and the anchors do not depend on Ks at all in this policy. */
++        p0->knee_point_x             = (AVRational){ ks_code, 4095 };
++        p0->knee_point_y             = (AVRational){ ks_code, 4095 };
++    }
++    p0->num_bezier_curve_anchors = N - 1;
++    for (int i = 1; i < N; i++) {
++        p0->bezier_curve_anchors[i - 1] = (AVRational){ (int)llround(P[i] * 1023.0), 1023 };
++        /* Validate the grid the bits actually carry, not the doubles I started from. */
++        P[i] = p0->bezier_curve_anchors[i - 1].num / (double)p0->bezier_curve_anchors[i - 1].den;
++    }
++
++    /* Three shapes were measured to be wrong rather than merely ugly (gate arms M5c / M6 / M7):
++     * a knee above zero with KF == 0 maps everything under it to black; Ks == 1 with KF != 1 is a
++     * pure gain Case 3 does not describe; Ks == 0 with KF > 0 lifts black by exactly KF because
++     * Eq 3 has no linear part to hold it down. Then the standard's own Eq 2.
++     */
++    if (bez_min_slope(P, N, 257) < -1e-9 ||
++        curve_eval(1.0, p0->knee_point_x.num / 4095.0, p0->knee_point_y.num / 4095.0, P, N) > 1.000001 ||
++        (p0->knee_point_x.num != 0 && p0->knee_point_y.num == 0) ||
++        (p0->knee_point_x.num == 0 && p0->knee_point_y.num != 0)) {
++        if (!s->warned_curve) {
++            av_log(ctx, AV_LOG_WARNING, "generated curve failed its own checks (Ks=%d/4095 "
++                   "KF=%d/4095); falling back to the identity curve\n",
++                   p0->knee_point_x.num, p0->knee_point_y.num);
++            s->warned_curve = 1;
++        }
++        p0->knee_point_x = (AVRational){ 0, 4095 };
++        p0->knee_point_y = (AVRational){ 0, 4095 };
++        for (int i = 1; i < N; i++)
++            p0->bezier_curve_anchors[i - 1] = (AVRational){ (int)llround(i * 1023.0 / N), 1023 };
++    }
++
++    /* 9.4 forbids ColorSaturationWeight at ApplicationVersion = 1, and to_t35() writes this flag
++     * inside the tone-mapping block while from_t35() and the length formula treat it as a
++     * sibling - so a payload with no curve and a weight loses the weight silently. Zero is
++     * required twice over here.
++     */
++    p0->color_saturation_mapping_flag = 0;
++}
++
++static int attach_metadata(AVFilterContext *ctx, AVFrame *frame,
++                           int max_r, int max_g, int max_b,
++                           const uint64_t *hist, int nb_codes, uint64_t npix, double fbp)
++{
++    HDR10PlusContext *s = ctx->priv;
++    AVDynamicHDRPlus *md;
++    AVHDRPlusColorTransformParams *p0;
++    const int maxval = nb_codes - 1;
++    int p, c;
++
++    if (npix == 0) {
++        /* A zero-area frame has no distribution to describe; writing zeros here would be
++         * indistinguishable from "not a calculated value". */
++        av_log(ctx, AV_LOG_ERROR, "no pixels to measure\n");
++        return AVERROR(EINVAL);
++    }
++
++    /* A frame can already carry HDR10+ of its own: an HEVC decoder attaches an authored block as
++     * AV_FRAME_DATA_DYNAMIC_HDR_PLUS, side data survives the format conversions in a typical
++     * graph, and av_frame_new_side_data() APPENDS - it does not replace. Were this filter to add a
++     * second entry, the authored one would stay first, and every first-match reader
++     * (av_frame_get_side_data(), which is what the encoder wrappers that carry this type use) would
++     * publish the input's metadata while the numbers measured above were silently dropped. Measured
++     * on a studio-authored 4K clip: the plain, curve=rolloff, peak=4000 and even the no-producer
++     * graphs each produced the same 68,679-byte AV1 file, byte for byte. */
++    if (av_frame_get_side_data(frame, AV_FRAME_DATA_DYNAMIC_HDR_PLUS)) {
++        if (!s->warned_existing) {
++            av_log(ctx, AV_LOG_WARNING, "input frames already carry HDR10+ dynamic metadata; "
++                   "replacing it with the values measured here (warned once per stream)\n");
++            s->warned_existing = 1;
++        }
++        av_frame_side_data_remove(&frame->side_data, &frame->nb_side_data,
++                                  AV_FRAME_DATA_DYNAMIC_HDR_PLUS);
++    }
++
++    md = av_dynamic_hdr_plus_create_side_data(frame);
++    if (!md)
++        return AVERROR(ENOMEM);
++    memset(md, 0, sizeof(*md));
++
++    /* Field names, ranges and the "shall be" values below follow
++     * libavutil/hdr_dynamic_metadata.h as fetched from master on 2026-09-28.
++     * Two of them are worth pointing at because a compiler cannot catch getting them wrong.
++     * The T35 identity: measured on this box, flipping any of country 0xB5 / provider 0x003C /
++     * assigned 0x0001 makes the decoder return zero pictures, so a payload with the wrong
++     * identity is simply not HDR10+ as far as anyone downstream is concerned. Note that the
++     * carrier writes those six bytes, not this struct field - setting it here is so the side
++     * data describes itself correctly to anything that reads the struct rather than the bits.
++     * The other one is the first window: it has to span the picture, i.e. (0,0) to (1,1);
++     * leaving the corners zeroed would describe an empty window while still serialising
++     * cleanly. */
++    md->itu_t_t35_country_code  = 0xB5;
++    md->application_version     = 1;      /* to_t35 writes 1 regardless */
++    /* 9.4: with ApplicationVersion = 1 a WindowNumber > 0 is not permitted, and this filter
++     * measures the whole picture, so one window is both the allowed and the honest choice. */
++    md->num_windows             = 1;
++    md->targeted_system_display_maximum_luminance = (AVRational){
++        (int)llround(s->peak * 1000.0), 1000
++    };
++
++    p0 = &md->params[0];
++    p0->window_upper_left_corner_x  = (AVRational){ 0, 1 };
++    p0->window_upper_left_corner_y  = (AVRational){ 0, 1 };
++    p0->window_lower_right_corner_x = (AVRational){ 1, 1 };
++    p0->window_lower_right_corner_y = (AVRational){ 1, 1 };
++
++    /* 8.3: MaxSCL = three elements, "the maximum of each component of linearized RGB
++     * values in the scene", ordered {R,G,B}; {0,0,0} means "not a calculated value". */
++    p0->maxscl[0] = (AVRational){ norm_light(pq_eotf(max_r, maxval)), 100000 };
++    p0->maxscl[1] = (AVRational){ norm_light(pq_eotf(max_g, maxval)), 100000 };
++    p0->maxscl[2] = (AVRational){ norm_light(pq_eotf(max_b, maxval)), 100000 };
++
++    /* 8.4: "the average of linearized maxRGB values in the scene". Accumulate in 64
++     * bit: a 4K frame is 8.3e6 pixels, so the per-bin products do not fit the int a
++     * AVRational numerator is. */
++    {
++        uint64_t acc = 0;
++
++        for (c = 0; c < nb_codes; c++)
++            if (hist[c])
++                acc += (uint64_t)norm_light(pq_eotf(c, maxval)) * hist[c];
++        p0->average_maxrgb = (AVRational){ (int)((acc + npix / 2) / npix), 100000 };
++    }
++
++    /* 8.5: DistributionMaxRGB = the pair (J, V) over the CFD of linearized maxRGB of
++     * all pixels of the scene, ascending, duplicates kept, n = pixel count.
++     * 8.5.2: V_i is the ceil(J_i * n / 100)-th element (1-based) of that list.
++     * 8.5.3/8.5.4: a J of 99 is computed as 99.98%; and for ApplicationVersion = 1
++     * with J = [1,5,10,25,50,75,90,95,99] the elements V1 and V2 are NOT measurements
++     * but fixed 0.00000 and 0.00255. */
++    p0->num_distribution_maxrgb_percentiles = NB_PERCENTILES;
++    for (p = 0; p < NB_PERCENTILES; p++) {
++        double q = hdr_plus_j[p] == 99 ? 99.98 : hdr_plus_j[p];
++        uint64_t want = (uint64_t)ceil(q * npix / 100.0);   /* 1-based CFD index */
++        uint64_t run  = 0;
++
++        p0->distribution_maxrgb[p].percentage = hdr_plus_j[p];
++        if (p == 1 || p == 2) {
++            p0->distribution_maxrgb[p].percentile = (AVRational){ p == 1 ? 0 : 255, 100000 };
++            continue;
++        }
++        for (c = 0; c < nb_codes; c++) {
++            run += hist[c];
++            if (run >= want)
++                break;
++        }
++        p0->distribution_maxrgb[p].percentile = (AVRational){
++            norm_light(pq_eotf(av_clip(c, 0, maxval), maxval)), 100000
++        };
++    }
++
++    /* 8.6: "FractionBrightPixels = 0 shall indicate that it does not represent a
++     * calculated value", and the revision notes recommend 0 - so the value is deliberately zero
++     * unless fbp=1 asks for the 10.4 measurement (see measure_fbp() for what that costs).
++     * The denominator is not: av_dynamic_hdr_plus_to_t35() converts this field through its own
++     * denominator and writes it unconditionally, and the memset above left that denominator 0.
++     * Measured on this box: the serialiser then dies with integer divide by zero (0xC0000094) on
++     * the very first frame, so {0,0} is not "a zero meaning not calculated" - it is a crash in
++     * the encoder. The knee/bezier and CCV blocks genuinely are gated off by their flags. */
++    p0->fraction_bright_pixels = (AVRational){ (int)av_clip64(llround(fbp * 1000.0), 0, 1000), 1000 };
++
++    /* The curve's own domain is relative (Annex B.3): the input axis is normalized by the scene
++     * peak, and its output 1.0 means TargetedSystemDisplayMaximumLuminance. Both of those are
++     * 1/100000-normalized linear light here, so the ratio is dimensionless. */
++    {
++        double snorm = p0->maxscl[0].num / (double)p0->maxscl[0].den;
++
++        for (c = 1; c < 3; c++)
++            snorm = fmax(snorm, p0->maxscl[c].num / (double)p0->maxscl[c].den);
++        fill_curve(ctx, p0, snorm, s->peak / 10000.0);
++    }
++    return 0;
++}
++
++/* ST 2094-40:2020 10.2/10.4 - FractionBrightPixels.
++ *
++ * The block sums come in already averaged per 5x5 pixel proxy block (10.4.1 mandates the 5:1
++ * reduction, and Eq 6's luma is linear in R,G,B so averaging the channels and taking the luma of
++ * the average are the same operation - which is why one accumulator per block is enough).
++ *
++ * CAVEAT, stated because it changes the number: 10.2 defines the scene as the unit - Eq 9 picks
++ * the brightest frame of the scene and Eq 11 is computed over that frame only. A streaming
++ * filter has no scene, so this measures the CURRENT PICTURE as a one-frame scene. That is legal
++ * (a single picture is a scene) and it is what makes the value honest about what was observed,
++ * but it will not equal a two-pass producer's number on the same title. 10.4.1's "highest frame
++ * index wins a tie" is satisfied trivially with one frame.
++ */
++static double proxy_fbp(const double *acc, int nbw, int nbh, int width, int height)
++{
++    const double w1 = 1.0 / 255.0, w2 = 5.0 / 255.0;   /* 10.4.1: omega1, omega2 */
++    double ymax = 0.0, total = 0.0;
++    int n = 0;
++
++    for (int by = 0; by < nbh; by++) {
++        int y0 = by * 5, y1 = FFMIN(y0 + 5, height);
++        int hgt = y1 - y0;
++
++        if (hgt <= 0)
++            continue;
++        for (int bx = 0; bx < nbw; bx++) {
++            int x0 = bx * 5, x1 = FFMIN(x0 + 5, width);
++            int wid = x1 - x0;
++            double y;
++
++            if (wid <= 0)
++                continue;
++            y = acc[(size_t)by * nbw + bx] / (hgt * wid);   /* Eq 6 already applied per pixel */
++            if (y > ymax)
++                ymax = y;                                    /* Eq 10 */
++            n++;
++        }
++    }
++    if (!n)
++        return 0.0;
++
++    for (int i = 0; i < nbw * nbh; i++) {
++        int by = i / nbw, bx = i % nbw;
++        int y0 = by * 5, x0 = bx * 5;
++        int wid = FFMIN(x0 + 5, width) - x0, hgt = FFMIN(y0 + 5, height) - y0;
++        double y, d, wgt;
++
++        if (wid <= 0 || hgt <= 0)
++            continue;
++        y   = acc[i] / (wid * hgt);
++        d   = ymax - y;                                      /* inside the 10.4.1 luminance band */
++        wgt = d < w1 ? 1.0 : (d < w2 ? (d - w2) / (w1 - w2) : 0.0);   /* Eq 7 */
++        total += wgt;
++    }
++    return total / n;                                        /* Eq 11 */
++}
++
++static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
++{
++    AVFilterContext *ctx = inlink->dst;
++    HDR10PlusContext *s = ctx->priv;
++    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(frame->format);
++    const int depth = desc ? desc->comp[0].depth : 0;
++    const int nb_codes = 1 << depth;          /* 1024 at 10 bit, 4096 at 12 bit */
++    const int maxval = nb_codes - 1;
++    uint64_t *hist;
++    /* FractionBrightPixels needs the luma of a 5:1 proxy: three contribution tables (one per
++     * channel, Eq 6's coefficients folded in) so the picture is measured with lookups instead of
++     * three pow() per pixel, and one double per proxy block. */
++    double *acc = NULL, *lr = NULL, *lg = NULL, *lb = NULL, fbp = 0.0;
++    int *colblk = NULL, nbw = 0, nbh = 0;
++    uint16_t max_r = 0, max_g = 0, max_b = 0;
++    int ret, x, y;
++
++    if (!desc || (depth != 10 && depth != 12) || nb_codes > NB_CODES_MAX) {
++        /* Fail closed on an unknown width rather than measuring through a table sized for
++         * something else: with depth 0 the mask below would be `& 0`, every pixel would bin at
++         * code 0, and the payload would still serialise and decode cleanly as "all black".
++         * query_formats() only offers 10 and 12 bit, so reaching here means a frame arrived
++         * around the negotiation, or a depth was added to that list without touching this. */
++        av_log(ctx, AV_LOG_ERROR, "input is %s (%d-bit); this filter measures 10-bit and 12-bit "
++               "PQ code values through a table of at most %d bins - extend both together\n",
++               av_get_pix_fmt_name(frame->format), depth, NB_CODES_MAX);
++        ret = AVERROR(EINVAL);
++        goto fail;
++    }
++
++    /* 4.4 defines a linearized signal through ST 2084, so these statistics mean PQ code
++     * values and nothing else. A differently tagged (or untagged) picture still produces a
++     * payload that serialises and decodes cleanly, so nothing downstream can catch it:
++     * refuse here rather than guess which transfer the pixels are in. */
++    if (frame->color_trc != AVCOL_TRC_SMPTE2084) {
++        av_log(ctx, AV_LOG_ERROR, "input transfer is %s, this filter measures ST 2084 (PQ) "
++               "code values; convert or label explicitly, e.g. "
++               "setparams=color_trc=smpte2084\n", av_color_transfer_name(frame->color_trc));
++        ret = AVERROR(EINVAL);
++        goto fail;
++    }
++    /* Measured on this box: swscale's yuv->rgb delivers full-range RGB, so a gbrp frame
++     * arriving tagged studio-range is a caller mistake - and it would not fail, it would
++     * just read the whole distribution low by the expansion factor. */
++    if (frame->color_range == AVCOL_RANGE_MPEG) {
++        av_log(ctx, AV_LOG_ERROR, "input is studio-range RGB; expand it first "
++               "(scale=out_range=pc) or the measured maxRGB would be low\n");
++        ret = AVERROR(EINVAL);
++        goto fail;
++    }
++
++    hist = av_calloc(nb_codes, sizeof(*hist));
++    if (!hist) {
++        ret = AVERROR(ENOMEM);
++        goto fail;
++    }
++
++    if (s->fbp) {
++        nbw = (frame->width  + 4) / 5;
++        nbh = (frame->height + 4) / 5;
++        acc    = av_calloc((size_t)nbw * nbh, sizeof(*acc));
++        lr     = av_malloc_array(nb_codes, sizeof(*lr));
++        lg     = av_malloc_array(nb_codes, sizeof(*lg));
++        lb     = av_malloc_array(nb_codes, sizeof(*lb));
++        colblk = av_malloc_array(frame->width, sizeof(*colblk));
++        if (!acc || !lr || !lg || !lb || !colblk) {
++            ret = AVERROR(ENOMEM);
++            goto cleanup;
++        }
++        /* 10.2.1's luma is BT.2020 with D65: 0.2627 / 0.678 / 0.0593 on the LINEARIZED
++         * components (their sum is exactly 1.0, which the gate exploits to build a proxy block
++         * of a wanted luminance). */
++        for (int c = 0; c < nb_codes; c++) {
++            double e = pq_eotf(c, maxval);
++
++            lr[c] = 0.2627 * e;
++            lg[c] = 0.6780 * e;
++            lb[c] = 0.0593 * e;
++        }
++        for (x = 0; x < frame->width; x++)
++            colblk[x] = x / 5;
++    }
++
++    /* gbrp keeps its planes in G, B, R order.
++     * The mask is the picture's OWN code width, not a constant: `& 0x3FF` on 12-bit samples
++     * drops the two most significant bits and still yields a payload that serialises, decodes
++     * and passes every downstream check - a full-scale white would simply be measured as a
++     * quarter of one. */
++    for (y = 0; y < frame->height; y++) {
++        const uint16_t *pg = (const uint16_t *)(frame->data[0] + (ptrdiff_t)y * frame->linesize[0]);
++        const uint16_t *pb = (const uint16_t *)(frame->data[1] + (ptrdiff_t)y * frame->linesize[1]);
++        const uint16_t *pr = (const uint16_t *)(frame->data[2] + (ptrdiff_t)y * frame->linesize[2]);
++        double *row_acc = s->fbp ? acc + (size_t)(y / 5) * nbw : NULL;
++
++        for (x = 0; x < frame->width; x++) {
++            int rv = pr[x] & maxval, gv = pg[x] & maxval, bv = pb[x] & maxval;
++            int m = rv > gv ? rv : gv;
++
++            if (bv > m)
++                m = bv;
++            if (rv > max_r)
++                max_r = rv;
++            if (gv > max_g)
++                max_g = gv;
++            if (bv > max_b)
++                max_b = bv;
++            hist[m]++;
++            if (row_acc)
++                row_acc[colblk[x]] += lr[rv] + lg[gv] + lb[bv];
++        }
++    }
++
++    if (s->fbp)
++        fbp = proxy_fbp(acc, nbw, nbh, frame->width, frame->height);
++
++    ret = attach_metadata(ctx, frame, max_r, max_g, max_b, hist, nb_codes,
++                          (uint64_t)frame->width * frame->height, fbp);
++cleanup:
++    av_free(hist);
++    av_free(acc);
++    av_free(lr);
++    av_free(lg);
++    av_free(lb);
++    av_free(colblk);
++    if (ret < 0)
++        goto fail;
++
++    return ff_filter_frame(ctx->outputs[0], frame);
++
++fail:
++    av_frame_free(&frame);
++    return ret;
++}
++
++#define OFFSET(x) offsetof(HDR10PlusContext, x)
++#define FLAGS (AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_FILTERING_PARAM)
++
++static const AVOption hdr10plus_options[] = {
++    { "peak",    "targeted system display peak luminance in cd/m2",
++        OFFSET(peak), AV_OPT_TYPE_DOUBLE, { .dbl = 1000 }, 1, 10000, FLAGS },
++    { "curve",   "write a tone-mapping curve (8.7) as well as the statistics",
++        OFFSET(curve), AV_OPT_TYPE_INT, { .i64 = CURVE_OFF }, CURVE_OFF, CURVE_ROLLOFF, FLAGS,
++        .unit = "curve" },
++    { "off",      "no curve block - the shape most shipped HDR10+ actually carries",
++        0, AV_OPT_TYPE_CONST, { .i64 = CURVE_OFF }, 0, 0, FLAGS, .unit = "curve" },
++    { "preserve", "identity curve, f(x) = x",
++        0, AV_OPT_TYPE_CONST, { .i64 = CURVE_PRESERVE }, 0, 0, FLAGS, .unit = "curve" },
++    { "rolloff",  "slope 1 up to the target, then fit the scene peak onto it",
++        0, AV_OPT_TYPE_CONST, { .i64 = CURVE_ROLLOFF }, 0, 0, FLAGS, .unit = "curve" },
++    { "fbp",      "measure FractionBrightPixels (10.4) for this picture instead of the 0 marker",
++        OFFSET(fbp), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, FLAGS },
++    { "hold",     "keep the previous knee unless the new one differs by more than this many "
++                  "1/4095 codes (0 = recompute per picture)",
++        OFFSET(hold), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 4095, FLAGS },
++    { NULL }
++};
++
++AVFILTER_DEFINE_CLASS(hdr10plus);
++
++static const AVFilterPad inputs[] = {
++    {
++        .name         = "default",
++        .type         = AVMEDIA_TYPE_VIDEO,
++        .filter_frame = filter_frame,
++    },
++};
++
++const FFFilter ff_vf_hdr10plus = {
++    .p.name        = "hdr10plus",
++    .p.description = NULL_IF_CONFIG_SMALL("Produce HDR10+ (SMPTE ST 2094-40) dynamic metadata from the picture."),
++    .p.priv_class  = &hdr10plus_class,
++    .p.flags       = AVFILTER_FLAG_METADATA_ONLY,
++    .priv_size     = sizeof(HDR10PlusContext),
++    FILTER_INPUTS(inputs),
++    FILTER_OUTPUTS(ff_video_default_filterpad),
++    FILTER_QUERY_FUNC2(query_formats),
++};
+
+-- 
+2.0.0 (generator: upstream-kit/make_patches.py)
+

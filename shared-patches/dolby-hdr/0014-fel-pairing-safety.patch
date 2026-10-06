@@ -1,0 +1,135 @@
+diff --git a/libavfilter/vf_dovi_compose.c b/libavfilter/vf_dovi_compose.c
+--- a/libavfilter/vf_dovi_compose.c
++++ b/libavfilter/vf_dovi_compose.c
+@@ -150,6 +150,21 @@
+ static int check_pair(AVFilterContext *ctx, const AVFrame *bl, const AVFrame *el)
+ {
+     DoviComposeContext *s = ctx->priv;
++
++    if (!el) {
++        const AVFrameSideData *sd = av_frame_get_side_data(bl, AV_FRAME_DATA_DOVI_METADATA);
++        const AVDOVIRpuDataHeader *hdr = sd ? av_dovi_get_header((const AVDOVIMetadata *)sd->data) : NULL;
++
++        if (!hdr) {
++            av_log(ctx, AV_LOG_ERROR, "base frame has no Dolby Vision RPU; cannot determine whether a missing EL is valid\n");
++            return AVERROR_INVALIDDATA;
++        }
++        if (!hdr->disable_residual_flag) {
++            av_log(ctx, AV_LOG_ERROR, "base frame pts %"PRId64" requires an enhancement residual, but no matching EL frame exists\n", bl->pts);
++            return AVERROR_INVALIDDATA;
++        }
++        return 0;
++    }
+ 
+     if (s->el_rebuild < 0) {
+         av_log(ctx, AV_LOG_ERROR, "el_rebuild was not declared. This input pair is dual layer "
+@@ -240,11 +255,9 @@
+ /*
+  * Compose one pair and emit it.
+  *
+- * OWNERSHIP, stated because getting it wrong here is what crashed this filter on the SECOND frame
+- * while the first one worked: `bl` and `el` are both handed in by the caller and the CALLER KEEPS
+- * OWNERSHIP of them. This function allocates its own output frame, copies the base frame's
+- * properties onto it, writes the composed samples into it, and returns THAT frame. It does not free,
+- * consume or hand on either input.
++ * OWNERSHIP: `bl` belongs to this callback; `el` remains owned by framesync. This function
++ * allocates its output frame, copies the base frame's properties onto it, writes the composed
++ * samples into it, and returns that output without consuming either input.
+  *
+  * The first revision emitted `out` and left `bl` unreferenced - the queue slot was cleared, so
+  * nothing freed it, and by the second frame the base frame's buffers were no longer there to read.
+@@ -362,31 +375,27 @@
+     }
+ 
+     memset(&el_in, 0, sizeof(el_in));
+-    for (c = 0; c < 3; c++) {
+-        el_in.plane[c]    = (const uint16_t *)el->data[c];
+-        el_in.stride[c]   = el->linesize[c] / 2;
+-    }
+-    el_in.width     = el->width;
+-    el_in.height    = el->height;
+-    el_in.bit_depth = av_pix_fmt_desc_get(el->format)->comp[0].depth;
+-    el_in.present   = 1;
+-    {
+-        /* The EL arrives as a decoded picture, and its chroma planes may be subsampled relative to
+-         * its luma. Declaring that here is what keeps the residual path from walking off the end of
+-         * a half-width chroma plane - the crash that the host-driven P1 arms could not reach because
+-         * they modelled the EL as 4:4:4. Read from the descriptor rather than assumed, so a 4:4:4 or
+-         * 4:2:2 EL would be described correctly too. */
+-        const AVPixFmtDescriptor *ed = av_pix_fmt_desc_get(el->format);
+-        int log2cw = ed ? ed->log2_chroma_w : 0;
+-        int log2ch = ed ? ed->log2_chroma_h : 0;
+-
+-        el_in.chroma_w = AV_CEIL_RSHIFT(el->width,  log2cw);
+-        el_in.chroma_h = AV_CEIL_RSHIFT(el->height, log2ch);
+-    }
+-
+-    av_log(ctx, AV_LOG_VERBOSE, "EL %dx%d (%s) -> plane rasters %dx%d luma, %dx%d chroma\n",
+-           el->width, el->height, av_get_pix_fmt_name(el->format),
+-           el->width, el->height, el_in.chroma_w, el_in.chroma_h);
++    if (el) {
++        for (c = 0; c < 3; c++) {
++            el_in.plane[c]  = (const uint16_t *)el->data[c];
++            el_in.stride[c] = el->linesize[c] / 2;
++        }
++        el_in.width     = el->width;
++        el_in.height    = el->height;
++        el_in.bit_depth = av_pix_fmt_desc_get(el->format)->comp[0].depth;
++        el_in.present   = 1;
++        {
++            const AVPixFmtDescriptor *ed = av_pix_fmt_desc_get(el->format);
++            int log2cw = ed ? ed->log2_chroma_w : 0;
++            int log2ch = ed ? ed->log2_chroma_h : 0;
++
++            el_in.chroma_w = AV_CEIL_RSHIFT(el->width,  log2cw);
++            el_in.chroma_h = AV_CEIL_RSHIFT(el->height, log2ch);
++        }
++        av_log(ctx, AV_LOG_VERBOSE, "EL %dx%d (%s) -> plane rasters %dx%d luma, %dx%d chroma\n",
++               el->width, el->height, av_get_pix_fmt_name(el->format),
++               el->width, el->height, el_in.chroma_w, el_in.chroma_h);
++    }
+ 
+     /* `chroma` is the BASE layer's 4:2:0 -> 4:4:4 rebuild declaration, and it is required for the
+      * same reason `dovi_apply` requires it: the rebuild is part of the result, not a pre-processing
+@@ -396,7 +405,7 @@
+     ret = dovi_apply_planes(dovi, src, src_stride, dst, dst_stride,
+                             bl->width, bl->height, out_depth,
+                             CHROMA_BILINEAR, -1,      /* the P5 slot is not this filter's business */
+-                            &el_in, s->el_rebuild, s->el_neutral, NULL,
++                            el ? &el_in : NULL, s->el_rebuild, s->el_neutral, NULL,
+                             ctx, &out_of_range);
+     if (ret < 0) {
+         av_frame_free(&out);
+@@ -494,18 +503,21 @@
+      * is therefore removed rather than left in place, and this comment is what remains of it.
+      */
+ 
+-    if (!el) {
+-        /* No enhancement frame for this base frame. Legitimate rather than an error: clause 5.4.3.3
+-         * makes the residual conditional on disable_residual_flag, and the stream's own shape can
+-         * simply end the EL first. Counted and reported, because a silent pass-through would be
+-         * indistinguishable from a compose that did nothing. */
++    if (el && (bl->pts == AV_NOPTS_VALUE || el->pts == AV_NOPTS_VALUE ||
++               av_compare_ts(bl->pts, ctx->inputs[PAD_BL]->time_base,
++                             el->pts, ctx->inputs[PAD_EL]->time_base) != 0)) {
++        av_log(ctx, AV_LOG_ERROR, "BL/EL frames are not exactly timestamp-aligned (BL=%"PRId64", EL=%"PRId64"); refusing to compose a neighboring residual\n",
++               bl->pts, el->pts);
++        av_frame_free(&bl);
++        return AVERROR_INVALIDDATA;
++    }
++
++    if (!el)
+         s->bl_only++;
+-        av_log(ctx, AV_LOG_VERBOSE, "base frame pts %"PRId64" has no enhancement frame; passing it "
+-               "through without composition (counted: %"PRId64" so far)\n", bl->pts, s->bl_only);
+-        return ff_filter_frame(outlink, bl);
+-    }
+-
+-    return compose_pair(ctx, bl, el);
++
++    ret = compose_pair(ctx, bl, el);
++    av_frame_free(&bl);
++    return ret;
+ }
+ 
+ /*

@@ -1,0 +1,1945 @@
+From 8864fd0aecf21fe9e3cfcd83a8ef33cb7e885fd4 Mon Sep 17 00:00:00 2001
+From: REPLACE-ME <you@example>
+Date: Tue, 06 Oct 2026 14:34:02 +0800
+Subject: [PATCH] avfilter: add dovi_apply, applying DV RPU reshaping curves
+
+Dolby Vision base layers are not the picture their metadata describes: the RPU's
+reshaping curves sit between the coded components and the signal the content was
+authored for. Nothing in tree evaluates those curves on the CPU today -
+libavcodec only parses them into AVDOVIDataMapping (dovi_rpudec.c), vf_showinfo
+prints them, and vf_libplacebo applies them inside the GPU renderer via
+pl_map_avframe_ex(.map_dovi=...). A CPU pipeline therefore cannot get HDR10+
+(SMPTE ST 2094-40) metadata out of a Dolby Vision source at all: measuring the base
+layer directly describes a picture nobody graded.
+
+This filter closes that step. Per pixel it takes the stream's own component planes,
+rebuilds chroma onto the luma grid by a DECLARED method, evaluates the per-component
+piecewise function (polynomial or MMR, coefficients divided by 2**coef_log2_denom,
+pivots compared in the source's coded domain), then applies the DM's own
+ycc_to_rgb_matrix - which dovi_meta.h documents as acting "before PQ linearization" -
+and emits AV_PIX_FMT_GBRP at the input depth in the PQ code domain, tagged
+BT.2020 / SMPTE ST 2084 / full range. That output domain is what pairs with the
+hdr10plus producer filter of the earlier patch in this series: the producer applies the
+ST 2084 EOTF itself, as ST 2094-40 4.4 requires.
+
+Input is restricted to 4:2:0, and that restriction is enforced rather than implied: the
+rebuild indexes chroma as (y >> 1, x >> 1) with cw = (w + 1) / 2, so a 4:2:2 or 4:4:4 frame
+would be measured against the wrong samples and the metadata would still serialise, decode and
+look fine. 4:2:2 and 4:4:4 deliberately STAY in query_formats(): with only 4:2:0 listed, the
+graph would quietly insert a chroma conversion to reach it, which is the same unmarked assumption
+the chroma option refuses to make. Listing them means such a frame arrives and is refused here,
+with the conversion named as the caller's decision.
+
+The rebuild walks the chroma grid, one cell per 2x2 luma block, so each cell loads its four
+bilinear taps once instead of four times. The per-pixel statements were moved verbatim (only
+re-indented), which is what makes it arithmetic-identical rather than approximately so:
+(in)(v * 0.5 + 0.25) == v >> 1 for every v, and v >> 1 is never outside the chroma plane for a v
+inside the picture, so no clamp can move y0/x0 and the weights are exactly 0.25/0.75 by parity.
+Verified by comparing whole frames byte for byte against the previous implementation on nine
+geometries (1920x1080, the same frame with odd width, odd height and both, and 1x1, 2x2, 3x3,
+5x7, 7x5) plus four frames of two real clips. Measured on this box at -O2, interleaved A/B/A,
+seven runs per arm and distributions that do not overlap: 127.8 ms -> 109.1 ms per 1920x1080
+frame (1.17x by medians, 1.14x by per-arm minima).
+
+Two shapes are refused rather than approximated, all with the reason in the message:
+
+  - ICtCp (signal_color_space == 2), where the transfer to assume for the curve output is
+    not carried by the bitstream, and the two candidates do not just differ slightly -
+    on the same frame they move average_maxrgb by more than a factor of two. Emitting a
+    guess would be indistinguishable downstream from a correct result;
+  - a placeholder curve: one component's piecewise function maps its whole declared pivot
+    range to a single value. Applying it is not an error and nothing crashes - every pixel
+    comes out the same, so the producer downstream measures a flat picture and emits a block
+    that serialises, decodes and prints a complete set of ST 2094-40 values. It is refused
+    because that output is indistinguishable from a correct one after the fact. The test is
+    the one the validated Python kernel this filter mirrors uses: 257 points spread over the
+    component's own pivots, refuse when max - min < 1e-3 (p5_applier.py:129-138). It is not
+    a hypothetical guard - the same measurement on real clips found such blocks on 30 of 60
+    frames of one and 31 of 60 of another, where every usable curve spanned at least 0.54.
+
+A RESIDUAL (dual) LAYER is no longer one of them. It is composed, with el_rebuild / el_neutral
+declared by the caller - and refusing to choose those is the same style the two refusals above
+use. That is the whole reason the compose could land here: CCM 001 clause 5.4.1 states outright
+that resampling "is not a normative part of the present document", so the bitstream does not say
+which filter brought the enhancement layer onto the base layer's raster, and clause 5.4.3.2's
+"rr = e - nlq_offset" does not settle where the layer's zero residual sits on real material
+(the CES 00004 pair's own EL luma median is code 64 while its RPU declares nlq_offset=512 for
+all three components - 2.4x apart). Both are therefore AVOptions with no default, refused by
+name when undeclared, exactly as p5_transfer is above. The compose itself is measured, not
+asserted: against the shipped Python reference on a real paired subject the two pipelines agree
+BIT-IDENTICALLY on 98.4355% of 24,883,200 samples (median |delta| = 0), the disagreement is
+confined to a thin spatially-local tail, and the teeth arm shows the residual genuinely reaches
+the pixels (the composed frame matches the composed reference at mean|delta| 1.653 against 3.598
+for the base layer alone). The residual between the two pipelines is EL/BL resampling, which is
+the non-normative step above - so the <= 1 code arm is reported as failing rather than loosened.
+
+The probe reads the RPU alone, not the frame, so it costs 3 * 257 evaluations of a polynomial
+or a small MMR per frame, allocates nothing, and lives in a function of its own: the per-pixel
+reshape path is untouched byte for byte (re-checked against the previous revision of this patch),
+which is what keeps the numeric contract asserted elsewhere exactly where it was. Its arithmetic
+was executed, not reasoned about: a single-TU harness calling the same dovi_apply_probe_curves()
+filter_frame() calls, fed dv84's real RPU (bl_bit_depth 10, coef_log2_denom 23, 9 luma pivots,
+8 polynomial pieces), reproduces the validated Python kernel's span/min/max/first for that curve
+to 9 decimals (0.658104121 / 0.064753009 / 0.722857129) and returns the expected verdict in four
+arms - real curve accepted, luma zeroed refused naming component 0, and a flat MMR refused naming
+components 1 and 2 respectively. Not verified: the refusal has not been driven through a real
+filtergraph (that needs a tree rebuilt with this source), and the box's single-layer subjects carry
+no placeholder block to reach it with - measured, not assumed: walking 60 DM blocks of each,
+glowtime refuses 30 and shine 31 (all of them component 0 mapping its domain to 0.0, span 0.0),
+pursuit 0, and dv84 0 with its smallest component span 0.658, which is why a rebuilt tree should
+not start refusing the existing in-graph material. Compile arms: three, all exit 0, no diagnostic
+attributed to the new lines.
+
+The chroma rebuild has no default, because the geometry is part of the result: measured,
+nearest and bilinear put J=50 4.49% apart, and a 4:2:0 path moves the median 19.7% against a
+4:4:4 reference. Choosing silently would put an unmarked assumption into the metadata, and
+the distribution sanity checks do not see it.
+
+Input and output formats differ, so query_formats pins each side separately rather than
+using the common-list helper; DOVI side data is dropped from the output by type, since the
+generic colour-dependent-property sweep would also strip the HDR10+ side data the next
+filter attaches.
+
+Two depth rules follow from that, and both are refusals rather than conversions because the
+declared domain is not this filter's to guess:
+ - the frame is only accepted at the depth the RPU declares in bl_bit_depth. The curves act on
+   the base layer's own code domain, so feeding 12-bit samples through a 1/1023 divisor scales
+   every pixel by four and pins the curve output at its ceiling. Measured on a Profile 8 clip
+   declared at 10 bit and pushed through format=yuv420p12le: the frames that came out had R =
+   4095 and G = 0 across two thirds of the picture, five distinct codes in the whole frame, and
+   the producer downstream reported maxscl = average_maxrgb = 100000/100000. That serialises and
+   decodes cleanly, so nothing after this filter could have told.
+ - the codes WRITTEN are scaled by the depth of the output buffer, not of the input frame. The
+   format list offers gbrp10le and gbrp12le on both sides, so a graph may legitimately negotiate
+   different depths; using the input depth for the output range left dv84's reshaped picture in
+   codes 0..754 inside a 12-bit buffer - four times too small - which the producer then read as
+   maxscl 18/100000 for a frame it measures as 8499/100000 at the matching depth. With both rules
+   in place, the same reshaped picture measured at 10 bit and at 12 bit agrees to within one
+   10-bit code step (|d maxscl| 22 and 24 units against a ~57-unit step at that brightness,
+   |d average| 0).
+
+Verification (see README): the file compiles warning-free as one translation unit
+(cl -W3 -std:c17, MSVC 19.51) against this revision, under the same flags as two control arms -
+upstream's own vf_setparams.c unmodified, and the vf_hdr10plus.c of the previous patch. All three
+emit only the same pre-existing intmath.h C4146 pair, so no diagnostic is attributable to these
+lines. The arithmetic was checked numerically: frames of two real Profile 8 clips were pushed
+through this filter and then through the hdr10plus producer, and the resulting statistics match an
+independent reference implementation of the same chain with maxscl and all nine percentiles
+identical, average_maxrgb differing only on a .5 rounding tie (llround away from zero versus
+half-to-even). It has also been built and run as part of a whole tree (this revision, MSVC 19.51 +
+GNU Make, --toolchain=msvc --disable-x86asm): both filters appear in -filters, two frames of a real
+Profile 8 clip pass dovi_apply -> hdr10plus inside an actual filtergraph, and the frames carry
+per-frame ST 2094-40 metadata read back with structured values (application version 1,
+num_distribution_maxrgb_percentiles 9). The refusals are graph-tested too, one frame each:
+4:2:2 and 4:4:4 input, a frame without DOVI side data, and a frame deeper than
+the RPU declares all reach filter_frame and come back as errors rather than crashing, and omitting
+`chroma` fails at init. A DUAL-LAYER clip is no longer in that list: it is composed when the caller
+declares `el_rebuild` and `el_neutral`, and refused by name when either is missing (EINVAL) or when
+no enhancement layer is supplied (ENOTSUP) - three distinguishable outcomes, tested. Two whole-tree
+builds were judged, with x86 asm disabled and with it
+enabled through nasm 2.16.01: the same 22 graph assertions pass on both, and every metadata value
+they print is identical between them. Not verified: SIMD (the loop is scalar double; ~18 Mpix/s at
+-O2 in a single translation unit on this box - no timing is claimed from either tree build), and a
+genuinely 12-bit source: no 12-bit Dolby Vision subject was available here, so the 12-bit arms are
+measured on depth conversions of 10-bit clips and on samples written by the suite.
+
+Signed-off-by: REPLACE-ME <replace-me@example.com>
+
+---
+
+The tree this diff was generated against: ffmpeg (HEAD 8864fd0)
+Filter source in this kit: upstream-kit/libavfilter/vf_dovi_apply.c (1763 lines, sha256 ba7c39f2b349fbdd)
+Numeric check: p5probe/dovi-apply-chain-20260930.log (4 real Profile 8 frames, 5 PASS / 0 FAIL)
+---
+diff --git a/libavfilter/vf_dovi_apply.c b/libavfilter/vf_dovi_apply.c
+new file mode 100644
+--- /dev/null
++++ b/libavfilter/vf_dovi_apply.c
+@@ -0,0 +1,1763 @@
++/*
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++/**
++ * @file
++ * Apply the Dolby Vision RPU reshaping curves to a base layer, producing the
++ * signal the metadata was authored for.
++ */
++
++#include <math.h>
++#include <stdio.h>
++
++#include "libavutil/avassert.h"
++#include "libavutil/common.h"
++#include "libavutil/dovi_meta.h"
++#include "libavutil/frame.h"
++#include "libavutil/mem.h"
++#include "libavutil/opt.h"
++#include "libavutil/pixdesc.h"
++#include "libavutil/rational.h"
++
++#include "avfilter.h"
++#include "filters.h"
++#include "formats.h"
++#include "avfilter_internal.h"
++#include "video.h"
++
++enum ChromaRebuild {
++    CHROMA_NEAREST,
++    CHROMA_BILINEAR,
++    CHROMA_NB
++};
++
++/*
++ * What the transfer slot between the DM's two matrices holds for a Profile 5 base layer.
++ *
++ * The bitstream does NOT decide it. `signal_eotf` is the field that nominally would, but on the
++ * ICtCp material this was developed against it carries no code at all: measured 65535 on all three
++ * items with signal_eotf_param0/1/2 all zero, and research report 63 established that combination
++ * as a derived sentinel rather than a declaration of PQ. Nor does self-consistency separate the
++ * candidates - each arm closes its own round trip. Only the numbers differ, and they differ
++ * substantially: measured on the corrected component-plane path (report 42.2,
++ * p5probe/p5-path-orientation-20260929.log), one frame of the shine item peaks at 1833 cd/m2
++ * under the cube arm and 180 cd/m2 under the PQ arm, against the 1000.6 cd/m2 reference white that
++ * very stream declares. The report's own verdict on that pair is that the cube arm is consistently
++ * nearer but by less than half an octave - explicitly NOT strong enough to adjudicate (it withdrew
++ * an earlier, over-read version of the same comparison in report 42).
++ *
++ * So there is no default here: the caller declares the arm, and an undeclared ICtCp frame is
++ * refused rather than silently given whichever transfer I would have picked.
++ */
++enum P5Transfer {
++    P5_TRANSFER_CBRT,   /* sign(x)*|x|^3, the cube root the P5 authored signal is inverted with */
++    P5_TRANSFER_PQ,     /* ST 2084 EOTF on the normalised code, 1.0 == 10000 cd/m2 */
++    P5_TRANSFER_NB
++};
++
++/*
++ * How the enhancement layer is brought onto the base layer's raster before the two are composed.
++ *
++ * NAME THIS HONESTLY: only one of these three is the shape the format asks for, one is an
++ * informative reference that covers ONE direction, and the third is a stand-in this kit invented.
++ *
++ *   EL_REBUILD_IDENTITY  - ETSI GS CCM 001 clause 5.2.2 a) says the BL and EL pictures "shall have
++ *                          the same vertical and horizontal resolution", so on conformant material
++ *                          nothing is resampled at all. The clause number is quoted because this is
++ *                          the only arm with a normative basis.
++ *   EL_REBUILD_REPEAT    - the exact integer ratio: each EL sample replicated over its BL cell when
++ *                          the EL is smaller, every n-th sample taken from the top-left when it is
++ *                          larger. THIS IS A STAND-IN, NOT A STANDARD. `el_spatial_resampling_filter_flag`
++ *                          selects a normative filter whose identity is NOT carried by the stream -
++ *                          it is a single bit, not a selector (see the dossier, section C.2) - so
++ *                          the phase below is a declaration by the caller, which is why the caller
++ *                          has to make it. Annex B.3 of CCM 001 does publish a reference upsampler,
++ *                          but it is INFORMATIVE, and it defines only the UPSAMPLING direction
++ *                          (every published tap is written `r[2n]` / `r[2n+1]`); it contains no
++ *                          decimation filter. That reference is deliberately NOT wired here: wiring
++ *                          it would take a filter the standard marks informative and present it as
++ *                          the reason the picture is right, and lane E's dossier measured that this
++ *                          kit's own gates use the integer stand-in for BOTH directions. Naming it
++ *                          `annexb` in an option would be the lie, not the omission.
++ *   EL_REBUILD_DECIMATE  - the same stand-in in the other direction, split out so a caller cannot
++ *                          reach the decimation path by accident: on the LG subject the EL is
++ *                          smaller and on the CES subject it is larger, and "one option meaning
++ *                          both" is how a caller ends up declaring the wrong one and getting a
++ *                          plausible picture anyway - the failure shape this filter refuses
++ *                          everywhere else.
++ */
++enum ElRebuild {
++    EL_REBUILD_REPEAT,     /* stand-in: integer repeat, EL smaller than BL */
++    EL_REBUILD_DECIMATE,   /* stand-in: integer decimation, EL larger than BL */
++    EL_REBUILD_IDENTITY,   /* CCM 001 5.2.2 a): same raster, no resampling - the conformant shape */
++    EL_REBUILD_NB
++};
++
++/*
++ * Where the EL's zero residual sits. The bitstream does NOT settle it: it declares `nlq_offset`,
++ * but on the CES 00004 pair the EL's own coded luma median is code 64 (studio black) while the RPU
++ * declares nlq_offset = 512 for all three components, so the two candidates disagree by construction
++ * on real material. They also differ in what they MEAN:
++ *
++ *   EL_NEUTRAL_NLQ      - the format's own neutral: clause 5.4.3.2's `rr = e - nlq_offset` with its
++ *                         `rr == 0 -> r = 0` carve-out. This is what the clause and the one shipped
++ *                         reference implementation both do (libplacebo shaders/colorspace.c:143),
++ *                         so it is the arm an output is authored with.
++ *   EL_NEUTRAL_MEDIAN   - the EL's own per-component coded median. A DIAGNOSTIC: it is never a
++ *                         choice to ship on, because it makes the picture depend on this file's
++ *                         distribution rather than on what the stream declared. It exists so the
++ *                         disagreement above can be MEASURED instead of argued about.
++ *
++ * Both are declarations rather than a default because the choice moves the composed picture: report
++ * 73 measured nlq 1097 against the CES item's own median on one component, and the gate that
++ * consumes this reads 499.7 cd/m2 under one arm and 1097.4 under the other on the same frame.
++ */
++enum ElNeutral {
++    EL_NEUTRAL_NLQ,
++    EL_NEUTRAL_MEDIAN,
++    EL_NEUTRAL_NB
++};
++
++/*
++ * ------------------------------------------------------------------ the EL input description
++ *
++ * The enhancement layer arrives as planes, not as an AVFrame. That is a deliberate shape, not a
++ * shortcut: dovi_apply_planes() has no AVFilterLink and no AVFrame in its signature, and the
++ * comment at the top of this file records why - so the arithmetic "can be called, and therefore
++ * checked, outside a graph". Handing this function an AVFrame would undo that property at the one
++ * place it is worth the most, because the compose is the part whose ordering error no downstream
++ * number can see.
++ *
++ * EL is NOT carried in frame side data and is NOT a second input pad in this revision. Adding a pad
++ * would change filter_frame() into activate(), and the two pad frames' pts then have to be paired -
++ * a real precondition (the kit measured that reversing the EL's timestamps is what a pairing gate
++ * stops) that belongs with the pad, not here. This stage integrates the ARITHMETIC with the input
++ * described explicitly, so that whichever container is chosen next has one thing left to prove.
++ *
++ * The fields are declared before the filter context because the context HOLDS one: the host that
++ * drives this step outside a graph fills it in, which is why it is a struct and not four parallel
++ * arguments.
++ */
++typedef struct DoviElInput {
++    const uint16_t *plane[3];
++    ptrdiff_t stride[3];   /* in SAMPLES, not bytes - the same convention as dovi_apply_planes() */
++    int width, height;     /* the EL's own LUMA raster, which is NOT assumed to be the BL's */
++    int bit_depth;         /* the EL's own depth, which is NOT assumed to equal hdr->el_bit_depth */
++    int present;           /* 0 means "single layer": every EL path below is skipped */
++
++    /*
++     * THE CHROMA RASTER, and its absence was a crash rather than a rounding error.
++     *
++     * `dovi_el_cell()` maps a base-layer pixel onto the EL's LUMA raster, so it yields `sx`/`sy` in
++     * 0..el->width-1 / 0..el->height-1. `dovi_el_residual_at()` then indexes EVERY component's
++     * plane with that pair. That is correct only when all three planes share the luma raster.
++     *
++     * On real material they do not: an enhancement layer arrives as `yuv420p10le`, whose chroma
++     * planes are half resolution in both directions, so `sx` running to el->width-1 walks off the
++     * end of a plane that is half as wide - an access violation, found by driving the filter through
++     * a real filtergraph (the host-driven P1 arms modelled the EL as 4:4:4 with one full-width
++     * stride for all three planes, so this path had never been exercised with a real decoded EL).
++     *
++     * Declared explicitly rather than inferred from a pixel format, because this struct is also
++     * filled by hosts that own their own buffers: `chroma_w`/`chroma_h` say what the caller actually
++     * laid out. A caller delivering 4:4:4 sets them equal to width/height, which is exactly what the
++     * P1 arms did and why they worked.
++     */
++    int chroma_w, chroma_h;
++} DoviElInput;
++
++/*
++ * ------------------------------------------------------------------ clause 5.4.3.2/5.4.3.3, the compose
++ *
++ * THE ONE INPUT THAT IS NOT A uint16 PLANE, AND WHY
++ * `resh_f64`, when non-NULL, replaces the curve's output for every pixel with the values it points
++ * at (three planes, BL order, float64). It exists for the TEST HOST and for nothing else, and the
++ * reason is a measured one rather than a convenience: the residual is added to the curve's OUTPUT,
++ * so a comparison against a reference that computed that output itself is only meaningful if BOTH
++ * sides hold the same output. Delivering it through a uint16 plane instead re-quantises it to
++ * 1/(2^bl_bit_depth - 1) on the way in, and the kit's own plan says in as many words that the
++ * zero-tolerance arms "hold only when no integer lands in the middle" (fel-C侧实现规划 §7.0). Measured
++ * on this subject, a 10-bit delivery perturbed 407,288 of 24,883,200 samples - the same order as the
++ * whole acceptance, so it would have been the driver being judged rather than the filter.
++ *
++ * In a filtergraph this is always NULL: the curve runs, and `resh` is the curve's own output.
++ */
++typedef struct DoviReshOverride {
++    const double *plane[3];   /* BL order, one plane per component, normalised [0,1] */
++    int present;
++} DoviReshOverride;
++
++typedef struct DolbyApplyContext {
++    const AVClass *class;
++
++    int chroma;   /* enum ChromaRebuild; -1 until declared, which is an error */
++    int p5_transfer;  /* enum P5Transfer; -1 until declared. Only consulted for an ICtCp stream,
++                       * so unlike `chroma` an undeclared value is not an init failure: a P8 stream
++                       * must keep working with no new option. */
++    int el_rebuild;   /* enum ElRebuild; -1 until declared. Demanded only of a dual-layer frame,
++                       * for the same reason: a single-layer P8 stream must keep working with no
++                       * new option at all. */
++    int el_neutral;   /* enum ElNeutral; -1 until declared. Same demand rule as el_rebuild. */
++
++    /* Where the enhancement layer's pixels come from. A POINTER, and NULL until a caller sets it:
++     * this revision integrates the compose arithmetic with the EL DESCRIBED EXPLICITLY rather than
++     * pulled from a second input pad, so that the container question (two pads, and the pts pairing
++     * they imply) stays a separate, separately provable step. It is the same reason
++     * dovi_apply_planes() takes planes rather than an AVFrame - see the file-top comment. Setting it
++     * is what makes `el_present` true; filter_frame() never invents it. */
++    DoviElInput el;
++    int el_present;
++} DolbyApplyContext;
++
++/*
++ * ST 2084. The five literals below are deliberately the SAME five lines as the producer next door
++ * (libavfilter/vf_hdr10plus.c:90-94) - two hand-written copies of the standard's numbers are how
++ * two files drift apart, so the numeric gate asserts they stay textually identical rather than
++ * merely equivalent. Research report 92 measured this set against the standard's own anchor points:
++ * 0.5081 -> 100.0 cd/m2, 0.7515 -> 997.0, 1.0 -> 10000.0, monotone across all 4096 codes, and
++ * eotf(oetf(x)) worst-case 7.31e-07, which is the documented PQ black platform (c1^m2), not slop.
++ */
++#define PQ_M1 (2610.0 / 16384.0)
++#define PQ_M2 (2523.0 / 4096.0 * 128.0)
++#define PQ_C1 (3424.0 / 4096.0)
++#define PQ_C2 (2413.0 / 4096.0 * 32.0)
++#define PQ_C3 (2392.0 / 4096.0 * 32.0)
++
++/*
++ * The EOTF on a NORMALISED code: 1.0 in means 1.0 out == the PQ full scale (10000 cd/m2). The
++ * producer's own pq_eotf() takes integer codes and returns nits, which is the right shape for
++ * measuring and the wrong one here, where the answer goes straight into a matrix. Same numerator
++ * and denominator layout, and the same two guards: the producer returns 0 for a non-positive
++ * denominator (vf_hdr10plus.c:179-180), and a negative numerator is not a negative light level but
++ * a code under the black platform, so it clamps to 0 too.
++ */
++static double dovi_pq_eotf_d(double e)
++{
++    double p  = pow(e > 0.0 ? e : 0.0, 1.0 / PQ_M2);
++    double nm = p - PQ_C1;
++    double de = PQ_C2 - PQ_C3 * p;
++
++    if (de <= 0.0 || nm <= 0.0)
++        return 0.0;
++    return pow(nm / de, 1.0 / PQ_M1);
++}
++
++/* The analytic inverse of the function above, so the round trip can be asserted instead of
++ * assumed. Clamped to [0,1] on the way in, like the Python route the numeric gate compares with. */
++static double dovi_pq_oetf_d(double lin)
++{
++    double x = lin < 0.0 ? 0.0 : (lin > 1.0 ? 1.0 : lin);
++    double p = pow(x, PQ_M1);
++
++    return pow((PQ_C1 + PQ_C2 * p) / (1.0 + PQ_C3 * p), PQ_M2);
++}
++
++/*
++ * Invert a row-major 3x3 by its adjugate, or refuse it.
++ *
++ * The refusal is the load-bearing part. A singular matrix yields infinities, llround() turns those
++ * into *some* integer, and the picture that comes out still serialises and still decodes - which is
++ * the failure shape this filter refuses everywhere else. |det| is compared against an absolute
++ * 1e-12, which is only honest because these coefficients are rationals of order 1 (the real P5
++ * items measure det(rgb_to_lms) = 1.13169236936): under that, the matrix itself is degenerate
++ * rather than merely small.
++ *
++ * The closed form is checked by a fixture that can actually see an orientation error. The real P5
++ * items' matrix is symmetric, so its inverse is symmetric too and a transposed cofactor agrees
++ * with it to the last bit - the first version of this comment claimed exactly that kind of
++ * agreement, from a comparison that could not have failed. The probe host therefore inverts an
++ * ASYMMETRIC matrix as well and multiplies back: worst residual 6.9e-18 there
++ * (test_dovi_p5_host.c, p5probe/p5-c-probe-20261002.log), and 2.2e-16 on the symmetric one - and
++ * that fixture is what caught the transposed term this comment is now describing.
++ */
++static int dovi_invert3(const AVRational in[9], double out[9])
++{
++    double a[9];
++    double det;
++    int i;
++
++    for (i = 0; i < 9; i++)
++        a[i] = av_q2d(in[i]);
++
++    det = a[0] * (a[4] * a[8] - a[5] * a[7])
++        - a[1] * (a[3] * a[8] - a[5] * a[6])
++        + a[2] * (a[3] * a[7] - a[4] * a[6]);
++    if (!(fabs(det) > 1e-12))
++        return AVERROR_INVALIDDATA;
++
++    out[0] = (a[4] * a[8] - a[5] * a[7]) / det;
++    out[1] = (a[2] * a[7] - a[1] * a[8]) / det;
++    out[2] = (a[1] * a[5] - a[2] * a[4]) / det;
++    out[3] = (a[5] * a[6] - a[3] * a[8]) / det;
++    out[4] = (a[0] * a[8] - a[2] * a[6]) / det;
++    out[5] = (a[2] * a[3] - a[0] * a[5]) / det;
++    out[6] = (a[3] * a[7] - a[4] * a[6]) / det;
++    out[7] = (a[1] * a[6] - a[0] * a[7]) / det;
++    out[8] = (a[0] * a[4] - a[1] * a[3]) / det;
++    return 0;
++}
++
++/*
++ * ------------------------------------------------------------------ clause 5.4.3.2: the EL residual
++ *
++ * The NLQ pre-fold. Clause 5.4.3.2 dequantises each EL sample against the RPU's per-component
++ * (nlq_offset, linear_deadzone_slope S, linear_deadzone_threshold T), bounded by fp_hdr_in_max R,
++ * and divides by 2**coefficient_log2_denom. The three formulas below are that fold, and they are
++ * deliberately the SAME three lines the shipped Python reference uses (dv_ycc.nlq_params):
++ *
++ *     offset    = nlq_offset / (2**el_bit_depth - 1)
++ *     slope     = (2**el_bit_depth - 1) * S / 2**coef_log2_denom
++ *     threshold = (T - 0.5 * S) / 2**coef_log2_denom
++ *     ceiling   = R / 2**coef_log2_denom
++ *
++ * `-0.5 * S` is not a fudge: it is the half-sample the clause's `<< 1; -= sign` zig-zag implies,
++ * and the kit's own mutation arm measured it moving real residuals, so it is live rather than
++ * decorative. `R` is a CEILING and not a factor - clause 5.4.3.2's own pseudo-code uses it exactly
++ * three times, all of them `RR = R << (10 - EL_bit_depth + 1)` and the two-sided bound that
++ * follows. The one shipped reference implementation never multiplies by it at all.
++ *
++ * WHY THE RESIDUAL IS ADDED IN THE CURVE-OUTPUT DOMAIN
++ * Clause 5.4.3.1: the reconstruction "adds the inverse quantized EL signal to the MAPPED BL
++ * signal". Mapped - i.e. after the reshaping curve, and before the DM's Y'CbCr->RGB matrix and
++ * before the PQ EOTF. libplacebo runs the same order in one place: src/shaders/colorspace.c:337-338
++ * reshapes, :346 composes the NLQ residual, and only then :350 runs pl_color_repr_decode, the
++ * matrix. Getting this order wrong does not produce a visible failure - the frame still
++ * serialises, still decodes and still gets a full set of ST 2094-40 values - which is exactly the
++ * failure shape this filter refuses everywhere else, and exactly why the test host that drives this
++ * arithmetic compares against the Python reference sample for sample instead of checking that a
++ * file came out.
++ *
++ * The shift amounts are the clause's, and two of them make the clause inexecutable on some inputs
++ * rather than merely awkward - dovi_nlq_unsupported() below names them instead of clamping them
++ * away, because "shifting by a negative amount" has no meaning to fall back on.
++ */
++static int dovi_nlq_predicates_ok(const AVDOVIRpuDataHeader *hdr)
++{
++    /* 5.4.3.2's `<< (10 - EL_bit_depth)` and `R << (10 - EL_bit_depth + 1)` both go negative above
++     * this: at EL_bit_depth == 12 the second is -1, which is undefined behaviour in C and has no
++     * meaning in the clause's arithmetic either. FFmpeg's own parser accepts the field, so the
++     * refusal has to live here rather than in the parse. */
++    if (hdr->el_bit_depth > 10)
++        return 0;
++    /* The final `>> (coefficient_log2_denom - 5 - EL_bit_depth)` is the other one. */
++    if (hdr->coef_log2_denom - 5 - hdr->el_bit_depth < 0)
++        return 0;
++    return 1;
++}
++
++static void dovi_nlq_fold(const AVDOVIRpuDataHeader *hdr, const AVDOVIDataMapping *map,
++                          double off[3], double slope[3], double threshold[3], double ceiling[3])
++{
++    const double el_scale = 1.0 / ((1 << hdr->el_bit_depth) - 1);
++    const double coef     = 1.0 / (double)(1ULL << hdr->coef_log2_denom);
++    const double slope_sc = ((1 << hdr->el_bit_depth) - 1) * coef;
++    int c;
++
++    for (c = 0; c < 3; c++) {
++        const double S = (double) map->nlq[c].linear_deadzone_slope;
++        const double T = (double) map->nlq[c].linear_deadzone_threshold;
++
++        off[c]       = el_scale * (double) map->nlq[c].nlq_offset;
++        slope[c]     = slope_sc * S;
++        threshold[c] = coef * (T - 0.5 * S);
++        ceiling[c]   = coef * (double) map->nlq[c].vdr_in_max;
++    }
++}
++
++/*
++ * One sample of clause 5.4.3.2 plus the addition clause 5.4.3.3 asks for.
++ *
++ * `el_norm` is the EL sample in ITS OWN normalised domain; the return value is the residual in the
++ * SAME domain the curve output lives in, ready to be added to it.
++ *
++ * `sign(cen) == 0` at `cen == 0` is the load-bearing branch, not an optimisation: it is the
++ * clause's `if (rr == 0) { r = 0; }` carve-out, and it is what makes a fully neutral EL add exactly
++ * nothing - a property the kit's own Python suite asserts with array_equal rather than a tolerance.
++ * A port that writes this as `<=` or `<`, or that lets the zig-zag turn 0 into +/-1, keeps every
++ * other sample right and breaks only this one, which is why the negative control below perturbs the
++ * input by one code: without that arm, "the neutral EL changed nothing" is also what a compose that
++ * never ran would report.
++ */
++static double dovi_nlq_residual_1(double el_norm, double offset, double slope, double threshold,
++                                  double ceiling)
++{
++    const double cen = el_norm - offset;
++    double r;
++
++    if (cen == 0.0)
++        return 0.0;
++
++    r = (cen < 0.0 ? -1.0 : 1.0) * (fabs(cen) * slope + threshold);
++    if (r > ceiling)
++        r = ceiling;
++    if (r < -ceiling)
++        r = -ceiling;
++    return r;
++}
++
++/*
++ * The EL's own per-component coded median, as the `el_neutral=coded-median` diagnostic arm wants it.
++ *
++ * Read off the EL plane the caller handed in, at the EL's own raster, normalised the same way
++ * dovi_nlq_residual_1 normalises its input - so the two candidates it is being compared against
++ * (this and the RPU's declared nlq_offset) are in the same units and the difference means something.
++ *
++ * The median is taken on a fixed stride rather than over every sample of the plane: a 4K plane is
++ * 8.3 million samples and this value is a per-frame diagnostic, so an exact median would cost a
++ * full histogram to answer a question that a bounded sample answers to the same code. `step` is
++ * chosen so at most DOVI_EL_MEDIAN_SAMPLES samples are read, and the count actually read is what
++ * the caller logs - a diagnostic that hid its own sample count would be a worse instrument than no
++ * diagnostic at all.
++ */
++#define DOVI_EL_MEDIAN_SAMPLES 65536
++
++static double dovi_el_median_1(const uint16_t *plane, ptrdiff_t stride, int w, int h, int bit_depth,
++                               long long *sampled)
++{
++    enum { HIST = 1 << 10 };   /* 10-bit EL is the only depth clause 5.4.3.2 executes (see above) */
++    uint16_t *vals;
++    long long n = 0, i, total = (long long) w * h, step, want;
++    double med = 0.0;
++
++    *sampled = 0;
++    if (w <= 0 || h <= 0 || bit_depth > 10)
++        return 0.0;
++    want = total < DOVI_EL_MEDIAN_SAMPLES ? total : DOVI_EL_MEDIAN_SAMPLES;
++    if (want <= 0)
++        return 0.0;
++    step = total / want;
++    if (step < 1)
++        step = 1;
++    vals = av_malloc_array((size_t) want + 1, sizeof(*vals));
++    if (!vals)
++        return 0.0;
++    for (i = 0; i < total && n <= want; i += step) {
++        const int x = (int)(i % w), y = (int)(i / w);
++        const unsigned v = plane[(ptrdiff_t) y * stride + x];
++
++        vals[n++] = (uint16_t) (v < (1u << bit_depth) ? v : (1u << bit_depth) - 1);
++    }
++    if (!n) {
++        av_free(vals);
++        return 0.0;
++    }
++    {
++        /* An insertion sort over at most 65536 uint16 is O(n^2) and would be the wrong thing to
++         * write; HIST buckets are O(n) and exact for a value range the EL's depth bounds. */
++        long long hist[HIST];
++        long long seen = 0, half = (n + 1) / 2;
++        int b;
++
++        memset(hist, 0, sizeof(hist));
++        for (i = 0; i < n; i++)
++            hist[vals[i] < HIST ? vals[i] : HIST - 1]++;
++        for (b = 0; b < HIST; b++) {
++            seen += hist[b];
++            if (seen >= half) {
++                med = (double) b;
++                break;
++            }
++        }
++        *sampled = n;
++    }
++    av_free(vals);
++    return med / (double) ((1 << bit_depth) - 1);
++}
++
++/*
++ * The arithmetic is deliberately in a function with no filtergraph state in it,
++ * so it can be called - and therefore checked - outside a graph. The HDR10+
++ * producer next to it was only found to divide by zero on the first frame
++ * because a harness could call its per-frame code directly.
++ *
++ * src[] is the base layer's own component planes in its own coded domain, which filter_frame()
++ * has already checked against the RPU's declared bl_bit_depth; dst[] receives planar R, G, B in
++ * the PQ code domain of `out_depth` bits - the depth of the buffer it was handed, which the
++ * graph negotiates and is NOT necessarily the input's. The chain is the one the curves are
++ * defined for: curve per component in the coded domain, then the DM's own Y'CbCr->RGB matrix,
++ * which dovi_meta.h documents as acting "before PQ linearization". Emitting PQ codes rather than
++ * linear light is what lets the producer filter measure them, since it applies the ST 2084 EOTF
++ * itself as ST 2094-40 4.4 requires.
++ *
++ * An ICtCp base layer (Profile 5) takes the same curves and the same subtract-then-matrix step -
++ * dovi_meta.h:176-183 documents those coefficients as the "custom Dolby Vision IPT-PQ matrices",
++ * to be used INSTEAD of what the frame's colourspace tags would give, so for P5 the matrix product
++ * lands in L'M'S' rather than in RGB' - and then two steps the Y'CbCr path has no equivalent of:
++ * the declared transfer slot, and the inverse of the DM's rgb_to_lms_matrix to get back to linear
++ * RGB. `p5_transfer` is what decides the first; passing anything other than a declared value with
++ * signal_color_space == 2 is refused here rather than guessed, and passing a declared value on a
++ * stream that is NOT ICtCp is refused too, because that is a mistake about which picture is in
++ * hand. The output stays PQ codes either way: the consumer downstream is the same one.
++ *
++ * WHY p5_transfer / el_rebuild / el_neutral ARE `int` AND NOT THEIR ENUMS
++ * Every one of them carries -1 as "the caller has not declared", and an enum whose enumerators are
++ * all non-negative may be given an UNSIGNED underlying type by the compiler. Handing `-1` to an
++ * enum-typed parameter then turns it into a huge positive number, so the very comparison that is
++ * supposed to detect an undeclared option (`x >= 0`) fires on it instead - the option is treated as
++ * DECLARED, and the refusal that exists to stop a guess never runs. That was measured here, not
++ * theorised: passing (enum P5Transfer)-1 through this parameter made the p5 branch take the
++ * "declared on a non-ICtCp stream" refusal on a frame that had declared nothing. The AVOption layer
++ * already stores these as int64, so `int` is also the type they actually arrive in.
++ *
++ * A dual-layer frame (disable_residual_flag == 0) gets one more step, and the reason it is here
++ * rather than in a filter of its own is that the step has to land BETWEEN two statements that
++ * already live in this loop: after the curve writes resh[3] and before the matrix reads it. See
++ * dovi_compose_el() for the ordering argument.
++ */
++/*
++ * ------------------------------------------------------------------ the EL -> BL raster step
++ *
++ * THIS IS A STAND-IN, AND IT HAS TO BE CALLED ONE.
++ *
++ * CCM 001 clause 5.4.1 says, in the standard's own words, "Resampling is not a normative part of
++ * the present document and is assumed to be performed prior to the" process it defines. So the
++ * standard that defines the residual does not define how a differently-sized EL gets onto the BL
++ * grid, and `el_spatial_resampling_filter_flag` does not fill the gap: it is ONE BIT, not a
++ * selector, so it names a decision the stream does not carry. The two other implementations read
++ * agree by construction - both treat that flag as a profile test rather than a filter selector.
++ *
++ * What is offered here is therefore the exact integer ratio and nothing else:
++ *   EL smaller -> each EL sample is replicated over its BL cell (repeat)
++ *   EL larger  -> every n-th sample is taken, counting from the top-left (decimation)
++ * Both keep the phase a DECLARATION rather than an invention: the caller chose the direction by
++ * naming the option, and the phase is fixed and documented (top-left) rather than fitted to the
++ * picture. A non-integer ratio is refused outright, because there the phase really would be
++ * invented and documenting it would not turn it into a reading of the bitstream.
++ *
++ * Annex B.3 of CCM 001 does publish a reference upsampler, and it is deliberately NOT implemented
++ * here. It is INFORMATIVE - a worked example, not a requirement - and it covers only the UPSAMPLING
++ * direction: every tap in it is written r[2n] / r[2n+1], and it contains no decimation filter at
++ * all. Wiring it under the name `annexb` would put a filter the standard marks informative exactly
++ * where a reader expects the normative one, and the honest description of this arm would not change.
++ * It is left for the stage that can also state what it is and is not.
++ *
++ * Returns a positive 1 for the identity case (the caller indexes 1:1), 0 when el_px[] has been
++ * filled, or a negative AVERROR when the DECLARATION does not match the material. The mismatch is
++ * EINVAL and not ENOTSUP on purpose: the material is fine, the declaration is wrong, and the two
++ * have to stay distinguishable in a log - the same split the ICtCp branch already uses.
++ */
++static int dovi_el_cell(const DoviElInput *el, int bl_w, int bl_h, enum ElRebuild how,
++                        int el_x, int el_y, int *sx, int *sy)
++{
++    int ry, rx;
++
++    if (el->width == bl_w && el->height == bl_h) {
++        /* The conformant shape, and the only one with a clause behind it (5.2.2 a). Declaring a
++         * rescale here would be a declaration about material that does not need one. */
++        if (how != EL_REBUILD_IDENTITY)
++            return AVERROR(EINVAL);
++        return 1;                              /* identity: the caller indexes 1:1 */
++    }
++
++    if (el->width < bl_w && el->height < bl_h) {
++        if (how != EL_REBUILD_REPEAT)
++            return AVERROR(EINVAL);
++        if (bl_w % el->width || bl_h % el->height)
++            return AVERROR(ENOTSUP);
++        rx = bl_w / el->width;
++        ry = bl_h / el->height;
++        *sx = el_x / rx;
++        *sy = el_y / ry;
++        return 0;
++    }
++    if (el->width > bl_w && el->height > bl_h) {
++        if (how != EL_REBUILD_DECIMATE)
++            return AVERROR(EINVAL);
++        if (el->width % bl_w || el->height % bl_h)
++            return AVERROR(ENOTSUP);
++        *sx = el_x * (el->width / bl_w);
++        *sy = el_y * (el->height / bl_h);
++        return 0;
++    }
++    /* One axis larger and the other smaller: no integer ratio describes that, and picking a
++     * direction would be the invention this branch exists to refuse. */
++    return AVERROR(ENOTSUP);
++}
++
++/* One component's residual at one BL pixel, in the curve-output domain. `*res` is written only on
++ * return 0. A negative return is a shape clause 5.4.3.2 cannot execute on (el_bit_depth > 10, or a
++ * negative denominator shift) and is refused rather than clamped into range. */
++static int dovi_el_residual_at(const DoviElInput *el, int c, int bl_w, int bl_h, int el_x, int el_y,
++                               enum ElRebuild how, double neutral, double slope, double threshold,
++                               double ceiling, int el_bd, double *res)
++{
++    const double el_scale = 1.0 / ((1 << el_bd) - 1);
++    int sx = 0, sy = 0, ident;
++    unsigned code;
++    double el_norm, cen, r;
++
++    *res = 0.0;
++
++    ident = dovi_el_cell(el, bl_w, bl_h, how, el_x, el_y, &sx, &sy);
++    if (ident < 0)
++        return ident;
++    if (!ident && (sx < 0 || sx >= el->width || sy < 0 || sy >= el->height))
++        return AVERROR_INVALIDDATA;
++
++    /* `sx`/`sy` are in the LUMA raster; component c may live on a smaller one. Scaling here rather
++     * than inside dovi_el_cell keeps the geometry decision (one mapping, one refusal) separate from
++     * the per-component addressing, and makes the subsampling explicit at the one place that reads
++     * a plane. A 4:2:0 chroma plane is half resolution in BOTH directions, so both axes scale. */
++    if (c) {
++        int cw = el->chroma_w > 0 ? el->chroma_w : el->width;
++        int ch = el->chroma_h > 0 ? el->chroma_h : el->height;
++
++        if (cw != el->width)
++            sx = sx * cw / el->width;
++        if (ch != el->height)
++            sy = sy * ch / el->height;
++        if (sx >= cw)
++            sx = cw - 1;
++        if (sy >= ch)
++            sy = ch - 1;
++    }
++    if (sx < 0 || sy < 0)
++        return AVERROR_INVALIDDATA;
++
++    code = (unsigned) el->plane[c][(ptrdiff_t) sy * el->stride[c] + sx];
++    el_norm = (double) code * el_scale;
++    cen = el_norm - neutral;
++    /* Clause 5.4.3.2's `if (rr == 0) { r = 0; }` carve-out. Load-bearing, not an optimisation: it
++     * is what makes a fully neutral EL add exactly nothing, and the kit's own Python suite asserts
++     * that with array_equal rather than a tolerance. Writing it as `<=` or `<`, or letting a
++     * zig-zag turn 0 into +/-1, leaves every other sample right and breaks only this one. */
++    if (cen == 0.0)
++        return 0;
++    r = (cen < 0.0 ? -1.0 : 1.0) * (fabs(cen) * slope + threshold);
++    /* `ceiling` is fp_hdr_in_max and it is a CEILING: clause 5.4.3.2's pseudo-code uses R exactly
++     * three times, all of them `RR = R << ...` and the two-sided bound that follows. It is never a
++     * factor and never a divisor. */
++    if (r > ceiling)
++        r = ceiling;
++    if (r < -ceiling)
++        r = -ceiling;
++    *res = r;
++    return 0;
++}
++
++/*
++ * ------------------------------------------------------------------ the EL compose, one triple
++ *
++ * Called once per pixel, from inside dovi_apply_planes()'s pixel loop, between the curve writing
++ * resh[3] and the matrix reading it. That position IS the specification: clause 5.4.3.1 says the
++ * reconstruction "adds the inverse quantized EL signal to the MAPPED BL signal" - mapped, i.e. the
++ * curve's output - and clause 5.4.3.3's `v` is that same already-reshaped sample.
++ *
++ * The alternative placements are not obviously wrong from the outside, which is why this comment is
++ * long: adding to `mid[]` (after the matrix) or to `lin[]` (after the EOTF) still produces a frame
++ * that serialises, decodes, and carries a complete set of ST 2094-40 values, and the one counter
++ * that could have noticed - `out_of_range` - counts the CURVE's own domain and does not move in
++ * either case. No downstream measurement in this kit can separate the three, so the acceptance for
++ * this step is a sample-for-sample comparison against the Python reference, not a file that came
++ * out.
++ */
++static int dovi_compose_el(const DoviElInput *el, int bl_w, int bl_h, int el_x, int el_y,
++                           enum ElRebuild how, enum ElNeutral neutral_kind, int el_bd,
++                           const AVDOVIRpuDataHeader *hdr, const AVDOVIDataMapping *map,
++                           const double el_median[3], double resh[3], int *out_of_range)
++{
++    const double el_scale = 1.0 / ((1 << el_bd) - 1);
++    const double coef     = 1.0 / (double)(1ULL << hdr->coef_log2_denom);
++    const double slope_sc = ((1 << el_bd) - 1) * coef;
++    int c;
++
++    for (c = 0; c < 3; c++) {
++        const double S = (double) map->nlq[c].linear_deadzone_slope;
++        const double T = (double) map->nlq[c].linear_deadzone_threshold;
++        /* `el_neutral` picks WHICH level counts as zero: the RPU's declared nlq_offset (the format's
++         * own answer, since the clause's own rr is `e - nlq_offset`) or the EL's coded median (a
++         * diagnostic - see the enum's comment for why it must not ship). The residual formula is one
++         * function either way, which is the point: what changes is the input, not the arithmetic. */
++        const double neutral = (neutral_kind == EL_NEUTRAL_MEDIAN)
++                             ? el_median[c]
++                             : el_scale * (double) map->nlq[c].nlq_offset;
++        const double slope     = slope_sc * S;
++        const double threshold = coef * (T - 0.5 * S);
++        const double ceiling   = coef * (double) map->nlq[c].vdr_in_max;
++        double r;
++        int c_rc;
++
++        /* hdr->disable_residual_flag is NOT re-tested here. Clause 5.4.3.3 makes it a condition on
++         * adding r at all, and the caller reaches this function only when the residual is live;
++         * testing it in two places is how one of them ends up disagreeing with the other. */
++        c_rc = dovi_el_residual_at(el, c, bl_w, bl_h, el_x, el_y, how, neutral, slope, threshold,
++                                   ceiling, el_bd, &r);
++        if (c_rc < 0)
++            return c_rc;
++        resh[c] += r;
++        /* Counted against the same [0,1] the curve half uses, and counted at all because the
++         * residual can push a sample out of the display's range where the curve alone did not. */
++        if (!(resh[c] >= 0.0 && resh[c] <= 1.0))
++            (*out_of_range)++;
++    }
++    return 0;
++}
++
++static int dovi_apply_planes(const AVDOVIMetadata *dovi,
++                             const uint16_t *const src[3], const ptrdiff_t src_stride[3],
++                             uint16_t *const dst[3], const ptrdiff_t dst_stride[3],
++                             int width, int height, int out_depth,
++                             enum ChromaRebuild chroma, int p5_transfer,
++                             const DoviElInput *el, int el_rebuild,
++                             int el_neutral, const DoviReshOverride *resh_override,
++                             void *log_ctx, int *out_of_range)
++{
++    const AVDOVIRpuDataHeader *hdr = av_dovi_get_header(dovi);
++    const AVDOVIDataMapping   *map = av_dovi_get_mapping(dovi);
++    const AVDOVIColorMetadata *col = av_dovi_get_color(dovi);
++    const double scale_in  = 1.0 / ((1 << hdr->bl_bit_depth) - 1);
++    /* The OUTPUT domain is the buffer this function writes, not the frame it read. Those are the
++     * same thing only when the graph happened to negotiate equal depths, and the filter's own
++     * format list offers gbrp10le AND gbrp12le on the output side, so a 10-bit base layer feeding
++     * a 12-bit output is a legal graph. Measured with the input depth used here instead: dv84's
++     * reshaped frame came out with codes 0..754 in a 12-bit buffer (four times too small), and a
++     * producer downstream read maxscl 18/100000 for a picture it measured as 8499/100000 at the
++     * matching depth - a 472x error that serialises and decodes perfectly. */
++    const double scale_out = 1.0 / ((1 << out_depth) - 1);
++    const double scale_c   = 1.0 / (double)(1ULL << hdr->coef_log2_denom);
++    const int cw = (width + 1) >> 1, ch = (height + 1) >> 1;
++    double off[3];
++    int i, c, cx, cy, sx, sy, ret;   /* x and y are declared per pixel now: each 2x2 cell derives them */
++    double *lut[3] = { NULL, NULL, NULL };
++    long long rcode[3];
++    int lut_n = 0;
++    int lut_ok[3] = { 0, 0, 0 };
++    int any_lut = 0;
++    double pow_tab[7][4];
++    int basis_done = 0;
++    double inv_rlms[9];
++    int p5 = 0;
++    /* The EL's own per-component coded median, computed ONCE per frame when the diagnostic arm asks
++     * for it. Left at zero otherwise, where it is inert: `el_neutral=nlq` never reads it. */
++    double el_median[3] = { 0.0, 0.0, 0.0 };
++    int do_compose = el && el->present;
++    int el_ident = 0;
++
++    ret = 0;
++    *out_of_range = 0;
++
++    {
++        /* Per-frame counter: this function runs once per picture, so a trace that prints "entered"
++         * on frame 1 and "LUT built" on frame 2 can look like an impossible ordering when the two
++         * lines are compared without the frame number. It cost a debugging round to notice. */
++        static int p2frame;
++        p2frame++;
++    }
++
++
++    if (hdr->bl_bit_depth < 8 || hdr->bl_bit_depth > 16 ||
++        hdr->coef_log2_denom > 32)
++        { ret = AVERROR_INVALIDDATA; goto fail; }
++
++    for (c = 0; c < 3; c++)
++        off[c] = av_q2d(col->ycc_to_rgb_offset[c]);
++
++    /* Which shape this frame is, decided once per frame rather than per pixel, and refused here
++     * if the declaration does not match the stream. Both refusals are for the same reason: the
++     * difference between the two readings of an ICtCp frame is not visible downstream - the block
++     * serialises, decodes and prints a full set of ST 2094-40 values either way - so the only
++     * answer that cannot be missed is to stop. */
++    if (col->signal_color_space == 2) {
++        if (p5_transfer != P5_TRANSFER_CBRT && p5_transfer != P5_TRANSFER_PQ) {
++            { ret = AVERROR(EINVAL); goto fail; }
++        }
++        if (dovi_invert3(col->rgb_to_lms_matrix, inv_rlms) < 0)
++            { ret = AVERROR_INVALIDDATA; goto fail; }
++        p5 = 1;
++    } else if (p5_transfer >= 0) {
++        { ret = AVERROR(EINVAL); goto fail; }
++    }
++
++    /* The Profile 8.4 transfer check lives in the caller, not here: this function is handed PLANES
++     * and has neither the AVFrame's tags nor a log context (see the file-top comment at :140 on why
++     * it takes planes rather than a frame). The first attempt put it here and the compiler refused
++     * with `error C2065: "frame": undeclared identifier` - which is the signature doing its job. */
++
++    /* ------------------------------------------------------------------ the EL, once per frame
++     *
++     * Everything that can be decided without looking at a pixel is decided here, so the per-pixel
++     * path below is one branch on a flag that has already been validated. Three things are checked:
++     *
++     *   1. clause 5.4.3.2 is EXECUTABLE on this block at all (el_bit_depth <= 10 and a non-negative
++     *      denominator shift). This is checked here rather than at the first pixel so a refusal
++     *      costs nothing and, more importantly, so it is a REFUSAL rather than a per-pixel silence.
++     *   2. the EL's decoded depth equals the depth the RPU declares. The two are separate facts -
++     *      one is what the planes carry, the other is what the coefficients were fitted for - and
++     *      reading 12-bit samples through a 10-bit divisor is the same class of error as the BL one
++     *      at :787-796, which is already refused for exactly this reason.
++     *   3. the geometry declaration matches the material. EINVAL here means the caller declared the
++     *      wrong direction; ENOTSUP means the material is not an integer ratio at all. Those are
++     *      different problems with different remedies, so they are different codes.
++     */
++    if (do_compose) {
++        int probe_sx = 0, probe_sy = 0;
++
++        if (!dovi_nlq_predicates_ok(hdr)) {
++            av_log(log_ctx, AV_LOG_ERROR, "This RPU declares el_bit_depth=%d with "
++                   "coefficient_log2_denom=%d, on which clause 5.4.3.2 cannot be executed: its "
++                   "`<< (10 - EL_bit_depth)` and `R << (10 - EL_bit_depth + 1)` go negative above "
++                   "an EL depth of 10, and its closing `>> (coef_log2_denom - 5 - EL_bit_depth)` "
++                   "goes negative below %d. Those are not small values to be clamped - they are "
++                   "shifts the clause does not define. Refusing rather than composing a residual "
++                   "the standard does not describe.\n",
++                   hdr->el_bit_depth, hdr->coef_log2_denom, 5 + hdr->el_bit_depth);
++            ret = AVERROR(ENOTSUP);
++            goto fail;
++        }
++        if (el->bit_depth != hdr->el_bit_depth) {
++            av_log(log_ctx, AV_LOG_ERROR, "The enhancement layer is %d-bit but the RPU declares "
++                   "el_bit_depth=%d: clause 5.4.3.2's coefficients are defined on the declared "
++                   "domain, so normalising %d-bit samples by 1/%d scales every residual by about "
++                   "%g. Deliver the EL at its declared depth.\n",
++                   el->bit_depth, hdr->el_bit_depth, el->bit_depth, (1 << el->bit_depth) - 1,
++                   (double)((1 << el->bit_depth) - 1) / ((1 << hdr->el_bit_depth) - 1));
++            ret = AVERROR(ENOTSUP);
++            goto fail;
++        }
++        /* One call, so the per-pixel path cannot disagree with the gate about the geometry. */
++        el_ident = dovi_el_cell(el, width, height, el_rebuild, 0, 0, &probe_sx, &probe_sy);
++        if (el_ident < 0) {
++            av_log(log_ctx, AV_LOG_ERROR, "The enhancement layer is %dx%d and the base layer %dx%d: "
++                   "the declared el_rebuild does not describe that pair. Integer repeat needs the "
++                   "EL smaller on BOTH axes, integer decimation needs it larger on both, and "
++                   "identity needs them equal - and \"equal\" is what clause 5.2.2 a) of CCM 001 "
++                   "asks for. A ratio that is not an integer in either direction is refused "
++                   "outright: the resampling filter's identity is not carried by the stream, so "
++                   "there the phase would be invented rather than declared. (rc=%d)\n",
++                   el->width, el->height, width, height, el_ident);
++            ret = el_ident == AVERROR(EINVAL) ? AVERROR(EINVAL) : AVERROR(ENOTSUP);
++            goto fail;
++        }
++        if (el_rebuild == EL_REBUILD_IDENTITY)
++            av_log(log_ctx, AV_LOG_VERBOSE, "el_rebuild=identity (CCM 001 5.2.2 a: BL and EL share a "
++                   "raster, %dx%d): no resampling runs, which is the conformant shape.\n",
++                   width, height);
++        else
++            av_log(log_ctx, AV_LOG_VERBOSE, "el_rebuild=%s (STAND-IN, phase declared top-left; the "
++                   "bitstream does not carry the resampling filter's identity and CCM 001 clause "
++                   "5.4.1 states that resampling \"is not a normative part of the present "
++                   "document\"). EL %dx%d -> BL %dx%d.\n",
++                   el_rebuild == EL_REBUILD_REPEAT ? "repeat" : "decimate",
++                   el->width, el->height, width, height);
++
++        if (el_neutral == EL_NEUTRAL_MEDIAN) {
++            long long sampled = 0;
++
++            /* Per-component dimensions, not the luma raster: this reads a whole plane, so handing it
++             * the luma size for a 4:2:0 chroma plane would read past the end and, worse, would
++             * compute a "median" over whatever followed. The residual path handles the same
++             * subsampling by scaling the index; here it is the iteration bounds that have to differ. */
++            for (c = 0; c < 3; c++) {
++                int mw = el->width, mh = el->height;
++
++                if (c && el->chroma_w > 0) mw = el->chroma_w;
++                if (c && el->chroma_h > 0) mh = el->chroma_h;
++                el_median[c] = dovi_el_median_1(el->plane[c], el->stride[c], mw, mh,
++                                                el->bit_depth, &sampled);
++            }
++            /* The sample count goes in the log because this is a DIAGNOSTIC and a diagnostic that
++             * hid how much of the plane it looked at would be a worse instrument than none. */
++            av_log(log_ctx, AV_LOG_VERBOSE, "el_neutral=coded-median (DIAGNOSTIC: the format's neutral "
++                   "is the RPU's nlq_offset, not this EL's own distribution - see the option's "
++                   "comment). Median over %lld sampled code(s) per component: %.6f %.6f %.6f.\n",
++                   sampled, el_median[0], el_median[1], el_median[2]);
++        } else {
++            av_log(log_ctx, AV_LOG_VERBOSE, "el_neutral=nlq (the format's own neutral: clause 5.4.3.2's "
++                   "`rr = e - nlq_offset`, whose `rr == 0 -> r = 0` carve-out makes a fully neutral "
++                   "EL add exactly nothing).\n");
++        }
++    }
++
++    /* One table per component, but only for a curve that is polynomial in EVERY piece: then its
++     * value depends on that component's own code alone, and that code is an integer the planes
++     * already carry (chroma included, because the rebuilt chroma sample is rounded before it is
++     * scaled). Built with the same expressions in the same order as the loop below - clamp, pivot
++     * search, Horner, scale_c - so a table hit is the same double, not an approximation of it.
++     * MMR components are excluded by definition: their value depends on all three inputs.
++     * av_mallocz, not av_mallocz_array: this FFmpeg's mem.h declares av_malloc_array and av_mallocz
++     * only, and the array variant that older releases had is gone (the first version of this arm
++     * asked for it and the link said so). */
++    lut_n = 1 << hdr->bl_bit_depth;
++    for (i = 0; i < 3; i++) {
++        const AVDOVIReshapingCurve *tbl_cv = &map->curves[i];
++        int code, bad = 0;
++
++        if (tbl_cv->num_pivots < 2 || tbl_cv->num_pivots > AV_DOVI_MAX_PIECES + 1)
++            continue;
++        for (c = 0; c < tbl_cv->num_pivots - 1; c++)
++            if (tbl_cv->mapping_idc[c] != AV_DOVI_MAPPING_POLYNOMIAL ||
++                tbl_cv->poly_order[c] < 1 || tbl_cv->poly_order[c] > 2)
++                bad = 1;
++        if (bad)
++            continue;
++        lut[i] = av_mallocz((size_t) lut_n * sizeof(*lut[i]));
++        if (!lut[i])
++            continue;
++        for (code = 0; code < lut_n; code++) {
++            const double xin = av_clipd((double) code * scale_in, 0.0, 1.0);
++            const int64_t *k;
++            double v = 0.0;
++            int piece = 0;
++
++            for (c = 1; c < tbl_cv->num_pivots - 1; c++)
++                if (xin >= tbl_cv->pivots[c] * scale_in)
++                    piece = c;
++            if (piece >= AV_DOVI_MAX_PIECES) {   /* the loop below would refuse the frame */
++                av_freep(&lut[i]);
++                bad = 1;
++                break;
++            }
++            k = tbl_cv->poly_coef[piece];
++            v = ((double) k[2] * xin + (double) k[1]) * xin + (double) k[0];
++            lut[i][code] = v * scale_c;
++        }
++        if (bad)
++            continue;
++        lut_ok[i] = 1;
++    }
++    any_lut = lut_ok[0] | lut_ok[1] | lut_ok[2];
++
++    fflush(stderr);
++
++    /* Chroma is one sample per 2x2 luma block, so walk the CHROMA cells: a cell loads its four
++     * bilinear taps once and the four luma pixels of that cell share them. The per-pixel
++     * statements below are the previous ones, moved verbatim (only re-indented), so any
++     * difference in the output can only come from where the samples are read. Worth saying
++     * why: the per-pixel rebuild measured ~25% of the frame time (report 60).
++     */
++    for (cy = 0; cy < ch; cy++) {
++        const int y0 = cy, y1 = FFMIN(cy + 1, ch - 1);
++
++        for (cx = 0; cx < cw; cx++) {
++            const int x0 = cx, x1 = FFMIN(cx + 1, cw - 1);
++            double tap_a[3] = { 0 }, tap_b[3] = { 0 }, tap_d[3] = { 0 }, tap_e[3] = { 0 };
++
++            for (c = 1; c < 3; c++) {
++                const uint16_t *p = src[c];
++
++                tap_a[c] = p[(ptrdiff_t)y0 * src_stride[c] + x0];
++                tap_b[c] = p[(ptrdiff_t)y0 * src_stride[c] + x1];
++                tap_d[c] = p[(ptrdiff_t)y1 * src_stride[c] + x0];
++                tap_e[c] = p[(ptrdiff_t)y1 * src_stride[c] + x1];
++            }
++            for (sy = 0; sy < 2; sy++) {
++                const int y = 2 * cy + sy;
++                const uint16_t *yp;
++
++                if (y >= height)
++                    break;
++                yp = src[0] + (ptrdiff_t)y * src_stride[0];
++                for (sx = 0; sx < 2; sx++) {
++                    const int x = 2 * cx + sx;
++
++                    if (x >= width)
++                        break;
++    double in[3], resh[3], mid[3], lin[3];
++    basis_done = 0;   /* per pixel: the basis is that pixel's own */
++
++    /* Chroma is rebuilt per sample instead of into full-size planes: a 4K
++     * frame would otherwise cost three float buffers, and every consumer
++     * here looks at one pixel at a time. */
++    if (any_lut)
++        rcode[0] = (long long) yp[x];
++    in[0] = yp[x] * scale_in;
++    if (chroma == CHROMA_NEAREST) {
++if (any_lut) rcode[1] = (long long) tap_a[1]; in[1] = tap_a[1] * scale_in;
++if (any_lut) rcode[2] = (long long) tap_a[2]; in[2] = tap_a[2] * scale_in;
++    } else {
++/* Same expression, same operands, same order as the per-pixel version - only the four
++ * taps are now shared by the 2x2 block of luma pixels. wy/wx are 0.25 or 0.75 by parity,
++ * which is what fy - y0 produced before: the fraction of v * 0.5 + 0.25 is never >= 1,
++ * and v >> 1 <= (n + 1) / 2 - 1 for v < n, so no clamp bites on the 0-side and only
++ * y1/x1 can clamp - to the same value the old code got. */
++const double wy = sy ? 0.75 : 0.25, wx = sx ? 0.75 : 0.25;
++rcode[1] = llround((tap_a[1] + (tap_b[1] - tap_a[1]) * wx) * (1.0 - wy) +
++                (tap_d[1] + (tap_e[1] - tap_d[1]) * wx) * wy);
++in[1] = (double) rcode[1] * scale_in;
++
++rcode[2] = llround((tap_a[2] + (tap_b[2] - tap_a[2]) * wx) * (1.0 - wy) +
++                (tap_d[2] + (tap_e[2] - tap_d[2]) * wx) * wy);
++in[2] = (double) rcode[2] * scale_in;
++    }
++
++    for (i = 0; i < 3; i++) {
++        const AVDOVIReshapingCurve *cv = &map->curves[i];
++        /* A table hit is the same double the expressions further down produce, so it goes first
++         * and everything else stays exactly as it was for the components a table cannot serve.
++         * The range check is not decoration: the code is what the decoder produced, and outside
++         * the declared domain the scalar path is the answer of record. */
++        if (lut_ok[i] && rcode[i] >= 0 && rcode[i] < lut_n) {
++            const double v = lut[i][rcode[i]];
++
++            if (!(v >= 0.0 && v <= 1.0))
++                (*out_of_range)++;
++            resh[i] = v;
++            continue;
++        }
++        /* libplacebo clamps the INPUT to [0,1] and lets the output run
++         * past it; counting the overflow pixels is the only way a caller
++         * can tell a curve that stays inside its display from one that
++         * does not. */
++        const double xin = av_clipd(in[i], 0.0, 1.0);
++        const double ab = av_clipd(in[0], 0.0, 1.0);
++        const double bb = av_clipd(in[1], 0.0, 1.0);
++        const double cb = av_clipd(in[2], 0.0, 1.0);
++        double v = 0.0;
++        int piece = 0;
++
++        if (cv->num_pivots < 2 || cv->num_pivots > AV_DOVI_MAX_PIECES + 1)
++            { ret = AVERROR_INVALIDDATA; goto fail; }
++        /* num_pieces = num_pivots - 1; the last pivot is the far boundary
++         * and never selects a piece, exactly as the spec's piecewise
++         * function is written. */
++        for (c = 1; c < cv->num_pivots - 1; c++)
++            if (xin >= cv->pivots[c] * scale_in)
++                piece = c;
++        if (piece >= AV_DOVI_MAX_PIECES)
++            { ret = AVERROR_INVALIDDATA; goto fail; }
++
++        switch (cv->mapping_idc[piece]) {
++        case AV_DOVI_MAPPING_POLYNOMIAL: {
++            const int64_t *k = cv->poly_coef[piece];
++            if (cv->poly_order[piece] < 1 || cv->poly_order[piece] > 2)
++                { ret = AVERROR_INVALIDDATA; goto fail; }
++            v = ((double)k[2] * xin + (double)k[1]) * xin + (double)k[0];
++            v *= scale_c;
++            break;
++        }
++        case AV_DOVI_MAPPING_MMR: {
++            const int order = cv->mmr_order[piece];
++            double acc = 0.0;
++            int j, m;
++
++            if (order < 1 || order > 3) { ret = AVERROR_INVALIDDATA; goto fail; }
++
++            /* The same three clamped inputs drive every component, so the monomials and their
++             * powers are a per-pixel quantity, not a per-component one - but worth computing only
++             * once, and only when some component actually asks for MMR. The accumulation below
++             * keeps its original j-then-m order and reads the same numbers, which is what makes
++             * this byte-identical rather than merely close. */
++            if (!basis_done) {
++                double mono[7];
++                int pw;
++
++                mono[0] = ab;  mono[1] = bb;  mono[2] = cb;
++                mono[3] = ab * bb;  mono[4] = ab * cb;  mono[5] = bb * cb;
++                mono[6] = ab * bb * cb;
++                for (m = 0; m < 7; m++) {
++                    pow_tab[m][0] = 1.0;
++                    for (pw = 1; pw <= 3; pw++)
++                        pow_tab[m][pw] = pow_tab[m][pw - 1] * mono[m];
++                }
++                basis_done = 1;
++            }
++            for (j = 0; j < order; j++)
++                for (m = 0; m < 7; m++)
++                    acc += (double)cv->mmr_coef[piece][j][m] * pow_tab[m][j + 1];
++            v = ((double)cv->mmr_constant[piece] + acc) * scale_c;
++            break;
++        }
++        default:
++            { ret = AVERROR_INVALIDDATA; goto fail; }
++        }
++
++        if (!(v >= 0.0 && v <= 1.0))
++            (*out_of_range)++;
++        resh[i] = v;
++    }
++
++    /*
++     * ★ THE EL COMPOSE SITS HERE, BY SPECIFICATION AND NOT BY CONVENIENCE.
++     *
++     * This is the only line in the function where `resh[3]` is complete (the loop above just wrote
++     * all three components, including the MMR and LUT paths) and the matrix below has not yet read
++     * it. Clause 5.4.3.1's reconstruction "adds the inverse quantized EL signal to the MAPPED BL
++     * signal", clause 5.4.3.3's `v` is that already-reshaped sample, and libplacebo runs the same
++     * order in src/shaders/colorspace.c - reshape at :337-338, the NLQ compose at :346, and only
++     * then pl_color_repr_decode (the matrix) at :350.
++     *
++     * Moving this one block down past the matrix or past the EOTF produces a frame that serialises,
++     * decodes and carries a full set of ST 2094-40 values, and NOTHING downstream here would say
++     * otherwise: `out_of_range` counts the curve's domain, and a shifted residual only moves the
++     * peak. So the tests that judge this step compare pixels against the Python reference; they do
++     * not check that a file came out.
++     */
++    /* The test host's replacement for the curve output, applied BEFORE the compose and for a
++     * measured reason: the residual is added to the curve's OUTPUT, so a comparison against a
++     * reference that computed that output itself is only a statement about the COMPOSE if both
++     * sides add the residual to the same number. Delivering it through a uint16 plane instead
++     * re-quantises it on the way in, and the kit's own plan records that the zero-tolerance arms
++     * hold "only when no integer lands in the middle" (fel-C侧实现规划 §7.0). Measured on this
++     * subject: a 10-bit delivery perturbed 407,288 of 24,883,200 samples, the same order as the
++     * whole acceptance - i.e. the container would have been judged instead of the filter.
++     *
++     * Never set in a graph: filter_frame() passes NULL, and the curve that ran is the curve used. */
++    if (resh_override && resh_override->present)
++        for (i = 0; i < 3; i++)
++            resh[i] = resh_override->plane[i][(size_t) y * width + x];
++
++    if (el && el->present) {
++        ret = dovi_compose_el(el, width, height, x, y, el_rebuild, el_neutral,
++                              el->bit_depth, hdr, map, el_median, resh, out_of_range);
++        if (ret < 0)
++            goto fail;
++    }
++
++    /* AV_PIX_FMT_GBRP stores the planes as G, B, R - not R, G, B. Writing row 0 of
++     * the matrix into plane 0 rotates every maxscl by one component, and because the
++     * percentiles and the average act on max(R,G,B) they do not notice: only maxscl
++     * moves. Measured that way, before it was guessed. */
++    static const int gbrp_plane[3] = { 2, 0, 1 };   /* R, G, B -> plane index */
++    /* One row of the matrix makes one component out of the whole reshaped triple, so collecting
++     * the three rows into an array first is the identical arithmetic in the identical order. Every
++     * P8 bit is therefore unchanged by this split, and that is exactly what the identity fixtures
++     * re-measure rather than what they are asked to assume. */
++    for (c = 0; c < 3; c++) {
++        double e = 0.0;
++        for (i = 0; i < 3; i++)
++            e += av_q2d(col->ycc_to_rgb_matrix[3 * c + i]) * (resh[i] - off[i]);
++        mid[c] = e;
++    }
++    if (!p5) {
++        for (c = 0; c < 3; c++) {
++            double e = av_clipd(mid[c], 0.0, 1.0);
++            dst[gbrp_plane[c]][(ptrdiff_t)y * dst_stride[gbrp_plane[c]] + x] =
++                (uint16_t)llround(e / scale_out);
++        }
++    } else {
++        /* Linearise through the declared slot, then leave LMS by way of the inverse of the DM's own
++         * crosstalk matrix. Negative results clamp to black - the same clip the Python route
++         * applies, and the same one the curve path above counts against [0,1] in `out_of_range`;
++         * the [0,1] clamp inside the OETF is the last word on anything the inverse pushes past the
++         * PQ full scale, which is why no code can come out wider than the buffer it is written to. */
++        for (c = 0; c < 3; c++)
++            lin[c] = (p5_transfer == P5_TRANSFER_CBRT)
++                   ? copysign(pow(fabs(mid[c]), 3.0), mid[c])
++                   : dovi_pq_eotf_d(mid[c]);
++        for (c = 0; c < 3; c++) {
++            double v = 0.0;
++            for (i = 0; i < 3; i++)
++                v += inv_rlms[3 * c + i] * lin[i];
++            dst[gbrp_plane[c]][(ptrdiff_t)y * dst_stride[gbrp_plane[c]] + x] =
++                (uint16_t)llround(dovi_pq_oetf_d(v) / scale_out);
++        }
++    }
++                }
++            }
++        }
++    }
++
++fail:
++    for (i = 0; i < 3; i++)
++        if (lut[i])
++            av_freep(&lut[i]);
++    return ret;
++}
++
++
++/*
++ * One component's curve, evaluated at a normalised input, with the same expressions
++ * dovi_apply_planes() uses per pixel: input clamped to [0,1], piece selected by the pivots in the
++ * base layer's own coded domain, coefficients divided by 2**coef_log2_denom. It exists only so the
++ * placeholder check below can read a curve without going near the reshape path, whose numeric
++ * contract is asserted elsewhere and must not move by one rounding. Nothing here writes a plane;
++ * ab/bb/cb are the probe's own input, which drives all three components with one value.
++ */
++static int dovi_curve_at(const AVDOVIReshapingCurve *cv, double x, double scale_in,
++                         double scale_c, double *out)
++{
++    const double xin = av_clipd(x, 0.0, 1.0);
++    const double ab = xin, bb = xin, cb = xin;
++    double v = 0.0;
++    int piece = 0, c;
++
++    for (c = 1; c < cv->num_pivots - 1; c++)
++        if (xin >= cv->pivots[c] * scale_in)
++            piece = c;
++    if (piece >= AV_DOVI_MAX_PIECES)
++        return AVERROR_INVALIDDATA;
++
++    switch (cv->mapping_idc[piece]) {
++    case AV_DOVI_MAPPING_POLYNOMIAL: {
++        const int64_t *k = cv->poly_coef[piece];
++
++        if (cv->poly_order[piece] < 1 || cv->poly_order[piece] > 2)
++            return AVERROR_INVALIDDATA;
++        v = ((double)k[2] * xin + (double)k[1]) * xin + (double)k[0];
++        v *= scale_c;
++        break;
++    }
++    case AV_DOVI_MAPPING_MMR: {
++        const int order = cv->mmr_order[piece];
++        double mono[7];
++        double acc = 0.0;
++        int j, m, pw;
++        double pow_tab[7][4];
++
++        if (order < 1 || order > 3)
++            return AVERROR_INVALIDDATA;
++        mono[0] = ab;  mono[1] = bb;  mono[2] = cb;
++        mono[3] = ab * bb;  mono[4] = ab * cb;  mono[5] = bb * cb;
++        mono[6] = ab * bb * cb;
++        for (m = 0; m < 7; m++) {
++            pow_tab[m][0] = 1.0;
++            for (pw = 1; pw <= 3; pw++)
++                pow_tab[m][pw] = pow_tab[m][pw - 1] * mono[m];
++        }
++        for (j = 0; j < order; j++)
++            for (m = 0; m < 7; m++)
++                acc += (double)cv->mmr_coef[piece][j][m] * pow_tab[m][j + 1];
++        v = ((double)cv->mmr_constant[piece] + acc) * scale_c;
++        break;
++    }
++    default:
++        return AVERROR_INVALIDDATA;
++    }
++
++    *out = v;
++    return 0;
++}
++
++#define DOVI_CURVE_PROBE_POINTS 257
++#define DOVI_CURVE_MIN_SPAN     1e-3
++
++/*
++ * A curve whose whole image is one value is a placeholder, not a tone map. Applying one does not
++ * fail: every pixel comes out the same, the producer downstream measures a flat picture, and the
++ * block serialises and decodes perfectly - which is why nothing after this filter could have told.
++ * The validated Python kernel this filter mirrors refuses exactly this (p5_applier.py:129-138: 257
++ * points across the component's own pivot range, refuse when max - min < 1e-3), and it measures it
++ * on real material rather than on a hypothesis: 30 of 60 frames on one clip, 31 of 60 on another.
++ *
++ * The grid is the pivots, not the frame - the curve is a function of the RPU alone - so this is
++ * 3 * 257 evaluations of a polynomial or a small MMR: no allocation, no per-pixel cost, and the
++ * same answer for every frame carrying that RPU. A real tone map spans most of the code range
++ * (every usable curve in those three clips measured >= 0.54) and the placeholders measured 0.0, so
++ * the threshold does not sit near anything it could plausibly mis-fire on.
++ *
++ * Returns 1 and names the component when a curve is flat, 0 when all three have span, and a
++ * negative error for a curve that cannot be evaluated at all - the same AVERROR_INVALIDDATA the
++ * per-pixel path already returns for those, so no new failure style is added here.
++ */
++static int dovi_apply_probe_curves(const AVDOVIMetadata *dovi, int *offender,
++                                   double *value, double *span)
++{
++    const AVDOVIRpuDataHeader *hdr = av_dovi_get_header(dovi);
++    const AVDOVIDataMapping   *map = av_dovi_get_mapping(dovi);
++    const double scale_in = 1.0 / ((1 << hdr->bl_bit_depth) - 1);
++    const double scale_c  = 1.0 / (double)(1ULL << hdr->coef_log2_denom);
++    int i, n, ret;
++
++    *offender = -1;
++    *value = 0.0;
++    *span = 0.0;
++
++    if (hdr->bl_bit_depth < 8 || hdr->bl_bit_depth > 16 ||
++        hdr->coef_log2_denom > 32)
++        return AVERROR_INVALIDDATA;
++
++    for (i = 0; i < 3; i++) {
++        const AVDOVIReshapingCurve *cv = &map->curves[i];
++        double lo = 0.0, hi = 0.0, v = 0.0, vmin = 0.0, vmax = 0.0, first = 0.0;
++
++        if (cv->num_pivots < 2 || cv->num_pivots > AV_DOVI_MAX_PIECES + 1)
++            return AVERROR_INVALIDDATA;
++        lo = cv->pivots[0] * scale_in;
++        hi = cv->pivots[cv->num_pivots - 1] * scale_in;
++
++        for (n = 0; n < DOVI_CURVE_PROBE_POINTS; n++) {
++            const double x = lo + (hi - lo) * n / (DOVI_CURVE_PROBE_POINTS - 1);
++
++            ret = dovi_curve_at(cv, x, scale_in, scale_c, &v);
++            if (ret < 0)
++                return ret;
++            if (n == 0) {
++                vmin = vmax = first = v;
++            } else {
++                vmin = FFMIN(vmin, v);
++                vmax = FFMAX(vmax, v);
++            }
++        }
++
++        if (vmax - vmin < DOVI_CURVE_MIN_SPAN) {
++            *offender = i;
++            *value = first;
++            *span = vmax - vmin;
++            return 1;
++        }
++    }
++
++    return 0;
++}
++
++/* The chroma maths in dovi_apply_planes() is 4:2:0-specific: cw/ch and the (y >> 1, x >> 1)
++ * taps assume chroma at half resolution in BOTH directions. A 4:2:2 or 4:4:4 frame would have
++ * its chroma read from rows and columns that are not where the maths expects them, and the
++ * result serialises, decodes and looks entirely healthy while describing the wrong picture -
++ * the failure mode this filter refuses everywhere else.
++ *
++ * Those formats stay in query_formats() deliberately: if the list held only 4:2:0, the graph
++ * would silently insert a chroma conversion to get there, which is precisely the unmarked
++ * assumption this filter has an option (and no default) for. Keeping them listed means the
++ * frame arrives and is refused here, in the open, with the remedy named. */
++static int dovi_apply_chroma_is_420(const AVPixFmtDescriptor *desc)
++{
++    return desc && desc->log2_chroma_w == 1 && desc->log2_chroma_h == 1;
++}
++
++static av_cold int dovi_apply_init(AVFilterContext *ctx)
++{
++    DolbyApplyContext *s = ctx->priv;
++
++    if (s->chroma < 0 || s->chroma >= CHROMA_NB) {
++        av_log(ctx, AV_LOG_ERROR, "A chroma rebuild method must be declared: nearest and "
++               "bilinear move the percentiles that end up in the metadata, so silently "
++               "picking one would put an unmarked assumption into the output.\n");
++        return AVERROR(EINVAL);
++    }
++    return 0;
++}
++
++static int query_formats(const AVFilterContext *ctx,
++                         AVFilterFormatsConfig **cfg_in,
++                         AVFilterFormatsConfig **cfg_out)
++{
++    static const enum AVPixelFormat src_fmts[] = {
++        AV_PIX_FMT_YUV420P10LE, AV_PIX_FMT_YUV422P10LE, AV_PIX_FMT_YUV444P10LE,
++        AV_PIX_FMT_YUV420P12LE, AV_PIX_FMT_YUV422P12LE, AV_PIX_FMT_YUV444P12LE,
++        AV_PIX_FMT_NONE
++    };
++    static const enum AVPixelFormat dst_fmts[] = {
++        AV_PIX_FMT_GBRP10LE, AV_PIX_FMT_GBRP12LE,
++        AV_PIX_FMT_NONE
++    };
++    int ret;
++
++    ret = ff_formats_ref(ff_make_pixel_format_list(src_fmts), &cfg_in[0]->formats);
++    if (ret < 0)
++        return ret;
++    return ff_formats_ref(ff_make_pixel_format_list(dst_fmts), &cfg_out[0]->formats);
++}
++
++static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
++{
++    AVFilterContext *ctx = inlink->dst;
++    AVFilterLink *outlink = ctx->outputs[0];
++    DolbyApplyContext *s = ctx->priv;
++    const AVFrameSideData *sd;
++    const AVDOVIMetadata *dovi;
++    const AVDOVIRpuDataHeader *hdr;
++    const AVDOVIColorMetadata *col;
++    const AVPixFmtDescriptor *desc;
++    const AVPixFmtDescriptor *out_desc;
++    /* NULL on purpose: every refusal above the buffer allocation jumps to `fail`, which
++     * reads this pointer. Declaring it uninitialized turns each of those refusals into an
++     * access violation - found only by driving the filter through a real filtergraph. */
++    AVFrame *out = NULL;
++    const uint16_t *src[3];
++    uint16_t *dst[3];
++    ptrdiff_t src_stride[3], dst_stride[3];
++    int out_of_range = 0, ret, c, depth;
++    /* all three initialised: the probe below writes them only when it has an answer to give, and
++     * the log line reads them unconditionally. */
++    int flat_component = -1;
++    double flat_value = 0.0, flat_span = 0.0;
++
++    sd = av_frame_get_side_data(frame, AV_FRAME_DATA_DOVI_METADATA);
++    if (!sd || sd->size < sizeof(AVDOVIMetadata)) {
++        av_log(ctx, AV_LOG_ERROR, "No Dolby Vision metadata on this frame; there is nothing "
++               "to apply. If the stream is not Dolby Vision, use the ordinary producer path.\n");
++        ret = AVERROR(EINVAL);
++        goto fail;
++    }
++    dovi = (const AVDOVIMetadata *)sd->data;
++    hdr = av_dovi_get_header(dovi);
++    col = av_dovi_get_color(dovi);
++
++    /* Dual layer used to be a flat refusal, keyed on the two RPU flags below and taken whatever the
++     * caller had said. It is a branch now, entered on the SAME two flags - a stream's own shape is
++     * what decides which path is taken, never an option - but with the same two declarations the
++     * ICtCp branch below demands, and for the same reason: the flags say a residual EXISTS, they do
++     * not say where it goes or how a differently-sized EL reaches this raster.
++     *
++     * Why the refusal existed at all is still true and worth keeping in view: a dual-layer stream's
++     * base layer is not the picture - the residual alone measures 61-122% of the base layer's whole
++     * curve image - so applying it and saying nothing would describe a picture that is not there.
++     * What changed is that there is now a way to be right about it, and it is entered only when the
++     * caller has declared both halves of the answer.
++     *
++     * Three outcomes, and they must stay distinguishable:
++     *   EINVAL   - the CALLER has not said, or has said something the material contradicts.
++     *   ENOTSUP  - the caller said, and THIS STREAM is outside what this filter can carry.
++     *   (proceed) - both declared, geometry is an integer ratio this filter implements.
++     *
++     * el_spatial_resampling_filter_flag does NOT by itself force a refusal any more. It is one bit
++     * that selects a filter whose identity the stream does not carry (see dovi_el_cell()), so it
++     * cannot be resolved by refusing: it is resolved by the caller declaring `el_rebuild`. It is
++     * logged here, unmoved, because it is the field that says resampling was expected to happen. */
++    if (!hdr->disable_residual_flag) {
++        if (s->el_rebuild < 0) {
++            av_log(ctx, AV_LOG_ERROR, "This is a dual-layer stream "
++                   "(disable_residual_flag=0, el_spatial_resampling_filter_flag=%d) and "
++                   "el_rebuild was not declared. The bitstream does not say which resampling "
++                   "filter brought the enhancement layer onto this raster: "
++                   "el_spatial_resampling_filter_flag is a single bit, not a selector, and CCM 001 "
++                   "clause 5.4.1 states outright that resampling \"is not a normative part of the "
++                   "present document\". The arms are not interchangeable - on this box's measured "
++                   "material the same pair reads 1.0 codes apart under the reference upsampler and "
++                   "126.0 under an integer decimation, and both produce a picture that decodes. "
++                   "Declare el_rebuild=identity (EL and BL share a raster, the conformant shape), "
++                   "repeat (EL smaller), or decimate (EL larger). This filter will not choose one "
++                   "on your behalf.\n", hdr->el_spatial_resampling_filter_flag);
++            ret = AVERROR(EINVAL);
++            goto fail;
++        }
++        if (s->el_neutral < 0) {
++            av_log(ctx, AV_LOG_ERROR, "This is a dual-layer stream and el_neutral was not "
++                   "declared. The RPU states an nlq_offset, but the bitstream does not settle "
++                   "where the EL's ZERO residual sits on real material: the CES 00004 pair's own "
++                   "EL luma median is code 64 while the RPU declares nlq_offset=512 for all three "
++                   "components, and the two readings differ by 2.4x on the kit's own gate "
++                   "(499.7 cd/m2 against 1097.4). Declare el_neutral=nlq (the format's own "
++                   "neutral, which is what clause 5.4.3.2's `rr = e - nlq_offset` means) or "
++                   "coded-median (a DIAGNOSTIC, never a choice to ship on). This filter will not "
++                   "choose one on your behalf.\n");
++            ret = AVERROR(EINVAL);
++            goto fail;
++        }
++        if (!s->el_present) {
++            av_log(ctx, AV_LOG_ERROR, "This is a dual-layer stream (disable_residual_flag=0) and "
++                   "no enhancement layer was supplied: composing without it would emit the base "
++                   "layer and describe a picture that is not there, which is what this filter used "
++                   "to refuse outright. Supply the EL planes, or use a single-layer source.\n");
++            ret = AVERROR(ENOTSUP);
++            goto fail;
++        }
++    } else if (s->el_rebuild >= 0 || s->el_neutral >= 0 || s->el_present) {
++        /* The reverse direction, and the one that is easiest to leave out. A single-layer stream
++         * that is handed these options is not being over-served, it is being MIS-DESCRIBED: there
++         * is no residual to compose, so the declarations would be carried into a picture that never
++         * needed them. This mirrors p5_transfer's own refusal on a non-ICtCp stream, and the reason
++         * is the same one :738-740 gives - letting a declaration outvote the stream's own shape is
++         * the combination that turns a wrong picture into a plausible one. */
++        av_log(ctx, AV_LOG_ERROR, "el_rebuild/el_neutral were declared on a stream whose RPU says "
++               "disable_residual_flag=1 (el_rebuild=%d, el_neutral=%d, EL supplied=%d): there is "
++               "no enhancement layer in this stream, so those options describe a residual that "
++               "does not exist. Carrying them here is not harmless - it is a statement about a "
++               "picture nobody is looking at.\n",
++               s->el_rebuild, s->el_neutral, s->el_present);
++        ret = AVERROR(EINVAL);
++        goto fail;
++    }
++    /* ICtCp used to be a flat refusal. It is a branch now, with two preconditions, and both are
++     * checkable rather than assumed: the caller has to declare which transfer fills the slot
++     * (report 42.2 measured the same frame peaking at 1833 cd/m2 under one arm and 180 under the
++     * other against that stream's own declared 1000.6 cd/m2 white, and found neither arm
++     * adjudicable), and the planes have to carry the ICtCp tag - which is what patch 0005 makes
++     * the decoder derive from the RPU. An untagged frame is NOT reinterpreted here: letting an RPU
++     * field outvote the frame's own representation is the one combination that turns a wrong
++     * picture into a plausible one, and this filter's whole refusal style exists to stop that. */
++    if (col->signal_color_space == 2) {
++        if (s->p5_transfer < 0) {
++            av_log(ctx, AV_LOG_ERROR, "ICtCp (signal_color_space=2) needs p5_transfer declared, "
++                   "as cbrt or pq: the bitstream does not say which transfer the curve output is "
++                   "linearised with, and the two arms give materially different pictures. This "
++                   "filter will not choose one on your behalf.\n");
++            ret = AVERROR(EINVAL);
++            goto fail;
++        }
++        if (frame->colorspace != AVCOL_SPC_ICTCP) {
++            av_log(ctx, AV_LOG_ERROR, "The RPU declares ICtCp but this frame is tagged "
++                   "colorspace=%d, not AVCOL_SPC_ICTCP(%d): refusing to reshape planes whose "
++                   "representation is disputed. Tag them (patch 0005 makes the decoder do it from "
++                   "the RPU) or convert them deliberately, and say which you did.\n",
++                   frame->colorspace, AVCOL_SPC_ICTCP);
++            ret = AVERROR(ENOTSUP);
++            goto fail;
++        }
++    } else if (s->p5_transfer >= 0) {
++        av_log(ctx, AV_LOG_ERROR, "p5_transfer=%d declared on a stream that is not ICtCp "
++               "(signal_color_space=%d): that option only means something for a base layer coded "
++               "in ICtCp, and carrying it onto this one would apply the LMS inverse and a second "
++               "transfer to a picture that never left Y'CbCr.\n",
++               s->p5_transfer, col->signal_color_space);
++        ret = AVERROR(EINVAL);
++        goto fail;
++    }
++
++    desc = av_pix_fmt_desc_get(frame->format);
++    if (!desc) {
++        ret = AVERROR(EINVAL);
++        goto fail;
++    }
++    depth = desc->comp[0].depth;
++    if (depth != 10 && depth != 12) {
++        ret = AVERROR(EINVAL);
++        goto fail;
++    }
++    /* The curves act on the base layer's OWN code domain, which the RPU declares - so a frame
++     * wider than that declaration is not a higher-quality input, it is a different number for
++     * the same pixel. Measured on this box with a 10-bit-declared clip fed through
++     * format=yuv420p12le: every normalised sample came in about four times too large, the curve
++     * output pinned at its ceiling, and the frames that came out had R = 4095 and G = 0 across
++     * two thirds of the picture with only five distinct codes in the whole frame. A downstream
++     * producer then reported maxscl = average_maxrgb = 100000/100000, which serialises and
++     * decodes perfectly. Refusing is the only answer that cannot be missed. */
++    if (depth != hdr->bl_bit_depth) {
++        av_log(ctx, AV_LOG_ERROR, "Frame is %d-bit but the RPU declares bl_bit_depth=%d: the "
++               "curves are defined on the declared domain, so reading %d-bit samples through a "
++               "1/%d divisor would scale every pixel by about %g and pin the result at the curve "
++               "ceiling. Deliver the base layer at its declared depth.\n",
++               depth, hdr->bl_bit_depth, depth, (1 << hdr->bl_bit_depth) - 1,
++               (double)((1 << depth) - 1) / ((1 << hdr->bl_bit_depth) - 1));
++        ret = AVERROR(ENOTSUP);
++        goto fail;
++    }
++    if (!dovi_apply_chroma_is_420(desc)) {
++        av_log(ctx, AV_LOG_ERROR, "Only 4:2:0 input is supported, not %s: the chroma rebuild "
++               "assumes half resolution in both directions, so this picture would be measured "
++               "against the wrong samples with nothing to show it. Convert to yuv420p10le / "
++               "yuv420p12le deliberately if that is what you want - the rebuild is part of the "
++               "result.\n", av_get_pix_fmt_name(frame->format));
++        ret = AVERROR(ENOTSUP);
++        goto fail;
++    }
++    /* --------------------------------------------- the base layer's TRANSFER: Profile 8.4
++     *
++     * PROFILE 8.1 AND PROFILE 8.4 ARE THE SAME RPU, and that is why this check exists at all.
++     * It is not a convention: `dovi_rpu.py`'s `dovi_profile()` - which mirrors dovi_tool's
++     * `rpu_data_header.rs:178` - returns 8 for EVERY `vdr_rpu_profile == 1` block that is not the
++     * dual-layer shape, and there is no field after that which separates 8.1 from 8.4. The two
++     * differ in exactly one place: the base layer's transfer, SDR for 8.1 and HLG (ARIB STD-B67)
++     * for 8.4. Measured on a real 8.4 file (`src4/dvp8/dv84.mov`) the RPU is `rpu_format 18`,
++     * `vdr_rpu_profile 1`, `disable_residual 0` - identical in kind to an 8.1 RPU.
++     *
++     * WHY IT MATTERS HERE AND NOT SOMEWHERE DOWNSTREAM. ST 2094-40 clause 4.4 defines the
++     * "linearized signal" the metadata is measured through as ST 2084, and `vf_hdr10plus` enforces
++     * that by refusing any frame whose `color_trc` is not `SMPTE2084`. So an HLG picture measured on
++     * a PQ axis yields a payload that serialises, decodes, and prints a complete plausible set of
++     * 2094-40 values - while describing a picture the decoder will never reconstruct. Nothing
++     * downstream can catch it. That is the same argument that makes the ICtCp refusal above a
++     * refusal rather than a warning.
++     *
++     * THE REMEDY ALREADY EXISTS AND IS ALREADY IN THE SERIES: `hlg2pq` (patch 0013) converts the
++     * samples and re-tags the frame PQ. What was missing was anything that NOTICES an HLG base layer
++     * and names it. Measured before this block existed: `grep -E 'ARIB|B67|HLG|hlg' vf_dovi_apply.c`
++     * returned 0 hits, so an HLG base layer travelled the whole graph unchallenged and was stopped
++     * only by the producer's message about a transfer - with nothing saying "this is Profile 8.4".
++     *
++     * THE CHECK READS THE FRAME AND ONLY THE FRAME. The transfer is not in the RPU (above), so the
++     * frame's own tag is the only witness available. It is also the honest one: a caller who has
++     * already run `hlg2pq` presents PQ here and passes with no declaration at all, so the correct
++     * path stays a one-liner and only the incorrect one reads this message.
++     *
++     * NOT APPLIED TO ICtCp. A Profile 5 base layer is full-range ICtCp with its own inverse-EOTF
++     * choice carried in `p5_transfer`, and `hlg2pq` works in the Y'CbCr domain - running it first
++     * would convert a picture that is not in that domain. The branches are mutually exclusive, and
++     * that is why this sits under `!p5`.
++     */
++    if (col->signal_color_space != 2 &&
++        frame->color_trc == AVCOL_TRC_ARIB_STD_B67) {
++        av_log(ctx, AV_LOG_ERROR,
++               "the base layer is HLG (ARIB STD-B67) - the Profile 8.4 shape. Its RPU is the same "
++               "one Profile 8.1 uses (`vdr_rpu_profile == 1` carries no 8.1/8.4 field), so the ONLY "
++               "thing that distinguishes them is this transfer, and it is not in the bitstream "
++               "metadata. HDR10+ (ST 2094-40 4.4) is measured over ST 2084, so authoring from an HLG "
++               "picture produces a payload that decodes cleanly and describes a picture the decoder "
++               "cannot reconstruct. Convert the picture first:\n"
++               "    ... ,hlg2pq=... ,hdr10plus=...\n"
++               "`hlg2pq` converts the samples and re-tags the frame PQ, after which this filter and "
++               "the producer both proceed. Refusing rather than measuring on the wrong axis, because "
++               "nothing downstream can tell the two apart.\n");
++        ret = AVERROR(EINVAL);
++        goto fail;
++    }
++
++    /* The curves are as much an input as the planes are, so a curve that maps its whole domain to
++     * one value has to be caught here rather than measured downstream: applying it emits a flat
++     * picture that serialises, decodes and prints a full set of ST 2094-40 values, and no number
++     * after this filter could tell. Same test and same numbers as the Python kernel (see
++     * dovi_apply_probe_curves), same refusal style as the checks above - and it runs before the
++     * output buffer is allocated, so `out` is still the NULL the fail path expects. */
++    ret = dovi_apply_probe_curves(dovi, &flat_component, &flat_value, &flat_span);
++    if (ret < 0)
++        goto fail;
++    if (ret > 0) {
++        av_log(ctx, AV_LOG_ERROR, "Component %d's curve maps its whole domain to %.6f (span %.1e) "
++               "over %d points of its own pivot range - a placeholder, not a tone map. Authoring "
++               "from it would emit a flat block; refusing rather than emitting it.\n",
++               flat_component, flat_value, flat_span, DOVI_CURVE_PROBE_POINTS);
++        ret = AVERROR(ENOTSUP);
++        goto fail;
++    }
++
++    out = ff_get_video_buffer(outlink, outlink->w, outlink->h);
++    if (!out) {
++        ret = AVERROR(ENOMEM);
++        goto fail;
++    }
++    ret = av_frame_copy_props(out, frame);
++    if (ret < 0)
++        goto fail;
++
++    /* The depth this function WRITES in, read off the buffer it was given. It is checked rather
++     * than assumed because the output list offers both depths: if the graph handed back
++     * something else, `1 << out_desc->comp[0].depth` would silently describe a picture that is
++     * not the buffer. */
++    out_desc = av_pix_fmt_desc_get(out->format);
++    if (!out_desc || (out_desc->comp[0].depth != 10 && out_desc->comp[0].depth != 12)) {
++        av_log(ctx, AV_LOG_ERROR, "negotiated output %s is not a 10- or 12-bit planar RGB "
++               "buffer; refusing rather than writing codes sized for another depth into it\n",
++               av_get_pix_fmt_name(out->format));
++        ret = AVERROR(EINVAL);
++        goto fail;
++    }
++
++    /* linesize is in BYTES; the planes are walked as uint16_t, so the stride this
++     * function is handed must be in samples. Half of it, for every plane - getting
++     * this wrong is not a crash, it is row 0 correct and every row after it garbage. */
++    for (c = 0; c < 3; c++) {
++        src[c] = (const uint16_t *)frame->data[c];
++        src_stride[c] = frame->linesize[c] / 2;
++        dst[c] = (uint16_t *)out->data[c];
++        dst_stride[c] = out->linesize[c] / 2;
++    }
++
++    ret = dovi_apply_planes(dovi, src, src_stride, dst, dst_stride,
++                            outlink->w, outlink->h, out_desc->comp[0].depth,
++                            s->chroma, s->p5_transfer,
++                            s->el_present ? &s->el : NULL, s->el_rebuild, s->el_neutral,
++                            NULL, ctx, &out_of_range);
++    if (ret < 0)
++        goto fail;
++
++    /* The curves have been applied, so the DM no longer describes this picture.
++     * Removed by type on purpose: the generic colour-dependent property sweep
++     * would also strip the HDR10+ side data this filter's output is about to get. */
++    av_frame_side_data_remove(&out->side_data, &out->nb_side_data,
++                              AV_FRAME_DATA_DOVI_METADATA);
++
++    out->colorspace  = AVCOL_SPC_BT2020_NCL;
++    out->color_trc   = AVCOL_TRC_SMPTE2084;
++    out->color_primaries = AVCOL_PRI_BT2020;
++    out->color_range = AVCOL_RANGE_JPEG;
++
++    if (out_of_range)
++        av_log(ctx, AV_LOG_VERBOSE, "%d curve output value(s) fell outside [0,1] of the "
++               "target display; they were clamped by the matrix step.\n", out_of_range);
++
++    av_frame_free(&frame);
++    return ff_filter_frame(outlink, out);
++
++fail:
++    av_frame_free(&frame);
++    if (out)
++        av_frame_free(&out);
++    return ret;
++}
++
++#define OFFSET(x) offsetof(DolbyApplyContext, x)
++#define FLAGS (AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_FILTERING_PARAM)
++
++static const AVOption dovi_apply_options[] = {
++    { "chroma", "how to rebuild chroma onto the luma grid before the matrix acts",
++      OFFSET(chroma), AV_OPT_TYPE_INT, { .i64 = -1 }, -1, CHROMA_NB - 1, FLAGS, .unit = "chroma" },
++    { "nearest",   "replicate each chroma sample over its luma area",
++      0, AV_OPT_TYPE_CONST, { .i64 = CHROMA_NEAREST }, 0, 0, FLAGS, .unit = "chroma" },
++    { "bilinear",  "MPEG co-sited bilinear upsample",
++      0, AV_OPT_TYPE_CONST, { .i64 = CHROMA_BILINEAR }, 0, 0, FLAGS, .unit = "chroma" },
++    /* No default on purpose, and -1 is not a usable value: see the enum's comment for what the two
++     * arms measure. Unlike `chroma` this is only demanded of an ICtCp stream, because a P8 stream
++     * has no transfer slot to fill and must keep working with no new option. */
++    { "p5_transfer", "transfer to linearise an ICtCp (Profile 5) curve output with; required for "
++                     "such frames, refused for any other stream",
++      OFFSET(p5_transfer), AV_OPT_TYPE_INT, { .i64 = -1 }, -1, P5_TRANSFER_NB - 1, FLAGS,
++      .unit = "p5_transfer" },
++    { "cbrt",   "sign(x) * |x|^3, the cube of the encoded signal",
++      0, AV_OPT_TYPE_CONST, { .i64 = P5_TRANSFER_CBRT }, 0, 0, FLAGS, .unit = "p5_transfer" },
++    { "pq",     "the ST 2084 EOTF, 1.0 == 10000 cd/m2",
++      0, AV_OPT_TYPE_CONST, { .i64 = P5_TRANSFER_PQ }, 0, 0, FLAGS, .unit = "p5_transfer" },
++    /* Same rules as p5_transfer above, and for the same reason: only a dual-layer frame consults
++     * these, so a single-layer P8 stream keeps working with no new option while a dual-layer frame
++     * is refused rather than guessed at. No default on either, and -1 is not a usable value. */
++    { "el_rebuild", "how the enhancement layer reaches the base layer's raster; required for a "
++                    "dual-layer frame, refused for any other stream. repeat and decimate are "
++                    "integer-ratio STAND-INS - the resampling filter's identity is not in the "
++                    "bitstream - and identity is the shape CCM 001 5.2.2 a) asks for",
++      OFFSET(el_rebuild), AV_OPT_TYPE_INT, { .i64 = -1 }, -1, EL_REBUILD_NB - 1, FLAGS,
++      .unit = "el_rebuild" },
++    { "repeat",   "STAND-IN: EL smaller than BL, each EL sample replicated over its BL cell "
++                  "(phase: top-left). Not a standard; see the option's comment",
++      0, AV_OPT_TYPE_CONST, { .i64 = EL_REBUILD_REPEAT }, 0, 0, FLAGS, .unit = "el_rebuild" },
++    { "decimate", "STAND-IN: EL larger than BL, every n-th sample from the top-left. Not a "
++                  "standard, and it is not what CCM 001 Annex B.3 describes - that reference is "
++                  "informative and has no decimation filter at all",
++      0, AV_OPT_TYPE_CONST, { .i64 = EL_REBUILD_DECIMATE }, 0, 0, FLAGS, .unit = "el_rebuild" },
++    { "identity", "EL and BL share a raster, so nothing is resampled (CCM 001 5.2.2 a)",
++      0, AV_OPT_TYPE_CONST, { .i64 = EL_REBUILD_IDENTITY }, 0, 0, FLAGS, .unit = "el_rebuild" },
++    { "el_neutral", "where the enhancement layer's zero residual sits; required for a dual-layer "
++                    "frame, refused for any other stream",
++      OFFSET(el_neutral), AV_OPT_TYPE_INT, { .i64 = -1 }, -1, EL_NEUTRAL_NB - 1, FLAGS,
++      .unit = "el_neutral" },
++    { "nlq",    "the format's own neutral: clause 5.4.3.2's rr = e - nlq_offset, with its rr == 0 "
++                "-> r = 0 carve-out",
++      0, AV_OPT_TYPE_CONST, { .i64 = EL_NEUTRAL_NLQ }, 0, 0, FLAGS, .unit = "el_neutral" },
++    { "coded-median", "DIAGNOSTIC, never a choice to ship on: the EL's own per-component coded "
++                      "median, so the disagreement with nlq_offset can be measured rather than "
++                      "argued",
++      0, AV_OPT_TYPE_CONST, { .i64 = EL_NEUTRAL_MEDIAN }, 0, 0, FLAGS, .unit = "el_neutral" },
++    { NULL }
++};
++
++/* ------------------------------------------------------------------ filter registration
++ *
++ * GUARDED, and the guard is load-bearing rather than tidiness. `vf_dovi_compose.c` composes with the
++ * SAME arithmetic this file carries - `dovi_apply_planes()`, the `DoviElInput`/`DoviReshOverride`
++ * plumbing, the two declaration enums - and reaches it by including this file, because the
++ * alternatives were both worse: a second copy of the compose would be a second implementation to
++ * keep in step (the entire point of the P1 work was that the compose has exactly one), and lifting
++ * the arithmetic into a shared translation unit would have rewritten a filter whose readings are
++ * already pinned. Including it a second time must therefore bring in the arithmetic and NOT a
++ * second definition of `ff_vf_dovi_apply` / `dovi_apply_class` / `inputs`, which is exactly what
++ * this guard prevents. It is defined by `vf_dovi_compose.c` before its include.
++ */
++#ifndef DOVI_APPLY_NO_FILTER_REGISTRATION
++
++AVFILTER_DEFINE_CLASS(dovi_apply);
++
++static const AVFilterPad inputs[] = {
++    {
++        .name         = "default",
++        .type         = AVMEDIA_TYPE_VIDEO,
++        .filter_frame = filter_frame,
++    },
++};
++
++const FFFilter ff_vf_dovi_apply = {
++    .p.name        = "dovi_apply",
++    .p.description = NULL_IF_CONFIG_SMALL("Apply Dolby Vision RPU reshaping curves to a base layer."),
++    .p.priv_class  = &dovi_apply_class,
++    .p.flags       = 0,
++    .priv_size     = sizeof(DolbyApplyContext),
++    .init          = dovi_apply_init,
++    FILTER_INPUTS(inputs),
++    FILTER_OUTPUTS(ff_video_default_filterpad),
++    FILTER_QUERY_FUNC2(query_formats),
++};
++
++#endif /* DOVI_APPLY_NO_FILTER_REGISTRATION */
+diff --git a/libavfilter/Makefile b/libavfilter/Makefile
+index ceea328..cae7403 100644
+--- a/libavfilter/Makefile
++++ b/libavfilter/Makefile
+@@ -295,6 +295,7 @@ OBJS-$(CONFIG_DNN_CLASSIFY_FILTER)           += vf_dnn_classify.o
+ OBJS-$(CONFIG_DNN_DETECT_FILTER)             += vf_dnn_detect.o
+ OBJS-$(CONFIG_DNN_PROCESSING_FILTER)         += vf_dnn_processing.o
+ OBJS-$(CONFIG_DOUBLEWEAVE_FILTER)            += vf_weave.o
++OBJS-$(CONFIG_DOVI_APPLY_FILTER)             += vf_dovi_apply.o
+ OBJS-$(CONFIG_DRAWBOX_FILTER)                += vf_drawbox.o
+ OBJS-$(CONFIG_DRAWGRAPH_FILTER)              += f_drawgraph.o
+ OBJS-$(CONFIG_DRAWGRID_FILTER)               += vf_drawbox.o
+diff --git a/libavfilter/allfilters.c b/libavfilter/allfilters.c
+index 3b93fe1..ba742bd 100644
+--- a/libavfilter/allfilters.c
++++ b/libavfilter/allfilters.c
+@@ -269,6 +269,7 @@ extern const FFFilter ff_vf_dnn_classify;
+ extern const FFFilter ff_vf_dnn_detect;
+ extern const FFFilter ff_vf_dnn_processing;
+ extern const FFFilter ff_vf_doubleweave;
++extern const FFFilter ff_vf_dovi_apply;
+ extern const FFFilter ff_vf_drawbox;
+ extern const FFFilter ff_vf_drawgraph;
+ extern const FFFilter ff_vf_drawgrid;

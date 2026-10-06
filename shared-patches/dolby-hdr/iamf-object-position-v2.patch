@@ -1,0 +1,1049 @@
+diff --git a/libavutil/iamf.h b/libavutil/iamf.h
+--- a/libavutil/iamf.h
++++ b/libavutil/iamf.h
+@@ -64,12 +64,21 @@
+  * @{
+  */
+ enum AVIAMFAnimationType {
+     AV_IAMF_ANIMATION_TYPE_STEP,
+     AV_IAMF_ANIMATION_TYPE_LINEAR,
+     AV_IAMF_ANIMATION_TYPE_BEZIER,
++    /* 本地补丁（2026-10-06）：IAMF v2.0.0 新增的两种"帧间"动画。
++     * 真值取自 AOM iamf-tools 与官方测试向量 iamf/tests/test_000800.textproto
++     * （那个向量用的就是 INTER_LINEAR(3) + 两个端点）。
++     *
++     * ⚠ 必须**追加在末尾并显式赋值**：往枚举中间插会静默改掉后继者的数值，
++     *   这条在参数定义类型上已经踩过一次（把 MIX_GAIN 顶成 4，导致连普通
++     *   channel 件都写不出来）。 */
++    AV_IAMF_ANIMATION_TYPE_INTER_LINEAR = 3,
++    AV_IAMF_ANIMATION_TYPE_INTER_BEZIER = 4,
+ };
+ 
+ /**
+  * Mix Gain Parameter Data as defined in section 3.8.1 of IAMF.
+  *
+  * @note This struct's size is not a part of the public ABI.
+@@ -122,12 +131,49 @@ typedef struct AVIAMFMixGain {
+ 
+ /**
+  * Demixing Info Parameter Data as defined in section 3.8.2 of IAMF.
+  *
+  * @note This struct's size is not a part of the public ABI.
+  */
++/**
++ * 本地补丁（2026-10-06）：极坐标位置（对象方位）。
++ * 单个点（single）即可表达静态位置；双点留给后续（DualPolar）。
++ */
++typedef struct AVIAMFPolarPosition {
++    int32_t azimuth;    /* 9 bit，[-180, 180] */
++    int32_t elevation;  /* 8 bit，[-90, 90] */
++    int32_t distance;   /* 7 bit，[0, 127] */
++} AVIAMFPolarPosition;
++
++/**
++ * 本地补丁（2026-10-06）：极坐标位置参数的**子块**（逐帧）。
++ * animation_type 沿用 IAMF 的取值（0=step 静态、1=linear）。
++ * 本补丁只实现 step（静态位置）—— 正好对得上"分段定值"的素材。
++ */
++typedef struct AVIAMFPolarParamSubblock {
++    const AVClass *av_class;   /* 必须首成员：与兄弟子块同形，av_opt_set_dict 依赖它 */
++
++    unsigned int subblock_duration;
++    unsigned int animation_type;   /* 0=step 1=linear 2=bezier 3=interLinear 4=interBezier */
++
++    /* 位置字段刻意**扁平**：实测在 AVOption 表里对**嵌套成员**取 OFFSET
++     * （如 `first.azimuth`）会让 mux init 直接 ENOMEM，连普通 channel 件都写不出来。
++     *
++     * 六种类型共用这一组字段：
++     *   Polar / DualPolar : azimuth(9s) elevation(8s) distance(7u)
++     *   Cart8 / DualCart8 : x,y,z 各 8s
++     *   Cart16/DualCart16 : x,y,z 各 16s
++     * `first_*` = 起点（single 时即全部）；`second_*` = 终点（仅 dual 用）。
++     * 存储用 int（够放 16 位有符号），写出时按类型 clip 到对应位宽。 */
++    int azimuth, elevation, distance;              /* Polar 起点 */
++    int x, y, z;                                   /* Cartesian 起点 */
++    int has_second;
++    int azimuth2, elevation2, distance2;           /* Polar 终点 */
++    int x2, y2, z2;                                /* Cartesian 终点 */
++} AVIAMFPolarParamSubblock;
++
+ typedef struct AVIAMFDemixingInfo {
+     const AVClass *av_class;
+ 
+     /**
+      * Duration for the given subblock, in units of
+      * 1 / @ref AVIAMFParamDefinition.parameter_rate "parameter_rate".
+@@ -164,24 +210,40 @@ typedef struct AVIAMFReconGain {
+      * Channel order is: FL, C, FR, SL, SR, TFL, TFR, BL, BR, TBL, TBR, LFE
+      */
+     uint8_t recon_gain[6][12];
+ } AVIAMFReconGain;
+ 
+ enum AVIAMFParamDefinitionType {
+-   /**
+-    * Subblocks are of struct type AVIAMFMixGain
+-    */
++    /**
++     * Subblocks are of struct type AVIAMFMixGain
++     */
+     AV_IAMF_PARAMETER_DEFINITION_MIX_GAIN,
+-   /**
+-    * Subblocks are of struct type AVIAMFDemixingInfo
+-    */
++    /**
++     * Subblocks are of struct type AVIAMFDemixingInfo
++     */
+     AV_IAMF_PARAMETER_DEFINITION_DEMIXING,
+-   /**
+-    * Subblocks are of struct type AVIAMFReconGain
+-    */
++    /**
++     * Subblocks are of struct type AVIAMFReconGain
++     */
+     AV_IAMF_PARAMETER_DEFINITION_RECON_GAIN,
++    /**
++     * 本地补丁（2026-10-06）：IAMF v2.0.0 的位置参数族，一共 6 种。
++     * 数值与规范一致（iamf-tools/param_definitions/param_definition_base.h）：
++     *   3 Polar 4 Cart8 5 Cart16 6 DualPolar 7 DualCart8 8 DualCart16
++     *
++     * ⚠⚠ 必须放在**最后**且**显式赋全值**。我第一版把 POLAR 插在枚举**开头**，
++     *   于是 MIX_GAIN 被顶成 4、DEMIXING 5、RECON_GAIN 6 —— 三个原有类型全部错位，
++     *   症状是**连普通 channel 件都写不出来**（mux init 报 ENOMEM）。
++     *   ⇒ 往枚举中间插值 = 静默改掉所有后继者的数值。
++     */
++    AV_IAMF_PARAMETER_DEFINITION_POLAR       = 3,
++    AV_IAMF_PARAMETER_DEFINITION_CART8       = 4,
++    AV_IAMF_PARAMETER_DEFINITION_CART16      = 5,
++    AV_IAMF_PARAMETER_DEFINITION_DUAL_POLAR  = 6,
++    AV_IAMF_PARAMETER_DEFINITION_DUAL_CART8  = 7,
++    AV_IAMF_PARAMETER_DEFINITION_DUAL_CART16 = 8,
+ };
+ 
+ /**
+  * Parameters as defined in section 3.6.1 of IAMF.
+  *
+  * The struct is allocated by av_iamf_param_definition_alloc() along with an
+@@ -288,12 +350,17 @@ enum AVIAMFAmbisonicsMode {
+  * For AV_IAMF_AUDIO_ELEMENT_TYPE_SCENE, it is an Ambisonics channel
+  * layout as defined in section 3.6.3 of IAMF.
+  *
+  * @note The struct should be allocated with av_iamf_audio_element_add_layer()
+  *       and its size is not a part of the public ABI.
+  */
++/**
++ * 本地补丁（2026-10-06）：极坐标位置（对象方位）。
++ * （已上移到 AVIAMFPolarParamSubblock 之前 —— 先声明后使用）
++ */
++
+ typedef struct AVIAMFLayer {
+     const AVClass *av_class;
+ 
+     AVChannelLayout ch_layout;
+ 
+     /**
+@@ -344,12 +411,23 @@ typedef struct AVIAMFLayer {
+ } AVIAMFLayer;
+ 
+ 
+ enum AVIAMFAudioElementType {
+     AV_IAMF_AUDIO_ELEMENT_TYPE_CHANNEL,
+     AV_IAMF_AUDIO_ELEMENT_TYPE_SCENE,
++    /**
++     * Object-based audio element (IAMF 3.6.5 `ObjectsConfig`), value 2.
++     *
++     * 本地补丁（2026-10-06）。上游 FFmpeg 只写 CHANNEL/SCENE 两支，没有对象元素。
++     * 规范里 `audio_element_type` 是 3 bit，0/1/2 有效、3–7 保留。
++     *
++     * ⚠ 能力边界：这**只让"对象元素容器"能写出来**（类型=2 + num_objects）。
++     * 要表达**对象方位**还需要 v2.0.0 的逐帧位置参数（Polar/Cart8/Cart16/Dual…，
++     * 参数定义类型 3..8），那六种在本树里不存在 ⇒ 方位传不过去。
++     */
++    AV_IAMF_AUDIO_ELEMENT_TYPE_OBJECT,
+ };
+ 
+ /**
+  * Information on how to combine one or more audio streams, as defined in
+  * section 3.6 of IAMF.
+  *
+@@ -382,12 +460,25 @@ typedef struct AVIAMFAudioElement {
+      * representation.
+      * The @ref AVIAMFParamDefinition.type "type" must be
+      * AV_IAMF_PARAMETER_DEFINITION_RECON_GAIN.
+      */
+     AVIAMFParamDefinition *recon_gain_info;
+ 
++    /**
++     * 本地补丁（2026-10-06）：位置参数（对象方位）的**定义**。
++     *
++     * 为什么要有这个字段：位置参数的逐帧值随包走（side-data），但**定义**
++     * 必须在写头时登记进 IA Sequence Header —— 上游只给 demixing/recon_gain
++     * 留了登记点，位置参数没有 ⇒ 写包时报
++     * "Non-existent Parameter Definition with ID N referenced by a packet"。
++     *
++     * `type` 取 6 种位置类型之一（POLAR/CART8/CART16/DUAL_*）；
++     * 子块是 AVIAMFPolarParamSubblock。**只在 OBJECT_BASED 元素上有意义。**
++     */
++    AVIAMFParamDefinition *position_info;
++
+     /**
+      * Audio element type as defined in section 3.6 of IAMF.
+      */
+     enum AVIAMFAudioElementType audio_element_type;
+ 
+     /**
+diff --git a/libavutil/iamf.c b/libavutil/iamf.c
+--- a/libavutil/iamf.c
++++ b/libavutil/iamf.c
+@@ -106,12 +106,45 @@ static const AVClass recon_gain_class = {
+     .class_name     = "AVIAMFReconGain",
+     .item_name      = av_default_item_name,
+     .version        = LIBAVUTIL_VERSION_INT,
+     .option         = recon_gain_options,
+ };
+ 
++/* 本地补丁（2026-10-06）：极坐标位置（对象方位）。
++ * 选项名与 AOM iamf-tools 的字段名对齐（azimuth / elevation / distance），
++ * 这样 CLI 侧写起来与参考实现同词。 */
++#undef OFFSET
++#define OFFSET(x) offsetof(AVIAMFPolarParamSubblock, x)
++static const AVOption polar_options[] = {
++    { "subblock_duration", "set subblock_duration", OFFSET(subblock_duration), AV_OPT_TYPE_UINT, {.i64 = 1 }, 1, UINT_MAX, FLAGS },
++    { "animation_type",    "set animation_type",    OFFSET(animation_type),    AV_OPT_TYPE_UINT, {.i64 = 0 }, 0, 4, FLAGS },
++    /* Polar（9s/8s/7u）*/
++    { "azimuth",   "set azimuth (9 bit)",   OFFSET(azimuth),   AV_OPT_TYPE_INT, {.i64 = 0 }, -180, 180, FLAGS },
++    { "elevation", "set elevation (8 bit)", OFFSET(elevation), AV_OPT_TYPE_INT, {.i64 = 0 },  -90,  90, FLAGS },
++    { "distance",  "set distance (7 bit)",  OFFSET(distance),  AV_OPT_TYPE_INT, {.i64 = 0 },    0, 127, FLAGS },
++    /* Cartesian 起点（8s 或 16s，按 type 定；这里按 16 位放宽，写出时 clip）*/
++    { "x", "set x", OFFSET(x), AV_OPT_TYPE_INT, {.i64 = 0 }, -32768, 32767, FLAGS },
++    { "y", "set y", OFFSET(y), AV_OPT_TYPE_INT, {.i64 = 0 }, -32768, 32767, FLAGS },
++    { "z", "set z", OFFSET(z), AV_OPT_TYPE_INT, {.i64 = 0 }, -32768, 32767, FLAGS },
++    /* 终点（仅 dual 用）*/
++    { "azimuth2",   "set second azimuth",   OFFSET(azimuth2),   AV_OPT_TYPE_INT, {.i64 = 0 }, -180, 180, FLAGS },
++    { "elevation2", "set second elevation", OFFSET(elevation2), AV_OPT_TYPE_INT, {.i64 = 0 },  -90,  90, FLAGS },
++    { "distance2",  "set second distance",  OFFSET(distance2),  AV_OPT_TYPE_INT, {.i64 = 0 },    0, 127, FLAGS },
++    { "x2", "set second x", OFFSET(x2), AV_OPT_TYPE_INT, {.i64 = 0 }, -32768, 32767, FLAGS },
++    { "y2", "set second y", OFFSET(y2), AV_OPT_TYPE_INT, {.i64 = 0 }, -32768, 32767, FLAGS },
++    { "z2", "set second z", OFFSET(z2), AV_OPT_TYPE_INT, {.i64 = 0 }, -32768, 32767, FLAGS },
++    { NULL },
++};
++
++static const AVClass polar_class = {
++    .class_name     = "AVIAMFPolarParamSubblock",
++    .item_name      = av_default_item_name,
++    .version        = LIBAVUTIL_VERSION_INT,
++    .option         = polar_options,
++};
++
+ #undef OFFSET
+ #define OFFSET(x) offsetof(AVIAMFParamDefinition, x)
+ static const AVOption param_definition_options[] = {
+     { "parameter_id", "set parameter_id", OFFSET(parameter_id), AV_OPT_TYPE_UINT, {.i64 = 0 }, 0, UINT_MAX, FLAGS },
+     { "parameter_rate", "set parameter_rate", OFFSET(parameter_rate), AV_OPT_TYPE_UINT, {.i64 = 0 }, 0, UINT_MAX, FLAGS },
+     { "duration", "set duration", OFFSET(duration), AV_OPT_TYPE_UINT, {.i64 = 0 }, 0, UINT_MAX, FLAGS },
+@@ -131,12 +164,21 @@ static const AVClass *param_definition_child_iterate(void **opaque)
+     case AV_IAMF_PARAMETER_DEFINITION_DEMIXING:
+         ret = &demixing_info_class;
+         break;
+     case AV_IAMF_PARAMETER_DEFINITION_RECON_GAIN:
+         ret = &recon_gain_class;
+         break;
++    /* 本地补丁（2026-10-06）：位置参数族 */
++    case AV_IAMF_PARAMETER_DEFINITION_POLAR:
++    case AV_IAMF_PARAMETER_DEFINITION_CART8:
++    case AV_IAMF_PARAMETER_DEFINITION_CART16:
++    case AV_IAMF_PARAMETER_DEFINITION_DUAL_POLAR:
++    case AV_IAMF_PARAMETER_DEFINITION_DUAL_CART8:
++    case AV_IAMF_PARAMETER_DEFINITION_DUAL_CART16:
++        ret = &polar_class;
++        break;
+     default:
+         break;
+     }
+ 
+     if (ret)
+         *opaque = (void*)(i + 1);
+@@ -169,12 +211,17 @@ AVIAMFParamDefinition *av_iamf_param_definition_alloc(enum AVIAMFParamDefinition
+         AVIAMFDemixingInfo d;
+     };
+     struct ReconGainStruct {
+         AVIAMFParamDefinition p;
+         AVIAMFReconGain r;
+     };
++    /* 本地补丁（2026-10-06）：极坐标位置参数的子块容器 */
++    struct PolarStruct {
++        AVIAMFParamDefinition p;
++        AVIAMFPolarParamSubblock s;
++    };
+     size_t subblocks_offset, subblock_size;
+     size_t size;
+     AVIAMFParamDefinition *par;
+ 
+     switch (type) {
+     case AV_IAMF_PARAMETER_DEFINITION_MIX_GAIN:
+@@ -186,12 +233,22 @@ AVIAMFParamDefinition *av_iamf_param_definition_alloc(enum AVIAMFParamDefinition
+         subblock_size = sizeof(AVIAMFDemixingInfo);
+         break;
+     case AV_IAMF_PARAMETER_DEFINITION_RECON_GAIN:
+         subblocks_offset = offsetof(struct ReconGainStruct, r);
+         subblock_size = sizeof(AVIAMFReconGain);
+         break;
++    /* 本地补丁（2026-10-06）：位置参数族（6 型共用同一子块结构） */
++    case AV_IAMF_PARAMETER_DEFINITION_POLAR:
++    case AV_IAMF_PARAMETER_DEFINITION_CART8:
++    case AV_IAMF_PARAMETER_DEFINITION_CART16:
++    case AV_IAMF_PARAMETER_DEFINITION_DUAL_POLAR:
++    case AV_IAMF_PARAMETER_DEFINITION_DUAL_CART8:
++    case AV_IAMF_PARAMETER_DEFINITION_DUAL_CART16:
++        subblocks_offset = offsetof(struct PolarStruct, s);
++        subblock_size = sizeof(AVIAMFPolarParamSubblock);
++        break;
+     default:
+         return NULL;
+     }
+ 
+     size = subblocks_offset;
+     if (nb_subblocks > (SIZE_MAX - size) / subblock_size)
+@@ -220,12 +277,23 @@ AVIAMFParamDefinition *av_iamf_param_definition_alloc(enum AVIAMFParamDefinition
+         case AV_IAMF_PARAMETER_DEFINITION_DEMIXING:
+             ((AVIAMFDemixingInfo *)subblock)->av_class = &demixing_info_class;
+             break;
+         case AV_IAMF_PARAMETER_DEFINITION_RECON_GAIN:
+             ((AVIAMFReconGain *)subblock)->av_class = &recon_gain_class;
+             break;
++        /* 本地补丁（2026-10-06）：位置参数族
++         * ⚠ 上游这里是 `default: av_assert0(0);` —— 不加这些 case，
++         *   传位置类型进来会**直接 assert 崩掉**（不是返回错误）。 */
++        case AV_IAMF_PARAMETER_DEFINITION_POLAR:
++        case AV_IAMF_PARAMETER_DEFINITION_CART8:
++        case AV_IAMF_PARAMETER_DEFINITION_CART16:
++        case AV_IAMF_PARAMETER_DEFINITION_DUAL_POLAR:
++        case AV_IAMF_PARAMETER_DEFINITION_DUAL_CART8:
++        case AV_IAMF_PARAMETER_DEFINITION_DUAL_CART16:
++            ((AVIAMFPolarParamSubblock *)subblock)->av_class = &polar_class;
++            break;
+         default:
+             av_assert0(0);
+         }
+     }
+ 
+     if (out_size)
+@@ -283,17 +351,20 @@ static const AVClass layer_class = {
+ 
+ #undef OFFSET
+ #define OFFSET(x) offsetof(AVIAMFAudioElement, x)
+ static const AVOption audio_element_options[] = {
+     { "audio_element_type", "set audio_element_type", OFFSET(audio_element_type), AV_OPT_TYPE_INT,
+             {.i64 = AV_IAMF_AUDIO_ELEMENT_TYPE_CHANNEL },
+-            AV_IAMF_AUDIO_ELEMENT_TYPE_CHANNEL, AV_IAMF_AUDIO_ELEMENT_TYPE_SCENE, FLAGS, .unit = "audio_element_type" },
++            /* 本地补丁（2026-10-06）：上界放宽到 OBJECT，否则用户选了也传不进来 */
++            AV_IAMF_AUDIO_ELEMENT_TYPE_CHANNEL, AV_IAMF_AUDIO_ELEMENT_TYPE_OBJECT, FLAGS, .unit = "audio_element_type" },
+         { "channel", NULL, 0, AV_OPT_TYPE_CONST,
+                    { .i64 = AV_IAMF_AUDIO_ELEMENT_TYPE_CHANNEL }, .unit = "audio_element_type" },
+         { "scene",   NULL, 0, AV_OPT_TYPE_CONST,
+                    { .i64 = AV_IAMF_AUDIO_ELEMENT_TYPE_SCENE },   .unit = "audio_element_type" },
++        { "object",  NULL, 0, AV_OPT_TYPE_CONST,
++                   { .i64 = AV_IAMF_AUDIO_ELEMENT_TYPE_OBJECT },  .unit = "audio_element_type" },
+     { "default_w", "set default_w", OFFSET(default_w), AV_OPT_TYPE_UINT, {.i64 = 0 }, 0, 10, FLAGS },
+     { NULL },
+ };
+ 
+ static const AVClass *audio_element_child_iterate(void **opaque)
+ {
+diff --git a/libavcodec/packet.h b/libavcodec/packet.h
+--- a/libavcodec/packet.h
++++ b/libavcodec/packet.h
+@@ -316,12 +316,29 @@ enum AVPacketSideDataType {
+      * metadata is in the form of the AVIAMFParamDefinition struct and contains
+      * information defined in sections 3.6.1 and 3.8.3 of the Immersive Audio Model
+      * and Formats standard.
+      */
+     AV_PKT_DATA_IAMF_RECON_GAIN_INFO_PARAM,
+ 
++    /**
++     * 本地补丁（2026-10-06）：IAMF v2.0.0 的**位置参数**（6 种）各占一个 side-data 类型。
++     * metadata 形式为 AVIAMFParamDefinition，其 `type` 决定子块语义：
++     *   AV_IAMF_PARAMETER_DEFINITION_POLAR / CART8 / CART16 /
++     *   DUAL_POLAR / DUAL_CART8 / DUAL_CART16
++     * 子块统一是 AVIAMFPolarParamSubblock。位流见 iamf-tools 的 *_position_data.cc。
++     *
++     * ⚠ 加在**最后一个 IAMF 项之后、非 IAMF 项之前**：这一段取值会顺移，
++     *   任何按数值硬编码 AV_PKT_DATA_* 的下游都会受影响（本树内已核：没有）。
++     */
++    AV_PKT_DATA_IAMF_POLAR_POSITION_PARAM,
++    AV_PKT_DATA_IAMF_CART8_POSITION_PARAM,
++    AV_PKT_DATA_IAMF_CART16_POSITION_PARAM,
++    AV_PKT_DATA_IAMF_DUAL_POLAR_POSITION_PARAM,
++    AV_PKT_DATA_IAMF_DUAL_CART8_POSITION_PARAM,
++    AV_PKT_DATA_IAMF_DUAL_CART16_POSITION_PARAM,
++
+     /**
+      * Ambient viewing environment metadata, as defined by H.274. This metadata
+      * should be associated with a video stream and contains data in the form
+      * of the AVAmbientViewingEnvironment struct.
+     */
+     AV_PKT_DATA_AMBIENT_VIEWING_ENVIRONMENT,
+diff --git a/libavformat/iamf_writer.c b/libavformat/iamf_writer.c
+--- a/libavformat/iamf_writer.c
++++ b/libavformat/iamf_writer.c
+@@ -232,13 +232,51 @@ int ff_iamf_add_audio_element(IAMFContext *iamf, const AVStreamGroup *stg, void
+     if (!stg->nb_streams) {
+         av_log(log_ctx, AV_LOG_ERROR, "Audio Element id %"PRId64" has no streams\n", stg->id);
+         return AVERROR(EINVAL);
+     }
+ 
+     iamf_audio_element = stg->params.iamf_audio_element;
+-    if (iamf_audio_element->audio_element_type == AV_IAMF_AUDIO_ELEMENT_TYPE_SCENE) {
++    av_log(log_ctx, AV_LOG_ERROR, "TRACE-A nb_layers=%u type=%d nb_streams=%u\n",
++           iamf_audio_element->nb_layers, iamf_audio_element->audio_element_type, stg->nb_streams);
++    if (iamf_audio_element->audio_element_type == AV_IAMF_AUDIO_ELEMENT_TYPE_OBJECT) {
++        /* 本地补丁（2026-10-06）：对象元素形状校验（IAMF 3.6.5）
++         *   · 1 层；· 每个对象一路单声道子流；· 对象数 > 0。
++         * 位置参数不在这里管。 */
++        av_log(log_ctx, AV_LOG_ERROR, "T2 obj branch nb_layers=%u\n", iamf_audio_element->nb_layers);
++        if (iamf_audio_element->nb_layers != 1) {
++            av_log(log_ctx, AV_LOG_ERROR,
++                   "Invalid amount of layers for OBJECT_BASED audio element. Must be 1\n");
++            return AVERROR(EINVAL);
++        }
++        if (!stg->nb_streams) {
++            av_log(log_ctx, AV_LOG_ERROR, "OBJECT_BASED audio element has no objects\n");
++            return AVERROR(EINVAL);
++        }
++        for (int i = 0; i < stg->nb_streams; i++) {
++            if (stg->streams[i]->codecpar->ch_layout.nb_channels != 1) {
++                av_log(log_ctx, AV_LOG_ERROR,
++                       "OBJECT_BASED audio element requires mono streams (object %d has %d channels)\n",
++                       i, stg->streams[i]->codecpar->ch_layout.nb_channels);
++                return AVERROR(EINVAL);
++            }
++        }
++        /* ⚠⚠ 承重的一步（实测踩到）：下面那个"按 layer 声道数铺子流"的循环
++         *   （本函数后半段）会从 `layers[0]->ch_layout.nb_channels` 往下**扣**，
++         *   扣到 0 就停。调用者给的对象 layer 通常是 mono（1 路）⇒ 只会登记
++         *   **一个**子流，第二个对象就 `get_audio_element(id)` 找不到 ⇒
++         *   写包时静默 EINVAL。
++         *   ⇒ 把 layer 的声道数改成**对象数**（每个对象一路），使那段循环正好铺满。
++         *
++         *   ⚠⚠ 这里**绝不能动 `iamf_audio_element->layers[0]->ch_layout`**（试过两版都崩）：
++         *     · `uninit + default` ⇒ 崩（改写了调用者的堆块，收尾时双重释放）；
++         *     · 直接改 order/nb_channels/u.mask ⇒ 也崩（`u` 是 union，
++         *       调用者可能用的是 `u.map`（custom 序）指针，我按 mask 解读就踩空了）。
++         *   ⇒ 真正干净的做法：**不改调用者的结构**，而是在下面那个铺子流的循环里，
++         *     对对象元素改用"每个子流一路"的规则（见 `对象元素` 分支）。 */
++        av_log(log_ctx, AV_LOG_ERROR, "TRACE-B 过了对象校验\n");
++    } else if (iamf_audio_element->audio_element_type == AV_IAMF_AUDIO_ELEMENT_TYPE_SCENE) {
+         const AVIAMFLayer *layer = iamf_audio_element->layers[0];
+         if (iamf_audio_element->nb_layers != 1) {
+             av_log(log_ctx, AV_LOG_ERROR, "Invalid amount of layers for SCENE_BASED audio element. Must be 1\n");
+             return AVERROR(EINVAL);
+         }
+         if (layer->ch_layout.order != AV_CHANNEL_ORDER_CUSTOM &&
+@@ -345,17 +383,31 @@ int ff_iamf_add_audio_element(IAMFContext *iamf, const AVStreamGroup *stg, void
+     if (!audio_element->layers) {
+         ret = AVERROR(ENOMEM);
+         goto fail;
+     }
+ 
+     for (int i = 0, j = 0; i < iamf_audio_element->nb_layers; i++) {
+-        int nb_channels = iamf_audio_element->layers[i]->ch_layout.nb_channels;
++        /*
++         * 本地补丁（2026-10-06）：对象元素的**子流铺设规则**。
++         *
++         * 上游这段是"按 layer 的声道数往下扣"：layer 声明几路就登记几路子流。
++         * 但对象元素的 layer 语义不同 —— 规范里对象数写在 `ObjectsConfig.num_objects`，
++         * layer 只是个占位（调用者通常给 mono）⇒ 按声道数扣只会登记 **1** 个子流，
++         * 第二个对象就 `get_audio_element(id)` 找不到，写包时静默 EINVAL。
++         * ⇒ 对象元素改成"**每个子流一路**"（stg->nb_streams 个对象全部铺满）。
++         *
++         * ⚠ 这样做不需要改调用者的 `layers[0]->ch_layout`（改它会崩，见上）。
++         */
++        const int 是对象元素 =
++            iamf_audio_element->audio_element_type == AV_IAMF_AUDIO_ELEMENT_TYPE_OBJECT;
++        int nb_channels = 是对象元素 ? stg->nb_streams
++                                     : iamf_audio_element->layers[i]->ch_layout.nb_channels;
+ 
+         IAMFLayer *layer = &audio_element->layers[i];
+ 
+-        if (i)
++        if (i && !是对象元素)
+             nb_channels -= iamf_audio_element->layers[i - 1]->ch_layout.nb_channels;
+         for (; nb_channels > 0 && j < stg->nb_streams; j++) {
+             const AVStream *st = stg->streams[j];
+             IAMFSubStream *substream = &audio_element->substreams[j];
+ 
+             substream->audio_substream_id = st->id;
+@@ -412,12 +464,36 @@ int ff_iamf_add_audio_element(IAMFContext *iamf, const AVStreamGroup *stg, void
+             ret = add_param_definition(iamf, param, audio_element, log_ctx);
+             if (ret < 0)
+                 goto fail;
+         }
+     }
+ 
++    /* 本地补丁（2026-10-06）：位置参数（对象方位）也要**在写头时登记**
++     *
++     * 为什么必须在这一步：位置参数的**定义**要在 IA Sequence Header 里声明，
++     * 而 packet 上的 side-data 只是"数据块"（逐帧值）。上游只登记
++     * demixing/recon_gain 两种，位置参数没有登记点 ⇒ 写包时报
++     * "Non-existent Parameter Definition with ID N referenced by a packet"。
++     *
++     * ⚠ 用 `param->nb_subblocks` 的**首个子块**当模板登记；duration/rate 由调用者填。
++     *   六型共用同一条路径（类型不同而已）。 */
++    if (iamf_audio_element->position_info) {
++        AVIAMFParamDefinition *param = iamf_audio_element->position_info;
++        if (param->nb_subblocks < 1) {
++            av_log(log_ctx, AV_LOG_ERROR,
++                   "nb_subblocks in position_info for stream group %u is not >= 1\n", stg->index);
++            ret = AVERROR(EINVAL);
++            goto fail;
++        }
++        if (!ff_iamf_get_param_definition(iamf, param->parameter_id)) {
++            ret = add_param_definition(iamf, param, audio_element, log_ctx);
++            if (ret < 0)
++                goto fail;
++        }
++    }
++
+     tmp = av_realloc_array(iamf->audio_elements, iamf->nb_audio_elements + 1, sizeof(*iamf->audio_elements));
+     if (!tmp) {
+         ret = AVERROR(ENOMEM);
+         goto fail;
+     }
+ 
+@@ -729,12 +805,24 @@ static int param_definition(const IAMFContext *iamf,
+                 }
+                 case AV_IAMF_PARAMETER_DEFINITION_RECON_GAIN: {
+                     const AVIAMFReconGain *recon = subblock;
+                     ffio_write_leb(dyn_bc, recon->subblock_duration);
+                     break;
+                 }
++                /* 本地补丁（2026-10-06）：位置参数族（6 型）—— 定义里只写 subblock_duration。
++                 * 默认位置值**不写**：读写两侧同形（读侧也只登记不还原），避免字段错位。 */
++                case AV_IAMF_PARAMETER_DEFINITION_POLAR:
++                case AV_IAMF_PARAMETER_DEFINITION_CART8:
++                case AV_IAMF_PARAMETER_DEFINITION_CART16:
++                case AV_IAMF_PARAMETER_DEFINITION_DUAL_POLAR:
++                case AV_IAMF_PARAMETER_DEFINITION_DUAL_CART8:
++                case AV_IAMF_PARAMETER_DEFINITION_DUAL_CART16: {
++                    const AVIAMFPolarParamSubblock *pol = subblock;
++                    ffio_write_leb(dyn_bc, pol->subblock_duration);
++                    break;
++                }
+                 }
+             }
+         }
+     }
+ 
+     return 0;
+@@ -761,21 +849,41 @@ static int iamf_write_audio_element(const IAMFContext *iamf,
+     init_put_bits(&pbc, header, sizeof(header));
+     put_bits(&pbc, 3, element->audio_element_type);
+     put_bits(&pbc, 5, 0);
+     flush_put_bits(&pbc);
+     avio_write(dyn_bc, header, put_bytes_count(&pbc, 1));
+ 
++    /* 本地补丁（2026-10-06）：对象元素先写 ObjectsConfig（规范 3.6.5 的字段次序）。 */
++    if (element->audio_element_type == AV_IAMF_AUDIO_ELEMENT_TYPE_OBJECT) {
++        init_put_bits(&pbc, header, sizeof(header));
++        put_bits(&pbc, 8, audio_element->nb_substreams);  /* num_objects */
++        put_bits(&pbc, 8, 0);                             /* objects_config_extension_bytes 长度 = 0 */
++        flush_put_bits(&pbc);
++        avio_write(dyn_bc, header, put_bytes_count(&pbc, 1));
++    }
++
+     ffio_write_leb(dyn_bc, audio_element->codec_config_id);
+     ffio_write_leb(dyn_bc, audio_element->nb_substreams);
+ 
+     for (int i = 0; i < audio_element->nb_substreams; i++)
+         ffio_write_leb(dyn_bc, audio_element->substreams[i].audio_substream_id);
+ 
+-    /* When audio_element_type = 1, num_parameters SHALL be set to 0 */
++    /* When audio_element_type = 1, num_parameters SHALL be set to 0。
++     * 本地补丁（2026-10-06）：对象元素在**本树**下也声明 0 个参数块 ——
++     * 位置参数（类型 3..8）不存在，声明了也没东西可写。 */
+     if (element->audio_element_type == AV_IAMF_AUDIO_ELEMENT_TYPE_SCENE)
+         param_definition_types = 0;
++    else if (element->audio_element_type == AV_IAMF_AUDIO_ELEMENT_TYPE_OBJECT) {
++        /* 本地补丁（2026-10-06）：对象元素的参数声明。
++         *
++         * ⚠ `param_definition_types` 是**位掩码**（上游只用来表示 DEMIXING/RECON_GAIN
++         *   两个 bit），而位置类型取值是 **3..8** —— 塞进位掩码会溢出/错义。
++         *   ⇒ 位置参数走**独立的计数与写出**，不混进这个掩码。
++         *   若调用者没给 position_info，声明 0 个（与改动前行为一致）。 */
++        param_definition_types = 0;
++    }
+     else {
+         int layout = 0, expanded_layout = 0;
+         get_loudspeaker_layout(element->layers[0], &layout, &expanded_layout);
+         /* When the loudspeaker_layout = 15, the type PARAMETER_DEFINITION_DEMIXING SHALL NOT be present. */
+         if (layout == 15) {
+             param_definition_types &= ~AV_IAMF_PARAMETER_DEFINITION_DEMIXING;
+@@ -810,13 +918,35 @@ static int iamf_write_audio_element(const IAMFContext *iamf,
+                 }
+             }
+             param_definition_types &= ~AV_IAMF_PARAMETER_DEFINITION_DEMIXING;
+         }
+     }
+ 
+-    ffio_write_leb(dyn_bc, av_popcount(param_definition_types)); // num_parameters
++    /* 本地补丁（2026-10-06）：位置参数（对象方位）的声明
++     *   num_parameters 要把它算进去；定义体在下面单独写（类型值 3..8 不进位掩码）。 */
++    {
++        const int 有位置 = element->position_info != NULL;
++
++        ffio_write_leb(dyn_bc, av_popcount(param_definition_types) + 有位置); // num_parameters
++
++        if (有位置) {
++            const AVIAMFParamDefinition *param = element->position_info;
++            const IAMFParamDefinition *param_def =
++                ff_iamf_get_param_definition(iamf, param->parameter_id);
++
++            if (!param_def) {
++                av_log(log_ctx, AV_LOG_ERROR,
++                       "position_info parameter_id %u was not registered\n", param->parameter_id);
++                return AVERROR(EINVAL);
++            }
++            ffio_write_leb(dyn_bc, param->type);            // type（3..8）
++            ret = param_definition(iamf, param_def, dyn_bc, log_ctx);
++            if (ret < 0)
++                return ret;
++        }
++    }
+ 
+     if (param_definition_types & AV_IAMF_PARAMETER_DEFINITION_DEMIXING) {
+         const AVIAMFParamDefinition *param = element->demixing_info;
+         const IAMFParamDefinition *param_def;
+         const AVIAMFDemixingInfo *demix;
+ 
+@@ -849,12 +979,16 @@ static int iamf_write_audio_element(const IAMFContext *iamf,
+     }
+ 
+     if (element->audio_element_type == AV_IAMF_AUDIO_ELEMENT_TYPE_CHANNEL) {
+         ret = scalable_channel_layout_config(audio_element, dyn_bc);
+         if (ret < 0)
+             return ret;
++    } else if (element->audio_element_type == AV_IAMF_AUDIO_ELEMENT_TYPE_OBJECT) {
++        /* 本地补丁（2026-10-06）：对象元素没有 scalable/ambisonics config —— 配置已在上面写过。
++         * ⚠ 原来这里是 `else`（只判 CHANNEL）⇒ 对象会被误送进 ambisonics_config()，
++         *   写出"对象元素 + 声场配置"的四不像 ⇒ 参考解码器必拒。 */
+     } else {
+         ret = ambisonics_config(audio_element, dyn_bc);
+         if (ret < 0)
+             return ret;
+     }
+ 
+@@ -1051,13 +1185,14 @@ static int write_parameter_block(const IAMFContext *iamf, AVIOContext *pb,
+     const IAMFParamDefinition *param_definition = ff_iamf_get_param_definition(iamf, param->parameter_id);
+     PutBitContext pbc;
+     AVIOContext *dyn_bc;
+     uint8_t *dyn_buf = NULL;
+     int dyn_size, ret;
+ 
+-    if (param->type > AV_IAMF_PARAMETER_DEFINITION_RECON_GAIN) {
++    /* 本地补丁（2026-10-06）：上界放宽到 DUAL_CART16(8)，否则位置参数块会被静默丢掉 */
++    if (param->type > AV_IAMF_PARAMETER_DEFINITION_DUAL_CART16) {
+         av_log(log_ctx, AV_LOG_DEBUG, "Ignoring side data with unknown type %u\n",
+                param->type);
+         return 0;
+     }
+ 
+     if (!param_definition) {
+@@ -1118,12 +1253,98 @@ static int write_parameter_block(const IAMFContext *iamf, AVIOContext *pb,
+             if (!param_definition->mode && param->constant_subblock_duration == 0)
+                 ffio_write_leb(dyn_bc, demix->subblock_duration);
+ 
+             avio_w8(dyn_bc, demix->dmixp_mode << 5);
+             break;
+         }
++        /* 本地补丁（2026-10-06）：位置参数族数据块（IAMF v2.0.0，6 型）
++         *
++         * 位流（真值取自 AOM iamf-tools 与官方测试向量 iamf/tests/test_000800.textproto）：
++         *   animation_type  uleb128（0=step 1=linear 2=bezier 3=interLinear 4=interBezier）
++         *   坐标点数**由 animation_type 决定**，不是由参数类型决定：
++         *     STEP(0)                     ⇒ 1 点（只有 start）
++         *     LINEAR(1)/INTER_LINEAR(3)   ⇒ 2 点（start + end）
++         *     BEZIER(2)/INTER_BEZIER(4)   ⇒ 3 点（start + end + control）+ 8bit 相对时间
++         *   官方向量 test_000800 用的就是 INTER_LINEAR(3) + 两个端点：
++         *     `"\x03"` 然后 `\x2d\x00\x7f`（+90°）—— 即 **2 点**。
++         *   每点坐标：
++         *     Polar  : azimuth 9s[-180,180] | elevation 8s[-90,90] | distance 7u[0,127]
++         *     Cart8  : x 8s | y 8s | z 8s
++         *     Cart16 : x 16s | y 16s | z 16s
++         *
++         * ⚠ 全是**跨字节位字段**（Polar 的 9+8+7 恰 24 bit 但不按字节对齐），
++         *   所以必须走 put_bits，不能像 MIX_GAIN 那样 avio_wb16。
++         * ⚠ pbuf 要够大：最多 3 点 × 3×16 = 144 bit = 18 B ⇒ 给 32 B 富余。 */
++        case AV_IAMF_PARAMETER_DEFINITION_POLAR:
++        case AV_IAMF_PARAMETER_DEFINITION_CART8:
++        case AV_IAMF_PARAMETER_DEFINITION_CART16:
++        case AV_IAMF_PARAMETER_DEFINITION_DUAL_POLAR:
++        case AV_IAMF_PARAMETER_DEFINITION_DUAL_CART8:
++        case AV_IAMF_PARAMETER_DEFINITION_DUAL_CART16: {
++            const AVIAMFPolarParamSubblock *pol = subblock;
++            const int 极坐标 = param->type == AV_IAMF_PARAMETER_DEFINITION_POLAR ||
++                               param->type == AV_IAMF_PARAMETER_DEFINITION_DUAL_POLAR;
++            const int 位宽 = (param->type == AV_IAMF_PARAMETER_DEFINITION_CART16 ||
++                              param->type == AV_IAMF_PARAMETER_DEFINITION_DUAL_CART16) ? 16 : 8;
++            /* ⚠⚠ 承重的一步（对着官方向量改的）：点数取**动画类型**与**参数类型**的较大者。
++             *   原来只按参数类型（single=1 / dual=2）⇒ 对 single 型写 INTER_LINEAR 时
++             *   会**只写 1 个点**，而解码器按 animation_type=3 要读 2 个点
++             *   ⇒ 位流错位、后续全乱。反之 dual 型写 STEP 时多写一个端点也是错位。
++             *   ⇒ 正确规则：需要几个点，就写几个点 ——
++             *       STEP ⇒ 1 点；LINEAR/INTER_LINEAR ⇒ 2 点；BEZIER/INTER_BEZIER ⇒ 3 点；
++             *       同时 dual 型**至少** 2 点（它的语义就是两点）。 */
++            const int 动画 = pol->animation_type;
++            int 点数;
++            if (动画 == AV_IAMF_ANIMATION_TYPE_BEZIER ||
++                动画 == AV_IAMF_ANIMATION_TYPE_INTER_BEZIER)
++                点数 = 3;
++            else if (动画 == AV_IAMF_ANIMATION_TYPE_LINEAR ||
++                     动画 == AV_IAMF_ANIMATION_TYPE_INTER_LINEAR)
++                点数 = 2;
++            else
++                点数 = 1;
++            if (pol->has_second && 点数 < 2)
++                点数 = 2;          /* dual 型必须两点 */
++            if (点数 > 3)
++                点数 = 3;
++            PutBitContext pbp;
++            uint8_t pbuf[32] = { 0 };
++
++            if (!param_definition->mode && param->constant_subblock_duration == 0)
++                ffio_write_leb(dyn_bc, pol->subblock_duration);
++
++            ffio_write_leb(dyn_bc, av_clip_uintp2(pol->animation_type, 8));
++
++            init_put_bits(&pbp, pbuf, sizeof(pbuf));
++            for (int 点 = 0; 点 < 点数; 点++) {
++                if (极坐标) {
++                    const int az = 点 == 0 ? pol->azimuth   : (点 == 1 ? pol->azimuth2   : pol->azimuth2);
++                    const int el = 点 == 0 ? pol->elevation : (点 == 1 ? pol->elevation2 : pol->elevation2);
++                    const int di = 点 == 0 ? pol->distance  : (点 == 1 ? pol->distance2  : pol->distance2);
++                    put_sbits(&pbp, 9, av_clip(az, -180, 180));
++                    put_sbits(&pbp, 8, av_clip(el,  -90,  90));
++                    put_bits (&pbp, 7, av_clip_uintp2(di, 7));
++                } else {
++                    const int cx = 点 == 0 ? pol->x : pol->x2;
++                    const int cy = 点 == 0 ? pol->y : pol->y2;
++                    const int cz = 点 == 0 ? pol->z : pol->z2;
++                    if (位宽 == 16) {
++                        put_sbits(&pbp, 16, av_clip(cx, -32768, 32767));
++                        put_sbits(&pbp, 16, av_clip(cy, -32768, 32767));
++                        put_sbits(&pbp, 16, av_clip(cz, -32768, 32767));
++                    } else {
++                        put_sbits(&pbp, 8, av_clip(cx, -128, 127));
++                        put_sbits(&pbp, 8, av_clip(cy, -128, 127));
++                        put_sbits(&pbp, 8, av_clip(cz, -128, 127));
++                    }
++                }
++            }
++            flush_put_bits(&pbp);
++            avio_write(dyn_bc, pbuf, put_bytes_count(&pbp, 1));
++            break;
++        }
+         case AV_IAMF_PARAMETER_DEFINITION_RECON_GAIN: {
+             const AVIAMFReconGain *recon = subblock;
+             const AVIAMFAudioElement *audio_element = param_definition->audio_element->celement;
+ 
+             if (!param_definition->mode && param->constant_subblock_duration == 0)
+                 ffio_write_leb(dyn_bc, recon->subblock_duration);
+@@ -1197,12 +1418,34 @@ int ff_iamf_write_parameter_blocks(const IAMFContext *iamf, AVIOContext *pb,
+     }
+     if (recon) {
+         int ret = write_parameter_block(iamf, pb, recon, log_ctx);
+         if (ret < 0)
+            return ret;
+     }
++    /* 本地补丁（2026-10-06）：位置参数块（对象方位，6 型）
++     * 读侧不看它（FFmpeg 的 IAMF demuxer 只解描述、不还原参数块载荷），
++     * 所以这条支路的验证方式是**逐字节看写出的位流**，不是 ffprobe 读回。 */
++    {
++        static const enum AVPacketSideDataType 位置类型[] = {
++            AV_PKT_DATA_IAMF_POLAR_POSITION_PARAM,
++            AV_PKT_DATA_IAMF_CART8_POSITION_PARAM,
++            AV_PKT_DATA_IAMF_CART16_POSITION_PARAM,
++            AV_PKT_DATA_IAMF_DUAL_POLAR_POSITION_PARAM,
++            AV_PKT_DATA_IAMF_DUAL_CART8_POSITION_PARAM,
++            AV_PKT_DATA_IAMF_DUAL_CART16_POSITION_PARAM,
++        };
++        for (size_t k = 0; k < FF_ARRAY_ELEMS(位置类型); k++) {
++            AVIAMFParamDefinition *pos =
++                (AVIAMFParamDefinition *)av_packet_get_side_data(pkt, 位置类型[k], NULL);
++            if (pos) {
++                int ret = write_parameter_block(iamf, pb, pos, log_ctx);
++                if (ret < 0)
++                    return ret;
++            }
++        }
++    }
+ 
+     return 0;
+ }
+ 
+ static IAMFAudioElement *get_audio_element(const IAMFContext *c,
+                                            unsigned int audio_substream_id)
+@@ -1233,17 +1476,19 @@ int ff_iamf_write_audio_frame(const IAMFContext *iamf, AVIOContext *pb,
+     size_t side_data_size;
+     int dyn_size, type = audio_substream_id <= 17 ?
+                          audio_substream_id + IAMF_OBU_IA_AUDIO_FRAME_ID0 : IAMF_OBU_IA_AUDIO_FRAME;
+     int ret;
+ 
+     audio_element = get_audio_element(iamf, audio_substream_id);
+-    if (!audio_element)
++    if (!audio_element) {
+         return AVERROR(EINVAL);
++    }
+     codec_config = ff_iamf_get_codec_config(iamf, audio_element->codec_config_id);
+-    if (!codec_config)
++    if (!codec_config) {
+         return AVERROR(EINVAL);
++    }
+ 
+     if (!pkt->size) {
+         size_t new_extradata_size;
+         const uint8_t *new_extradata = av_packet_get_side_data(pkt,
+                                                                AV_PKT_DATA_NEW_EXTRADATA,
+                                                                &new_extradata_size);
+diff --git a/libavformat/iamf_parse.c b/libavformat/iamf_parse.c
+--- a/libavformat/iamf_parse.c
++++ b/libavformat/iamf_parse.c
+@@ -691,12 +691,35 @@ static int param_parse(void *s, IAMFContext *c, AVIOContext *pb,
+         }
+         case AV_IAMF_PARAMETER_DEFINITION_RECON_GAIN: {
+             AVIAMFReconGain *recon = subblock;
+             recon->subblock_duration = subblock_duration;
+             break;
+         }
++        /* 本地补丁（2026-10-06）：位置参数族（6 型）
++         *
++         * ⚠ 这里**只登记子块、不读默认位置**。为什么：
++         *   写侧没往"参数定义"里写默认位置（只写 subblock_duration），
++         *   读侧若去读坐标字节，就会**读穿到下一个字段**、把整个 OBU 解析带偏 ——
++         *   实测症状是 "Cannot allocate memory"（后面字段全错、尺寸校验炸）。
++         *   位置值走**数据块**，定义里保持"只有 duration"，读写两侧同形。 */
++        case AV_IAMF_PARAMETER_DEFINITION_POLAR:
++        case AV_IAMF_PARAMETER_DEFINITION_CART8:
++        case AV_IAMF_PARAMETER_DEFINITION_CART16:
++        case AV_IAMF_PARAMETER_DEFINITION_DUAL_POLAR:
++        case AV_IAMF_PARAMETER_DEFINITION_DUAL_CART8:
++        case AV_IAMF_PARAMETER_DEFINITION_DUAL_CART16: {
++            AVIAMFPolarParamSubblock *pol = subblock;
++            pol->subblock_duration = subblock_duration;
++            pol->animation_type = 0;
++            pol->has_second = 0;
++            pol->azimuth = pol->elevation = pol->distance = 0;
++            pol->x = pol->y = pol->z = 0;
++            pol->azimuth2 = pol->elevation2 = pol->distance2 = 0;
++            pol->x2 = pol->y2 = pol->z2 = 0;
++            break;
++        }
+         default:
+             av_free(param);
+             return AVERROR_INVALIDDATA;
+         }
+     }
+ 
+@@ -775,20 +798,35 @@ static int audio_element_obu(void *s, IAMFContext *c, AVIOContext *pb, int len)
+             av_log(s, AV_LOG_ERROR, "Duplicate audio_element_id %d\n", audio_element_id);
+             ret = AVERROR_INVALIDDATA;
+             goto fail;
+         }
+ 
+     audio_element_type = avio_r8(pbc) >> 5;
+-    if (audio_element_type > AV_IAMF_AUDIO_ELEMENT_TYPE_SCENE) {
++    /* 本地补丁（2026-10-06）：上界放宽到 OBJECT（=2），否则自己写的对象件读不回来 */
++    if (audio_element_type > AV_IAMF_AUDIO_ELEMENT_TYPE_OBJECT) {
+         av_log(s, AV_LOG_DEBUG, "Unknown audio_element_type referenced in an audio element. Ignoring\n");
+         ret = 0;
+         goto fail;
+     }
+ 
+-    codec_config_id = ffio_read_leb(pbc);
++    /* 本地补丁（2026-10-06）：对象元素的 ObjectsConfig() 在 codec_config_id **之前**，
++     * 必须在这里吃掉，否则后面所有字段都会错位一个 ObjectsConfig 的宽度。
++     * 结构（规范 3.6.5）：num_objects(8) + objects_config_extension_bytes(8 位长度 + 载荷)。 */
++    if (audio_element_type == AV_IAMF_AUDIO_ELEMENT_TYPE_OBJECT) {
++        unsigned int num_objects = avio_r8(pbc);
++        unsigned int ext_len = avio_r8(pbc);
++        if (num_objects == 0) {
++            av_log(s, AV_LOG_ERROR, "OBJECT_BASED audio element with num_objects = 0\n");
++            ret = AVERROR_INVALIDDATA;
++            goto fail;
++        }
++        for (unsigned int i = 0; i < ext_len; i++)
++            avio_r8(pbc);
++    }
+ 
++    codec_config_id = ffio_read_leb(pbc);
+     codec_config = ff_iamf_get_codec_config(c, codec_config_id);
+     if (!codec_config) {
+         av_log(s, AV_LOG_ERROR, "Non existent codec config id %d referenced in an audio element\n", codec_config_id);
+         ret = AVERROR_INVALIDDATA;
+         goto fail;
+     }
+@@ -875,13 +913,17 @@ static int audio_element_obu(void *s, IAMFContext *c, AVIOContext *pb, int len)
+     if (num_parameters > 2 && audio_element_type == 0) {
+         av_log(s, AV_LOG_ERROR, "Audio Element parameter count %u is invalid"
+                                 " for Channel representations\n", num_parameters);
+         ret = AVERROR_INVALIDDATA;
+         goto fail;
+     }
+-    if (num_parameters && audio_element_type != 0) {
++    /* 本地补丁（2026-10-06）：对象元素**可以**带参数块（位置参数就在这里声明）。
++     * ⚠ 原来这条是"非 CHANNEL 就一律不许有参数"，把 SCENE 与 OBJECT 一起否了。
++     *   对象元素必须放行，否则我们写出的对象件读回来时会被判
++     *   "parameter count 1 is invalid for Scene representations" 而整件拒收。 */
++    if (num_parameters && audio_element_type == AV_IAMF_AUDIO_ELEMENT_TYPE_SCENE) {
+         av_log(s, AV_LOG_ERROR, "Audio Element parameter count %u is invalid"
+                                 " for Scene representations\n", num_parameters);
+         ret = AVERROR_INVALIDDATA;
+         goto fail;
+     }
+ 
+@@ -920,12 +962,47 @@ static int audio_element_obu(void *s, IAMFContext *c, AVIOContext *pb, int len)
+         if (ret < 0)
+             goto fail;
+     } else if (audio_element_type == AV_IAMF_AUDIO_ELEMENT_TYPE_SCENE) {
+         ret = ambisonics_config(s, pbc, audio_element, codec_config);
+         if (ret < 0)
+             goto fail;
++    } else if (audio_element_type == AV_IAMF_AUDIO_ELEMENT_TYPE_OBJECT) {
++        /* 本地补丁（2026-10-06）：对象元素没有 scalable/ambisonics config。
++         *
++         * ⚠ 但**必须建 layer**：后续代码无条件访问 `element->layers[...]`，
++         *   而 layers 只在 CHANNEL(:397) / SCENE(:544) 两条支路里分配。
++         *   我第一版在这里"什么都不做" ⇒ `layers == NULL` ⇒ 读回自己写的对象件时
++         *   **访问违例崩掉**（实测 rc=0xC0000005）—— 典型"写得出、读不回"。
++         * ⇒ 照 ambisonics_config 的建法补一个 layer（两套结构要分别设）：
++         *     · 内部 `IAMFLayer`（audio_element->layers）装 substream 计数
++         *     · 公开 `AVIAMFLayer`（element->layers）由 add_layer 分配
++         */
++        audio_element->layers = av_calloc(1, sizeof(*audio_element->layers));
++        if (!audio_element->layers) {
++            ret = AVERROR(ENOMEM);
++            goto fail;
++        }
++        audio_element->nb_layers = 1;
++        audio_element->layers->substream_count         = nb_substreams;
++        audio_element->layers->coupled_substream_count = 0;
++
++        {
++            AVIAMFLayer *layer = av_iamf_audio_element_add_layer(element);
++            if (!layer) {
++                ret = AVERROR(ENOMEM);
++                goto fail;
++            }
++            /* 对象各占一路单声道；不设 ambisonics_mode（那是 SCENE 的字段） */
++            av_channel_layout_default(&layer->ch_layout, 1);
++        }
++
++        /* 每个 substream 的 codecpar 也要标 mono —— 否则解码器报
++         * "Decoder requires channel layout to be set"（实测）。
++         * 照 ambisonics_config(:559) 的同一手法。 */
++        for (int i = 0; i < nb_substreams; i++)
++            audio_element->substreams[i].codecpar->ch_layout = (AVChannelLayout)AV_CHANNEL_LAYOUT_MONO;
+     } else {
+         av_unreachable("audio_element_type should have been checked above");
+     }
+ 
+     c->audio_elements[c->nb_audio_elements++] = audio_element;
+ 
+diff --git a/fftools/ffmpeg_mux_init.c b/fftools/ffmpeg_mux_init.c
+--- a/fftools/ffmpeg_mux_init.c
++++ b/fftools/ffmpeg_mux_init.c
+@@ -2690,12 +2690,35 @@ static int of_parse_group_token(Muxer *mux, const char *token, char *ptr)
+         ret = AVERROR(EINVAL);
+     if (ret < 0) {
+         av_log(mux, AV_LOG_ERROR, "Invalid group type \"%s\"\n", e->value);
+         goto end;
+     }
+ 
++    /*
++     * 本地补丁（2026-10-06）：把 `audio_element_type=` 摘出来单独存，并在 create 前
++     * 从字典里删掉。
++     *
++     * 两件事都必须在这里做：
++     *   ① 它必须**从传给 create 的字典里消失**。`avformat_stream_group_create()`
++     *      末尾会 `av_opt_set_dict2(stg, options, AV_OPT_SEARCH_CHILDREN)`，
++     *      字典里若有它认不得的键就 `goto fail → ff_free_stream_group → return NULL`。
++     *      `audio_element_type` 是 AVIAMFAudioElement 的选项，流组本身不认。
++     *   ② 它**在 dict 里、不在 ptr 里** —— 调用方
++     *      `token = av_strtok(str, ",", &ptr)` 先按逗号切，
++     *      所以 `...:audio_element_type=object,layer=...` 里那个键属于 token 段。
++     */
++    char *元素类型值 = NULL;
++    {
++        const AVDictionaryEntry *类型项 =
++            av_dict_get(tmp, "audio_element_type", NULL, AV_DICT_IGNORE_SUFFIX);
++        if (类型项)
++            元素类型值 = av_strdup(类型项->value);
++        if (类型项 && !元素类型值) { ret = AVERROR(ENOMEM); goto end; }
++    }
++    av_dict_set(&tmp, "audio_element_type", NULL, 0);
++
+     stg = avformat_stream_group_create(oc, type, &tmp);
+     if (!stg) {
+         ret = AVERROR(ENOMEM);
+         goto end;
+     }
+ 
+@@ -2709,14 +2732,15 @@ static int of_parse_group_token(Muxer *mux, const char *token, char *ptr)
+             goto end;
+         }
+         ret = avformat_stream_group_add_stream(stg, oc->streams[idx]);
+         if (ret < 0)
+             goto end;
+         OutputStream *ost = mux->of.streams[idx];
+-        if (ost->enc && (type == AV_STREAM_GROUP_PARAMS_IAMF_AUDIO_ELEMENT ||
+-                         type == AV_STREAM_GROUP_PARAMS_IAMF_MIX_PRESENTATION))
++        /* 本地补丁（2026-10-06）：`ost` 可能为 NULL，原来无条件 `ost->enc` 会崩。 */
++        if (ost && ost->enc && (type == AV_STREAM_GROUP_PARAMS_IAMF_AUDIO_ELEMENT ||
++                                type == AV_STREAM_GROUP_PARAMS_IAMF_MIX_PRESENTATION))
+             ost->enc->flags2 |= AV_CODEC_FLAG2_FIXED_FRAME_SIZE;
+     }
+     while (e = av_dict_get(dict, "stg", e, 0)) {
+         char *endptr;
+         int64_t idx = strtoll(e->value, &endptr, 0);
+         if (*endptr || idx < 0 || idx >= oc->nb_stream_groups - 1) {
+@@ -2730,12 +2754,28 @@ static int of_parse_group_token(Muxer *mux, const char *token, char *ptr)
+                 goto end;
+         }
+     }
+ 
+     switch(type) {
+     case AV_STREAM_GROUP_PARAMS_IAMF_AUDIO_ELEMENT:
++        /* 本地补丁（2026-10-06）：把摘出来的 `audio_element_type` 设到音频元素上。
++         *
++         * ⚠ 不能用 `av_opt_set(stg, ..., AV_OPT_SEARCH_CHILDREN)`：
++         *   实测它返回 0（"成功"）、`av_opt_get` 也能读回 2，但
++         *   `stg->params.iamf_audio_element->audio_element_type` 仍是 0 ——
++         *   SEARCH_CHILDREN 走 child_class_iterate/child_next 拿"某个子对象实例"，
++         *   未必就是 params 里这个元素。
++         *   ⇒ 直接对**元素指针**设。 */
++        if (元素类型值 && stg->params.iamf_audio_element) {
++            ret = av_opt_set(stg->params.iamf_audio_element,
++                             "audio_element_type", 元素类型值, 0);
++            if (ret < 0) {
++                av_log(mux, AV_LOG_ERROR, "Invalid audio_element_type \"%s\"\n", 元素类型值);
++                goto end;
++            }
++        }
+         ret = of_parse_iamf_audio_element_layers(mux, stg, ptr);
+         break;
+     case AV_STREAM_GROUP_PARAMS_IAMF_MIX_PRESENTATION:
+         ret = of_parse_iamf_submixes(mux, stg, ptr);
+         break;
+     default:
+@@ -2757,12 +2797,13 @@ static int of_parse_group_token(Muxer *mux, const char *token, char *ptr)
+         ret = AVERROR(EINVAL);
+         goto end;
+     }
+ 
+     ret = 0;
+ end:
++    av_free(元素类型值);
+     av_free(mapped_string);
+     av_dict_free(&dict);
+     av_dict_free(&tmp);
+ 
+     return ret;
+ }

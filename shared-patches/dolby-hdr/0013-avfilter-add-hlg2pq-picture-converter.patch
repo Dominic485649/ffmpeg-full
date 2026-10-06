@@ -1,0 +1,362 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: REPLACE-ME <you@example.com>
+Date: Tue, 06 Oct 2026 13:00:00 +0800
+Subject: [PATCH] avfilter: add hlg2pq, converting an HLG picture to PQ
+
+ST 2094-40:2020 4.4 defines the "linearized signal" that HDR10+ metadata is
+measured through as ST 2084, so the fields written by vf_hdr10plus only mean
+something to a consumer that will decode the picture with the PQ EOTF.
+
+Measuring an HLG picture on an HLG axis while leaving the stream HLG-coded
+publishes numbers into a domain the decoder does not own.  The conformant route
+converts the samples and re-tags the frame, and this filter is that conversion.
+
+It is a filter of its own rather than an option on vf_hdr10plus so that
+everything downstream of this pad sees an ordinary PQ picture -- the input that
+filter is already tested against -- instead of growing a second accepted shape.
+
+The transform follows ITU-R BT.2100-2: the HLG OETF constants, and the RGB OOTF
+whose exponent is set by the assumed reference-display peak.  Because the OOTF is
+not separable per channel the multiplier uses the pixel's own luma, so the lookup
+table carries the inverse OETF and no more.
+
+The assumed peak is an option and not a constant: the grade's reference display
+is not carried in the bitstream, and 1000 cd/m2 -- the default, the value that
+gives BT.2100's system gamma 1.2 -- has to be overridden when the material was
+graded for another display.
+
+---
+ libavfilter/Makefile     | 1 +
+ libavfilter/allfilters.c | 1 +
+ libavfilter/vf_hlg2pq.c  | 298 ++++++++++
+ 3 files changed, 300 insertions(+)
+
+diff --git a/libavfilter/Makefile b/libavfilter/Makefile
+--- a/libavfilter/Makefile
++++ b/libavfilter/Makefile
+@@ -149,6 +149,7 @@
+ OBJS-$(CONFIG_HEADPHONE_FILTER)              += af_headphone.o
+ OBJS-$(CONFIG_HIGHPASS_FILTER)               += af_biquads.o
+ OBJS-$(CONFIG_HIGHSHELF_FILTER)              += af_biquads.o
++OBJS-$(CONFIG_HLG2PQ_FILTER)                 += vf_hlg2pq.o
+ OBJS-$(CONFIG_JOIN_FILTER)                   += af_join.o
+ OBJS-$(CONFIG_LADSPA_FILTER)                 += af_ladspa.o
+ OBJS-$(CONFIG_LOUDNORM_FILTER)               += af_loudnorm.o ebur128.o
+diff --git a/libavfilter/allfilters.c b/libavfilter/allfilters.c
+--- a/libavfilter/allfilters.c
++++ b/libavfilter/allfilters.c
+@@ -320,6 +320,7 @@
+ extern const FFFilter ff_vf_hflip_vulkan;
+ extern const FFFilter ff_vf_histeq;
+ extern const FFFilter ff_vf_histogram;
++extern const FFFilter ff_vf_hlg2pq;
+ extern const FFFilter ff_vf_hqdn3d;
+ extern const FFFilter ff_vf_hqx;
+ extern const FFFilter ff_vf_hstack;
+diff --git a/libavfilter/vf_hlg2pq.c b/libavfilter/vf_hlg2pq.c
+new file mode 100644
+--- /dev/null
++++ b/libavfilter/vf_hlg2pq.c
+@@ -0,0 +1,298 @@
++/* hlg2pq: convert an HLG (ARIB STD-B67) coded picture into a PQ (ST 2084) coded picture.
++ *
++ * Why a conversion at all, and why its own filter.  ST 2094-40:2020 4.4 defines the "linearized
++ * signal" it measures through ST 2084, so HDR10+'s curve fields only mean something to a consumer
++ * that will decode the picture with the PQ EOTF.  Measuring HLG pixels on an HLG axis while
++ * leaving the stream HLG-coded would publish numbers into a domain the decoder does not own; the
++ * conformant route converts the samples and re-tags the frame.  Doing it here rather than as an
++ * option on vf_hdr10plus keeps that filter measurement-only and untouched: downstream of this pad
++ * the input is an ordinary PQ picture, which is what vf_hdr10plus already accepts, already refuses
++ * correctly, and already has 179 assertions against.
++ *
++ * The math follows ITU-R BT.2100-2 (HLG OETF constants, and the RGB OOTF whose exponent is set by
++ * the assumed reference-display peak) and is written to agree with libavutil/csp.c's
++ * eotf_arib_std_b67(), the tree's own implementation.  csp.h is an internal header and av_csp_* is
++ * not exported from the shared avutil DLL (measured here with dumpbin: zero csp symbols), so this
++ * filter cannot call it and carries its own copy - which turns "it agrees with csp.c" into a claim,
++ * so the gate compares the two tables instead of asserting it.
++ *
++ * Two properties of the OOTF shape this file, stated where the work happens:
++ *   - it is not separable per channel: the multiplier uses the pixel's own luma, so a lookup table
++ *     can carry the inverse OETF and nothing more.  Seven pow() per pixel remain - one for the luma
++ *     exponent, two inside the PQ OETF for each of the three channels - which is why this filter's
++ *     cost is measured rather than assumed.  An earlier draft of this sentence said "four", a stated
++ *     number nobody had counted; #39's gate now counts it out of the source.
++ *   - the reference display is an input, not a constant: peak 1000 cd/m2 gives BT.2100's gamma 1.2,
++ *     and the same HLG code stream against a 400 cd/m2 display yields different absolute
++ *     luminances, therefore different HDR10+ statistics.  Both options are exposed, and the log line
++ *     names the pair actually used.
++ *
++ * Not done yet, recorded rather than glossed: no slice threading (AVFILTER_FLAG_SLICE_THREADS is
++ * absent because filter_slice is not implemented), and only planar / planar-with-alpha RGB at 10
++ * and 12 bit is accepted - anything else has to be converted by the caller, not silently resampled.
++ */
++
++#include <math.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "libavutil/frame.h"
++#include "libavutil/mem.h"
++#include "libavutil/opt.h"
++#include "libavutil/pixdesc.h"
++#include "libavutil/pixfmt.h"
++
++#include "avfilter.h"
++#include "filters.h"
++#include "formats.h"
++#include "video.h"
++
++/* BT.2100-2 Table 2 constants, as spelled in libavutil/csp.c (HLG_a / HLG_b / HLG_c). */
++#define HLG_A 0.17883277
++#define HLG_B 0.28466892
++#define HLG_C 0.55991073
++
++/* ST 2084 equation 4.1, OETF direction.  c3 carries NO +1: csp.c writes PQ_c3 as 32*2392/4096 and
++ * the "+1" in the standard's note is a derivation remark, not an operation.  With +1 folded in,
++ * 1000 cd/m2 lands on code 16.82 of 1023 instead of 769.12 - silently, in a filter whose entire
++ * output is numbers.  That is what the csp-linked probe in this directory is for. */
++#define PQ_M1 (2610.0 / 16384.0)
++#define PQ_M2 (2523.0 / 4096.0 * 128.0)
++#define PQ_C1 (3424.0 / 4096.0)
++#define PQ_C2 (2413.0 / 4096.0 * 32.0)
++#define PQ_C3 (2392.0 / 4096.0 * 32.0)
++
++/* BT.2020 luma weights; they sum to exactly 1.0, which is what makes a neutral grey pixel's OOTF
++ * multiplier depend only on its own level - the anchor the gate uses. */
++#define LUMA_R 0.2627
++#define LUMA_G 0.6780
++#define LUMA_B 0.0593
++
++typedef struct HLG2PQContext {
++    const AVClass *class;
++
++    double hlg_lw;      /* assumed reference display peak,  cd/m2 */
++    double hlg_lb;      /* assumed reference display black, cd/m2 */
++
++    double  *rel;       /* code -> relative linear, black-offset blend included */
++    int      rel_depth; /* bit depth that produced rel, 0 when absent */
++    int      rel_maxval;/* code domain rel was built for, -1 when absent */
++    double   gamma;     /* OOTF system gamma for hlg_lw */
++    double   beta;      /* OOTF black term for (hlg_lb, hlg_lw) */
++    unsigned table_gen; /* bumped whenever rel is rebuilt; the gate reads this */
++} HLG2PQContext;
++
++/* BT.2100-2: gamma = max(1.2 + 0.42 log10(Lw / 1000), 1.0). */
++static double hlg_system_gamma(double Lw)
++{
++    return fmax(1.2 + 0.42 * log10(Lw / 1000.0), 1.0);
++}
++
++/* ARIB STD-B67 / BT.2100 HLG OETF inverted: signal level [0,1] -> relative linear.
++ *
++ * The 1/12 boundary of BT.2100-2 Table 2 sits on the LINEAR side, not on the signal side: the
++ * forward form is E' = sqrt(3E) for E <= 1/12, and it is continuous there because
++ * sqrt(3/12) = 0.5 = a*ln(12/12 - b) + c.  Inverting it therefore branches at E' = 0.5.
++ *
++ * Branching at 1/12 in the signal domain instead - which is what this file's first draft did,
++ * transcribing the equation as if the threshold belonged to the visible quantity - silently sends
++ * every code between 1/12 and 1/2 down the log branch: up to 202 codes of error at 10 bit, all of
++ * it in the shadows, all of it structurally valid.  It was caught by linking libavutil/csp.o and
++ * running upstream's own code against this table (csp_probe.exe / adjudicate_three_way.py), not by
++ * reading the equation. */
++static double hlg_inverse_oetf(double ep)
++{
++    if (ep <= 0.0)
++        return 0.0;
++    if (ep <= 0.5)
++        return (ep * ep) / 3.0;
++    return (exp((ep - HLG_C) / HLG_A) + HLG_B) / 12.0;
++}
++
++/* ST 2084 OETF: absolute luminance in cd/m2 -> signal level [0,1]. */
++static double pq_oetf_nits(double nit)
++{
++    double y, m;
++
++    if (nit <= 0.0)
++        return 0.0;
++    y = nit / 10000.0;
++    m = pow(y, PQ_M1);
++    return pow((PQ_C1 + PQ_C2 * m) / (1.0 + PQ_C3 * m), PQ_M2);
++}
++
++/* Rebuild the code -> relative linear table when the depth or the reference display moved.
++ * Checking before building is the cheap half of the lesson this project measured the hard way:
++ * vf_hdr10plus pays ~89 us (10 bit) and ~363 us (12 bit) per picture rebuilding tables that depend
++ * only on the code width, which is the largest fixed cost measured anywhere in this kit. */
++static int build_table(AVFilterContext *ctx, int depth)
++{
++    HLG2PQContext *s = ctx->priv;
++    const double gamma = hlg_system_gamma(s->hlg_lw);
++    const double beta  = s->hlg_lb > 0.0
++                       ? sqrt(3.0 * pow(s->hlg_lb / s->hlg_lw, 1.0 / gamma))
++                       : 0.0;
++    int maxval = (1 << depth) - 1;
++
++    if (s->rel && s->rel_depth == depth &&
++        fabs(s->gamma - gamma) < 1e-15 && fabs(s->beta - beta) < 1e-15)
++        return 0;
++
++    av_freep(&s->rel);
++    s->rel_depth  = 0;
++    s->rel_maxval = -1;
++    s->rel = av_malloc_array(maxval + 1, sizeof(*s->rel));
++    if (!s->rel)
++        return AVERROR(ENOMEM);
++
++    /* csp.c blends the black term in the signal domain: E = trc_inv((1 - beta) * E' + beta).
++     * With the usual Lb = 0, beta is exactly 0 and this reduces to the plain inverse OETF; the
++     * term is carried so that a non-zero black is honoured instead of dropped. */
++    for (int i = 0; i <= maxval; i++)
++        s->rel[i] = hlg_inverse_oetf((1.0 - beta) * (i / (double)maxval) + beta);
++
++    s->rel_depth  = depth;
++    s->rel_maxval = maxval;
++    s->gamma      = gamma;
++    s->beta       = beta;
++    s->table_gen++;
++
++    av_log(ctx, AV_LOG_INFO, "HLG reference display peak=%.1f cd/m2 black=%.6f cd/m2 -> "
++           "system gamma=%.6f, beta=%.6f, %d-entry table (generation %u, %d bit)\n",
++           s->hlg_lw, s->hlg_lb, s->gamma, s->beta, maxval + 1, s->table_gen, depth);
++    return 0;
++}
++
++static av_cold void uninit(AVFilterContext *ctx)
++{
++    HLG2PQContext *s = ctx->priv;
++
++    av_freep(&s->rel);
++    s->rel_depth  = 0;
++    s->rel_maxval = -1;
++}
++
++static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
++{
++    AVFilterContext *ctx = inlink->dst;
++    AVFilterLink *outlink = ctx->outputs[0];
++    HLG2PQContext *s = ctx->priv;
++    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(frame->format);
++    int depth, maxval, ret;
++
++    if (!desc)
++        return AVERROR_BUG;
++
++    /* The tag is the whole premise: this filter converts HLG-coded samples, so any other tag is
++     * refused in the open rather than converted on an assumption.  The message names both
++     * possibilities, because "wrongly tagged but really HLG" and "genuinely not HLG" need opposite
++     * answers and only the caller knows which one they have. */
++    if (frame->color_trc != AVCOL_TRC_ARIB_STD_B67) {
++        av_log(ctx, AV_LOG_ERROR, "input transfer is %s, not arib-std-b67 (HLG); refusing to "
++               "convert. If the picture really is HLG, fix the tag on the input "
++               "(setparams=color_trc=arib-std-b67); if it is not HLG, it needs no conversion "
++               "here.\n", av_color_transfer_name(frame->color_trc));
++        ret = AVERROR(EINVAL);
++        goto fail;
++    }
++    /* Same guard and same measured basis as the measurement filter: swscale delivers full-range
++     * RGB, so a studio-range tag here is a caller mistake, and obeying it would shift every
++     * converted code down instead of failing. */
++    if (frame->color_range == AVCOL_RANGE_MPEG) {
++        av_log(ctx, AV_LOG_ERROR, "input is studio-range RGB; expand it first "
++               "(scale=out_range=pc) or every converted code would be low\n");
++        ret = AVERROR(EINVAL);
++        goto fail;
++    }
++
++    depth  = desc->comp[0].depth;
++    maxval = (1 << depth) - 1;
++
++    ret = build_table(ctx, depth);
++    if (ret < 0)
++        goto fail;
++
++    /* In place: the OOTF needs all three channels of a pixel before any of them can be written, so
++     * a streaming per-plane pass is impossible regardless of allocation.  make_writable gives a
++     * private buffer whenever somebody else still shares this one. */
++    ret = av_frame_make_writable(frame);
++    if (ret < 0)
++        goto fail;
++
++    for (int y = 0; y < frame->height; y++) {
++        uint16_t *pg = (uint16_t *)(frame->data[0] + (ptrdiff_t)y * frame->linesize[0]);
++        uint16_t *pb = (uint16_t *)(frame->data[1] + (ptrdiff_t)y * frame->linesize[1]);
++        uint16_t *pr = (uint16_t *)(frame->data[2] + (ptrdiff_t)y * frame->linesize[2]);
++
++        for (int x = 0; x < frame->width; x++) {
++            /* The mask is the picture's own code width, never a constant: samples may carry bits
++             * above it, and at 12 bit a hard 0x3FF would silently divide every level by four while
++             * still producing a frame that encodes, decodes and passes every check downstream. */
++            const double er = s->rel[pr[x] & maxval];
++            const double eg = s->rel[pg[x] & maxval];
++            const double eb = s->rel[pb[x] & maxval];
++            const double luma = LUMA_R * er + LUMA_G * eg + LUMA_B * eb;
++            double k;
++
++            if (luma <= 0.0) {
++                pg[x] = pb[x] = pr[x] = 0;
++                continue;
++            }
++            /* OOTF: each channel scales by Lw * luma^(gamma - 1), which for a neutral grey lands
++             * on Lw * e^gamma - the point the gate checks against csp.c. */
++            k = s->hlg_lw * pow(luma, s->gamma - 1.0);
++            pg[x] = (uint16_t)av_clip64(llround(pq_oetf_nits(k * eg) * maxval), 0, maxval);
++            pb[x] = (uint16_t)av_clip64(llround(pq_oetf_nits(k * eb) * maxval), 0, maxval);
++            pr[x] = (uint16_t)av_clip64(llround(pq_oetf_nits(k * er) * maxval), 0, maxval);
++        }
++    }
++
++    /* The samples are PQ now, so the tag has to follow: otherwise vf_hdr10plus will (correctly)
++     * refuse this frame, and any decoder downstream would apply the wrong EOTF to pixels we just
++     * changed. */
++    frame->color_trc = AVCOL_TRC_SMPTE2084;
++
++    return ff_filter_frame(outlink, frame);
++
++fail:
++    av_frame_free(&frame);
++    return ret;
++}
++
++static const AVFilterPad hlg2pq_inputs[] = {
++    {
++        .name         = "default",
++        .type         = AVMEDIA_TYPE_VIDEO,
++        .filter_frame = filter_frame,
++    },
++};
++
++#define OFFSET(x) offsetof(HLG2PQContext, x)
++#define FLAGS (AV_OPT_FLAG_FILTERING_PARAM | AV_OPT_FLAG_VIDEO_PARAM)
++
++static const AVOption hlg2pq_options[] = {
++    { "hlg_lw", "assumed HLG reference display peak luminance in cd/m2 "
++                "(1000 gives BT.2100's system gamma 1.2)",
++      OFFSET(hlg_lw), AV_OPT_TYPE_DOUBLE, { .dbl = 1000 }, 100, 10000, FLAGS },
++    { "hlg_lb", "assumed HLG reference display black luminance in cd/m2 "
++                "(0 leaves the OOTF's black term unused)",
++      OFFSET(hlg_lb), AV_OPT_TYPE_DOUBLE, { .dbl = 0 }, 0, 100, FLAGS },
++    { NULL }
++};
++
++AVFILTER_DEFINE_CLASS(hlg2pq);
++
++const FFFilter ff_vf_hlg2pq = {
++    .p.name        = "hlg2pq",
++    .p.description = NULL_IF_CONFIG_SMALL("Convert an HLG (ARIB STD-B67) coded picture to a PQ "
++                                          "(ST 2084) coded picture."),
++    .p.priv_class  = &hlg2pq_class,
++    /* Deliberately no AVFILTER_FLAG_METADATA_ONLY: this filter rewrites every sample, and that
++     * flag is the framework's permission to hand the same buffer onward unchanged. */
++    .priv_size     = sizeof(HLG2PQContext),
++    .uninit        = uninit,
++    FILTER_INPUTS(hlg2pq_inputs),
++    FILTER_OUTPUTS(ff_video_default_filterpad),
++    FILTER_PIXFMTS(AV_PIX_FMT_GBRP10LE, AV_PIX_FMT_GBRAP10LE,
++                   AV_PIX_FMT_GBRP12LE, AV_PIX_FMT_GBRAP12LE),
++};
+-- 
+2.0.0 (generator: upstream-kit/make_0013.py)
+
+Signed-off-by: REPLACE-ME <REPLACE-ME>

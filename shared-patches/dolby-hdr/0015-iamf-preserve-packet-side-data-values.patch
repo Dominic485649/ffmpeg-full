@@ -1,0 +1,51 @@
+diff --git a/libavcodec/packet.h b/libavcodec/packet.h
+--- a/libavcodec/packet.h
++++ b/libavcodec/packet.h
+@@ -320,23 +320,6 @@
+     AV_PKT_DATA_IAMF_RECON_GAIN_INFO_PARAM,
+ 
+     /**
+-     * 本地补丁（2026-10-06）：IAMF v2.0.0 的**位置参数**（6 种）各占一个 side-data 类型。
+-     * metadata 形式为 AVIAMFParamDefinition，其 `type` 决定子块语义：
+-     *   AV_IAMF_PARAMETER_DEFINITION_POLAR / CART8 / CART16 /
+-     *   DUAL_POLAR / DUAL_CART8 / DUAL_CART16
+-     * 子块统一是 AVIAMFPolarParamSubblock。位流见 iamf-tools 的 *_position_data.cc。
+-     *
+-     * ⚠ 加在**最后一个 IAMF 项之后、非 IAMF 项之前**：这一段取值会顺移，
+-     *   任何按数值硬编码 AV_PKT_DATA_* 的下游都会受影响（本树内已核：没有）。
+-     */
+-    AV_PKT_DATA_IAMF_POLAR_POSITION_PARAM,
+-    AV_PKT_DATA_IAMF_CART8_POSITION_PARAM,
+-    AV_PKT_DATA_IAMF_CART16_POSITION_PARAM,
+-    AV_PKT_DATA_IAMF_DUAL_POLAR_POSITION_PARAM,
+-    AV_PKT_DATA_IAMF_DUAL_CART8_POSITION_PARAM,
+-    AV_PKT_DATA_IAMF_DUAL_CART16_POSITION_PARAM,
+-
+-    /**
+      * Ambient viewing environment metadata, as defined by H.274. This metadata
+      * should be associated with a video stream and contains data in the form
+      * of the AVAmbientViewingEnvironment struct.
+@@ -408,6 +391,23 @@
+      * If its value becomes huge, some code using it
+      * needs to be updated as it assumes it to be smaller than other limits.
+      */
++    /**
++     * 本地补丁（2026-10-06）：IAMF v2.0.0 的**位置参数**（6 种）各占一个 side-data 类型。
++     * metadata 形式为 AVIAMFParamDefinition，其 `type` 决定子块语义：
++     *   AV_IAMF_PARAMETER_DEFINITION_POLAR / CART8 / CART16 /
++     *   DUAL_POLAR / DUAL_CART8 / DUAL_CART16
++     * 子块统一是 AVIAMFPolarParamSubblock。位流见 iamf-tools 的 *_position_data.cc。
++     *
++     * ⚠ 加在**最后一个 IAMF 项之后、非 IAMF 项之前**：这一段取值会顺移，
++     *   任何按数值硬编码 AV_PKT_DATA_* 的下游都会受影响（本树内已核：没有）。
++     */
++    AV_PKT_DATA_IAMF_POLAR_POSITION_PARAM,
++    AV_PKT_DATA_IAMF_CART8_POSITION_PARAM,
++    AV_PKT_DATA_IAMF_CART16_POSITION_PARAM,
++    AV_PKT_DATA_IAMF_DUAL_POLAR_POSITION_PARAM,
++    AV_PKT_DATA_IAMF_DUAL_CART8_POSITION_PARAM,
++    AV_PKT_DATA_IAMF_DUAL_CART16_POSITION_PARAM,
++
+     AV_PKT_DATA_NB
+ };
+ 

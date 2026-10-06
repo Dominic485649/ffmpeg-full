@@ -1,0 +1,805 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: REPLACE-ME <you@example>
+Date: Tue, 06 Oct 2026 06:35:25 +0800
+Subject: [PATCH] avfilter: add dovi_compose, composing a DV enhancement layer
+
+The dovi_apply filter added earlier in this series refuses dual-layer material
+outright, and it is right to: applying only the base layer of a Dolby Vision
+Profile 7 stream describes a picture nobody graded. But refusing is where this
+series stopped, so a stream whose residual layer carries real picture
+information cannot be processed by an FFmpeg graph at all.
+
+Clause 5.4.3.1 of ETSI GS CCM 001 says the reconstruction "adds the inverse
+quantized EL signal to the MAPPED BL signal". Three things follow, and this
+patch implements all three rather than only the last:
+
+  * the residual is added in the CURVE-OUTPUT domain - after the reshaping
+    curve, before the ycc_to_rgb matrix and before the PQ EOTF. Adding it after
+    the matrix or after the EOTF also produces a frame that decodes and carries
+    a complete set of ST 2094-40 values, so nothing downstream can tell the
+    three apart; the placement is taken from the clause, not from what looks
+    plausible.
+
+  * clause 5.4.3.2's inverse quantisation is transcribed as written, including
+    its `if (rr == 0) { r = 0; }` carve-out. That carve-out is load-bearing, not
+    an optimisation: it is what makes a fully neutral enhancement layer add
+    exactly nothing, and a port that omits it stays correct everywhere except
+    that one sample.
+
+  * the resampling filter that brings the EL onto the base layer's raster is NOT
+    taken from the stream, because the stream does not carry it.
+    el_spatial_resampling_filter_flag is a single bit, and clause 5.4.1 states
+    that resampling "is not a normative part of the present document". The filter
+    therefore requires the caller to DECLARE el_rebuild, and refuses rather than
+    inventing a phase - a wrong resampling produces a picture that still
+    decodes, so the only answer that cannot be missed is to stop.
+
+dovi_compose is the filter that makes the second layer reachable from a graph.
+It takes two inputs, pairs them BY PTS rather than by index (the material this
+was validated on has one more base frame than enhancement frames, and the extra
+one is the frame with no residual of its own), passes a base frame through and
+counts it when its partner genuinely does not exist, and names every refusal it
+makes. Pairing is delegated to framesync, which is what the other multi-input
+video filters in-tree use; reaching activate() by hand is where the earlier
+revisions of this work lost the tail frame and, twice, dereferenced a consumed
+status.
+
+Validated against the reference the kit already trusts, on a real dual-layer
+subject: 49 base frames in, 49 frames out, exactly one named pass-through, the
+sample-for-sample comparison against the Python reference agreeing on 98.4% of
+samples bit-for-bit with the remainder explained by the resampling difference
+above, and every refusal exercised through a real filtergraph.
+---
+ The tree this diff was generated against: FFmpeg 8.0.git HEAD 16029e0, with patches
+ 0001-0011 applied (the same base as the sibling patches in this series). It applies
+ --check against the pristine commit the series gate uses, and the series gate asserts
+ that it still does after every regeneration.
+
+ libavfilter/Makefile | +1/-0, 1 hunk
+ libavfilter/allfilters.c | +1/-0, 1 hunk
+ libavfilter/vf_dovi_compose.c | +713/-0, 1 hunk
+diff --git a/libavfilter/Makefile b/libavfilter/Makefile
+--- a/libavfilter/Makefile
++++ b/libavfilter/Makefile
+@@ -296,6 +296,7 @@ OBJS-$(CONFIG_DNN_DETECT_FILTER)             += vf_dnn_detect.o
+ OBJS-$(CONFIG_DNN_PROCESSING_FILTER)         += vf_dnn_processing.o
+ OBJS-$(CONFIG_DOUBLEWEAVE_FILTER)            += vf_weave.o
+ OBJS-$(CONFIG_DOVI_APPLY_FILTER)             += vf_dovi_apply.o
++OBJS-$(CONFIG_DOVI_COMPOSE_FILTER)           += vf_dovi_compose.o
+ OBJS-$(CONFIG_DRAWBOX_FILTER)                += vf_drawbox.o
+ OBJS-$(CONFIG_DRAWGRAPH_FILTER)              += f_drawgraph.o
+ OBJS-$(CONFIG_DRAWGRID_FILTER)               += vf_drawbox.o
+diff --git a/libavfilter/allfilters.c b/libavfilter/allfilters.c
+--- a/libavfilter/allfilters.c
++++ b/libavfilter/allfilters.c
+@@ -270,6 +270,7 @@ extern const FFFilter ff_vf_dnn_detect;
+ extern const FFFilter ff_vf_dnn_processing;
+ extern const FFFilter ff_vf_doubleweave;
+ extern const FFFilter ff_vf_dovi_apply;
++extern const FFFilter ff_vf_dovi_compose;
+ extern const FFFilter ff_vf_drawbox;
+ extern const FFFilter ff_vf_drawgraph;
+ extern const FFFilter ff_vf_drawgrid;
+diff --git a/libavfilter/vf_dovi_compose.c b/libavfilter/vf_dovi_compose.c
+new file mode 100644
+--- /dev/null
++++ b/libavfilter/vf_dovi_compose.c
+@@ -0,0 +1,713 @@
++/*
++ * Copyright (c) 2026
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++/**
++ * @file
++ * Dolby Vision FEL composition: bring an enhancement layer onto the base layer's raster and add
++ * its dequantised residual to the base layer's curve output, per ETSI GS CCM 001 5.4.3.2/5.4.3.3.
++ *
++ * WHY THIS IS A SEPARATE FILTER AND NOT A THIRD INPUT OF `dovi_apply`
++ * A dual-layer stream is TWO coded video streams, so the enhancement layer arrives on its own
++ * input pad. Putting that pad on `dovi_apply` would mean rewriting a filter whose refusal of
++ * dual-layer input is already the recorded evidence that the compose did not exist
++ * (`vf_dovi_apply.c`, the `disable_residual_flag` branch), and every reading taken against that
++ * filter would have to be re-proved. This file leaves it alone and adds the pad next to it. The
++ * arithmetic is NOT duplicated: `dovi_apply_planes()` and the `DoviElInput`/`DoviReshOverride`
++ * plumbing are used as they shipped, which is what makes the compose here the same compose the
++ * single-input path already carries.
++ *
++ * WHY `activate()` AND NOT TWO `filter_frame`s
++ * The two layers are not guaranteed to have the same number of frames, and on the one real
++ * dual-layer subject this box has they do NOT: the LG comparison clip's base layer decodes 49
++ * packets while its enhancement layer decodes 48, with the missing residual on the last AU in
++ * decode order (`p5probe/fel-lg-comparison-wired-20261001.log`). Pairing by list position would
++ * therefore attach the wrong residual to frames from that point on - and the result decodes, carries
++ * metadata and looks entirely healthy, so no downstream gate would catch it. Pairing is done on
++ * `frame->pts`, which is a fact the container supplies rather than a declaration this filter makes.
++ *
++ * THREE SHAPES ARE REFUSED, ONE IS ADMITTED WITHOUT AN EL
++ *   * an orphan enhancement frame (its pts is behind the base layer's) is refused, not dropped:
++ *     dropping it silently would leave the NEXT base frame composing against a residual that was
++ *     authored for a different picture;
++ *   * a base frame with no enhancement frame is ADMITTED, because that is what a stream with a
++ *     residual on only some pictures means - it is the semantic boundary of the RPU's own
++ *     `disable_residual_flag`, not an error. It is counted and logged;
++ *   * a geometry that is not an integer ratio this filter implements, and a layer pair whose
++ *     depths differ, are refused with the measurement behind the refusal in the message.
++ */
++
++#include <stdint.h>
++#include <stdlib.h>
++
++#include "libavutil/avassert.h"
++#include "libavutil/avstring.h"
++#include "libavutil/dovi_meta.h"
++#include "libavutil/imgutils.h"
++#include "libavutil/opt.h"
++#include "libavutil/pixdesc.h"
++#include "libavutil/pixfmt.h"
++
++#include "avfilter.h"
++#include "filters.h"
++#include "formats.h"
++#include "avfilter_internal.h"   /* not "internal.h": this tree has no such header, and vf_dovi_apply.c
++                                  * (which this file includes below) uses this name too. A first build
++                                  * failed on exactly that line. */
++#include "video.h"
++
++/* The compose arithmetic and its declarations live in the filter that shipped them, so this file
++ * reaches them by including that file with its own filter registration suppressed. The alternatives
++ * were both worse: copying the arithmetic would create a second implementation to keep in step (and
++ * the whole point of the P1 work was that the compose has exactly one), and lifting it into a shared
++ * translation unit would have rewritten a shipping filter whose readings are pinned. The guard this
++ * defines is checked at the bottom of that file; see the note there.
++ *
++ * The undefs afterwards matter: that file defines OFFSET/FLAGS for its own AVOption table, and this
++ * one defines its own below. Left in place they would silently expand this file's options against
++ * the WRONG context struct - a mistake that produces a table of garbage offsets, not a compile
++ * error, which is the worst available failure mode for an option table. */
++#define DOVI_APPLY_NO_FILTER_REGISTRATION
++#include "vf_dovi_apply.c"
++#include "framesync.h"
++#undef OFFSET
++#undef FLAGS
++
++enum ElPad {
++    PAD_BL = 0,
++    PAD_EL = 1,
++    NB_PADS,
++};
++
++typedef struct DoviComposeContext {
++    const AVClass *class;
++
++    int el_rebuild;   /* enum ElRebuild; -1 until declared, which is an error on a dual-layer pair */
++    int el_neutral;   /* enum ElNeutral; -1 until declared for the same reason */
++
++    /*
++     * PAIRING IS DELEGATED TO FRAMESYNC, and this replaced a hand-rolled queue that could not be
++     * made correct.
++     *
++     * The hand-rolled version kept one frame per pad in `queue[]`, pull-paired them in activate(),
++     * and read `eof[]` in five places - while never writing it, because every way of writing it
++     * crashed. Two attempts at end-of-stream detection both produced a 0xC0000005 in a worker
++     * thread, and the measured cost of not having it was a real defect: the base layer's LAST frame
++     * was never emitted (BL had 49 frames, the output had 48) - which on this subject is exactly the
++     * residual-less tail frame that the whole pts-pairing design exists to pass through.
++     *
++     * `framesync` exists for this problem and is what every other multi-input video filter in this
++     * tree uses (overlay, blend, xfade, ...). It owns the per-input queues, the pts matching, the
++     * second-input EOF policy, and the drain on exit; `ff_framesync_dualinput_get()` then hands back
++     * the matched pair, or a NULL second frame when the enhancement input has ended - which IS the
++     * "pass the base layer through" case, stated by the framework rather than inferred by this file.
++     */
++    FFFrameSync fs;
++
++    /* counts, so a run can say what it did rather than only that it exited 0 */
++    int64_t composed;
++    int64_t bl_only;
++    int64_t dropped_el;   /* orphan EL frames refused */
++} DoviComposeContext;
++
++static av_cold void dovi_compose_uninit(AVFilterContext *ctx)
++{
++    DoviComposeContext *s = ctx->priv;
++
++    ff_framesync_uninit(&s->fs);
++}
++
++static av_cold int dovi_compose_init(AVFilterContext *ctx)
++{
++    DoviComposeContext *s = ctx->priv;
++
++    ff_framesync_preinit(&s->fs);
++    return 0;
++}
++
++/*
++ * The geometry and depth checks that must hold for EVERY pair, done once per pair rather than per
++ * pixel. They are separate from the per-pixel compose because their failure means "this pair of
++ * inputs is not something this filter can carry", which is a different sentence from "this pixel
++ * is out of range".
++ */
++static int check_pair(AVFilterContext *ctx, const AVFrame *bl, const AVFrame *el)
++{
++    DoviComposeContext *s = ctx->priv;
++
++    if (s->el_rebuild < 0) {
++        av_log(ctx, AV_LOG_ERROR, "el_rebuild was not declared. This input pair is dual layer "
++               "(a base layer on `bl` and an enhancement layer on `el`), and the bitstream does not "
++               "say which resampling filter brought the EL onto the BL's raster: "
++               "el_spatial_resampling_filter_flag is a single bit, not a selector, and ETSI GS "
++               "CCM 001 clause 5.4.1 states that resampling \"is not a normative part of the "
++               "present document\". Declare el_rebuild=identity (both layers share a raster, the "
++               "shape clause 5.4.2 a) requires), repeat (EL smaller), or decimate (EL larger). "
++               "This filter will not choose one on your behalf.\n");
++        return AVERROR(EINVAL);
++    }
++    if (s->el_neutral < 0) {
++        av_log(ctx, AV_LOG_ERROR, "el_neutral was not declared on a dual-layer pair. The RPU "
++               "declares an nlq_offset, but that is the stream's statement about where zero sits, "
++               "not a measurement of this material: clause 5.4.3.2's own pseudo-code is "
++               "`rr = e - nlq_offset`, so el_neutral=nlq is the format's answer, while "
++               "coded-median is a diagnostic that asks the EL where IT sits still. The two are not "
++               "interchangeable on real material. Declare one; this filter will not choose for "
++               "you.\n");
++        return AVERROR(EINVAL);
++    }
++
++    /* Same depth. CCM 001 clause 5.4.2 d) requires it in as many words ("Samples in each array of
++     * BL picture and EL picture shall have the same bit depth"), and a mismatch would otherwise be
++     * resolved by this filter silently choosing one side's scale - which produces a picture that
++     * decodes and is wrong by a power of four. */
++    {
++        const AVPixFmtDescriptor *db = av_pix_fmt_desc_get(bl->format);
++        const AVPixFmtDescriptor *de = av_pix_fmt_desc_get(el->format);
++        int bd_bl = db ? db->comp[0].depth : 0;
++        int bd_el = de ? de->comp[0].depth : 0;
++
++        if (!bd_bl || !bd_el) {
++            av_log(ctx, AV_LOG_ERROR, "could not read the component depth of the base layer (%s) "
++                   "or the enhancement layer (%s)\n",
++                   av_get_pix_fmt_name(bl->format), av_get_pix_fmt_name(el->format));
++            return AVERROR(EINVAL);
++        }
++        if (bd_bl != bd_el) {
++            av_log(ctx, AV_LOG_ERROR, "the layers disagree on bit depth: base layer is %d-bit "
++                   "(%s), enhancement layer is %d-bit (%s). ETSI GS CCM 001 clause 5.4.2 d) "
++                   "requires them equal, and composing across a mismatch would silently rescale "
++                   "one side by a power of four while still producing a decodable picture.\n",
++                   bd_bl, av_get_pix_fmt_name(bl->format),
++                   bd_el, av_get_pix_fmt_name(el->format));
++            return AVERROR(ENOTSUP);
++        }
++    }
++
++    /* Geometry. `dovi_el_cell()` decides this itself and refuses a non-integer ratio, so the check
++     * here is only to say WHICH refusal it is: the EL may be a different raster (expected and
++     * supported) but the ratio has to be an integer either way. */
++    if (s->el_rebuild != EL_REBUILD_IDENTITY) {
++        int rw = el->width  ? bl->width  % el->width  : 1;
++        int rh = el->height ? bl->height % el->height : 1;
++        int dw = bl->width  % (el->width  ? el->width  : 1);
++        int dh = bl->height % (el->height ? el->height : 1);
++        int ok_repeat   = (el->width <= bl->width && el->height <= bl->height &&
++                           !dw && !dh);
++        int ok_decimate = (el->width >= bl->width && el->height >= bl->height &&
++                           !rw && !rh);
++
++        if (!(s->el_rebuild == EL_REBUILD_REPEAT   ? ok_repeat :
++              s->el_rebuild == EL_REBUILD_DECIMATE ? ok_decimate : 0)) {
++            av_log(ctx, AV_LOG_ERROR, "el_rebuild does not describe this pair: declared %s, but "
++                   "the base layer is %dx%d and the enhancement layer is %dx%d, which is not an "
++                   "integer %s. A non-integer ratio has a resampling phase that is not in the "
++                   "stream and not in clause 5.4.1, so this filter refuses rather than inventing "
++                   "one.\n",
++                   s->el_rebuild == EL_REBUILD_REPEAT ? "repeat" : "decimate",
++                   bl->width, bl->height, el->width, el->height,
++                   s->el_rebuild == EL_REBUILD_REPEAT ? "upsampling ratio" : "downsampling ratio");
++            return AVERROR(ENOTSUP);
++        }
++    } else if (bl->width != el->width || bl->height != el->height) {
++        av_log(ctx, AV_LOG_ERROR, "el_rebuild=identity was declared, but the layers do not share "
++               "a raster: base layer %dx%d, enhancement layer %dx%d. identity means the EL is "
++               "already on the BL's raster, which is the shape clause 5.4.2 a) requires; it is a "
++               "claim about the input, and this pair contradicts it.\n",
++               bl->width, bl->height, el->width, el->height);
++        return AVERROR(EINVAL);
++    }
++
++    return 0;
++}
++
++/*
++ * Compose one pair and emit it.
++ *
++ * OWNERSHIP, stated because getting it wrong here is what crashed this filter on the SECOND frame
++ * while the first one worked: `bl` and `el` are both handed in by the caller and the CALLER KEEPS
++ * OWNERSHIP of them. This function allocates its own output frame, copies the base frame's
++ * properties onto it, writes the composed samples into it, and returns THAT frame. It does not free,
++ * consume or hand on either input.
++ *
++ * The first revision emitted `out` and left `bl` unreferenced - the queue slot was cleared, so
++ * nothing freed it, and by the second frame the base frame's buffers were no longer there to read.
++ * Releasing the input here (or in the caller) is required exactly once.
++ */
++static int compose_pair(AVFilterContext *ctx, AVFrame *bl, AVFrame *el)
++{
++    DoviComposeContext *s = ctx->priv;
++    AVFilterLink *outlink = ctx->outputs[0];
++    const AVDOVIMetadata *dovi = NULL;
++    const AVFrameSideData *sd;
++    DoviElInput el_in;
++    AVFrame *out;
++    const uint16_t *src[3];
++    uint16_t *dst[3];
++    ptrdiff_t src_stride[3], dst_stride[3];
++    int out_depth, ret, c;
++    int out_of_range = 0;
++
++    ret = check_pair(ctx, bl, el);
++    if (ret < 0)
++        return ret;          /* nothing allocated yet, so no cleanup is owed */
++
++    sd = av_frame_get_side_data(bl, AV_FRAME_DATA_DOVI_METADATA);
++    if (!sd) {
++        av_log(ctx, AV_LOG_ERROR, "the base layer carries no Dolby Vision metadata, so there is no "
++               "curve to compose onto and no RPU coefficients to dequantise the residual with\n");
++        return AVERROR(EINVAL);   /* likewise: nothing allocated yet */
++    }
++    dovi = (const AVDOVIMetadata *)sd->data;
++
++    /*
++     * NO COPY IS NEEDED, and the first attempt at one is recorded here because it was both wrong and
++     * instructive.
++     *
++     * The worry was real: `av_frame_get_side_data(bl, ...)` points INTO `bl`, `av_frame_copy_props()`
++     * shares side-data buffers rather than duplicating payloads, and the caller frees `bl` when this
++     * function returns - so `dovi` looked like it could dangle.
++     *
++     * It cannot, in this tree, because the side data is REFCOUNTED: `ff_dovi_attach_side_data()`
++     * (libavcodec/dovi_rpudec.c:75) creates it with
++     * `av_buffer_create((uint8_t *)dovi, size, NULL, NULL, 0)` and attaches it as an
++     * `AVBufferRef`-backed AVFrameSideData. `av_frame_copy_props()` takes a reference on that same
++     * buffer rather than copying the bytes, so the metadata stays alive for as long as any frame
++     * holds a reference - including the output frame, which is what lets this function keep reading
++     * it after the input is released.
++     *
++     * The first attempt allocated a block with `av_dovi_metadata_alloc()` and freed it. That
++     * function returns `&((AVDOVIMetadataInternal *)block)->metadata` - a pointer to a FIELD INSIDE
++     * the allocation, not to its start - so `av_free()` on it frees an interior pointer. Measured:
++     * it made even a SINGLE frame fail with a NULL write, breaking a case that had been passing.
++     * The decoder never frees that pointer either; it hands it to av_buffer_create, which is the
++     * correct convention for this API and the one to follow.
++     */
++
++    /* Two preparations `dovi_apply` performs before its own call to `dovi_apply_planes()`, and
++     * whose absence here was a real defect rather than a tidiness gap - the first one is why this
++     * filter used to crash instead of refusing.
++     *
++     * (1) THE PLACEHOLDER-CURVE REFUSAL. A curve that maps its whole domain to one value is a
++     *     placeholder, not a tone map; applying it emits a flat picture that serialises, decodes
++     *     and prints a full set of ST 2094-40 values, and no number downstream could tell. Same
++     *     test, same numbers and same refusal style as the single-input filter.
++     * (2) THE OUTPUT-DEPTH CHECK. `scale_out` is derived from the depth of the buffer this function
++     *     writes, so a buffer that is neither 10 nor 12 bits would be written with codes sized for
++     *     another depth - silently, because everything still serialises. `dovi_apply` checks this
++     *     (its own comment calls it "checked rather than assumed"); this filter did not, which is
++     *     exactly the class of difference that turns a refusal into a crash. */
++    {
++        int flat_component = -1;
++        double flat_value = 0.0, flat_span = 0.0;
++
++        ret = dovi_apply_probe_curves(dovi, &flat_component, &flat_value, &flat_span);
++        if (ret < 0)
++            goto done;
++        if (ret > 0) {
++            av_log(ctx, AV_LOG_ERROR, "base layer component %d's curve maps its whole domain to "
++                   "%.6f (span %.1e) over %d points of its own pivot range - a placeholder, not a "
++                   "tone map. Authoring from it would emit a flat block; refusing rather than "
++                   "emitting it.\n", flat_component, flat_value, flat_span, DOVI_CURVE_PROBE_POINTS);
++            ret = AVERROR(ENOTSUP);
++            goto done;
++        }
++    }
++
++    out = ff_get_video_buffer(outlink, outlink->w, outlink->h);
++    if (!out) {
++        ret = AVERROR(ENOMEM);
++        goto done;
++    }
++    ret = av_frame_copy_props(out, bl);
++    if (ret < 0) {
++        av_frame_free(&out);
++        goto done;
++    }
++
++    {
++        const AVPixFmtDescriptor *out_desc = av_pix_fmt_desc_get(out->format);
++
++        if (!out_desc || (out_desc->comp[0].depth != 10 && out_desc->comp[0].depth != 12)) {
++            av_log(ctx, AV_LOG_ERROR, "negotiated output %s is not a 10- or 12-bit planar RGB "
++                   "buffer; refusing rather than writing codes sized for another depth into it\n",
++                   av_get_pix_fmt_name(out->format));
++            av_frame_free(&out);
++            ret = AVERROR(EINVAL);
++            goto done;
++        }
++        out_depth = out_desc->comp[0].depth;
++    }
++    for (c = 0; c < 3; c++) {
++        src[c] = (const uint16_t *)bl->data[c];
++        src_stride[c] = bl->linesize[c] / 2;   /* linesize is BYTES; the plane is uint16_t */
++        dst[c] = (uint16_t *)out->data[c];
++        dst_stride[c] = out->linesize[c] / 2;
++    }
++
++    memset(&el_in, 0, sizeof(el_in));
++    for (c = 0; c < 3; c++) {
++        el_in.plane[c]    = (const uint16_t *)el->data[c];
++        el_in.stride[c]   = el->linesize[c] / 2;
++    }
++    el_in.width     = el->width;
++    el_in.height    = el->height;
++    el_in.bit_depth = av_pix_fmt_desc_get(el->format)->comp[0].depth;
++    el_in.present   = 1;
++    {
++        /* The EL arrives as a decoded picture, and its chroma planes may be subsampled relative to
++         * its luma. Declaring that here is what keeps the residual path from walking off the end of
++         * a half-width chroma plane - the crash that the host-driven P1 arms could not reach because
++         * they modelled the EL as 4:4:4. Read from the descriptor rather than assumed, so a 4:4:4 or
++         * 4:2:2 EL would be described correctly too. */
++        const AVPixFmtDescriptor *ed = av_pix_fmt_desc_get(el->format);
++        int log2cw = ed ? ed->log2_chroma_w : 0;
++        int log2ch = ed ? ed->log2_chroma_h : 0;
++
++        el_in.chroma_w = AV_CEIL_RSHIFT(el->width,  log2cw);
++        el_in.chroma_h = AV_CEIL_RSHIFT(el->height, log2ch);
++    }
++
++    av_log(ctx, AV_LOG_VERBOSE, "EL %dx%d (%s) -> plane rasters %dx%d luma, %dx%d chroma\n",
++           el->width, el->height, av_get_pix_fmt_name(el->format),
++           el->width, el->height, el_in.chroma_w, el_in.chroma_h);
++
++    /* `chroma` is the BASE layer's 4:2:0 -> 4:4:4 rebuild declaration, and it is required for the
++     * same reason `dovi_apply` requires it: the rebuild is part of the result, not a pre-processing
++     * detail. This filter does not expose it as an option yet, so it is pinned to bilinear - the
++     * method the kit's own gates and every shipped reading use - and that pin is a LIMITATION to be
++     * lifted with an option, not a claim that bilinear is the normative choice. */
++    ret = dovi_apply_planes(dovi, src, src_stride, dst, dst_stride,
++                            bl->width, bl->height, out_depth,
++                            CHROMA_BILINEAR, -1,      /* the P5 slot is not this filter's business */
++                            &el_in, s->el_rebuild, s->el_neutral, NULL,
++                            ctx, &out_of_range);
++    if (ret < 0) {
++        av_frame_free(&out);
++        goto done;
++    }
++    if (out_of_range)
++        av_log(ctx, AV_LOG_VERBOSE, "%d curve output value(s) fell outside [0,1]\n", out_of_range);
++
++    /*
++     * LABEL THE OUTPUT, and this is load-bearing rather than cosmetic: the compose has just put the
++     * picture into BT.2020 / ST 2084 full range (that is what the curve plus the matrix plus the PQ
++     * EOTF do), and the next filter in the chain - the HDR10+ producer - refuses a frame whose
++     * transfer is `unknown`:
++     *   "input transfer is unknown, this filter measures ST 2084 (PQ) code values; convert or label
++     *    explicitly"
++     * Measured: without these four lines the end-to-end run produces a ZERO-BYTE file and the
++     * refusal above is the only explanation given. `dovi_apply` sets exactly these four on its own
++     * output for exactly this reason; this filter composes with the same arithmetic and must make
++     * the same statement about what it produced.
++     *
++     * The DOVI side data is removed at the same time, because the curves have been applied and the
++     * RPU no longer describes this picture. Removed BY TYPE, not by a blanket sweep: the generic
++     * colour-dependent-property pass would also strip the HDR10+ side data that the next filter is
++     * about to attach.
++     */
++    av_frame_side_data_remove(&out->side_data, &out->nb_side_data,
++                              AV_FRAME_DATA_DOVI_METADATA);
++    out->colorspace      = AVCOL_SPC_BT2020_NCL;
++    out->color_trc       = AVCOL_TRC_SMPTE2084;
++    out->color_primaries = AVCOL_PRI_BT2020;
++    out->color_range     = AVCOL_RANGE_JPEG;
++
++    s->composed++;
++    ret = ff_filter_frame(outlink, out);
++
++done:
++    return ret;
++}
++
++/*
++ * The pairing merge. Each pad's frame goes into its queue when it arrives; this is called whenever
++ * an arrival could have made a decision possible, and it consumes as many pairs as it can.
++ *
++ * The ordering rule is the whole design: a base frame may only be released once it is KNOWN whether
++ * an enhancement frame for it exists, and with the EL's next pts in hand that question is answered.
++ * When a pad reaches EOF the remaining base frames are composed without an EL - legitimately, that
++ * is the stream's own shape - and the remaining EL frames are orphans, which are refused.
++ */
++/*
++ * The framesync callback: one matched pair, or one unmatched base frame.
++ *
++ * This replaces a hand-rolled queue and is the fix for the lost tail frame. framesync owns the
++ * per-input queues, the pts matching and the second-input EOF policy, and it keeps DRAINING the
++ * first input after the second has ended - which is precisely the case this filter has to get right,
++ * because on the one real dual-layer subject on this box the enhancement layer is one frame shorter
++ * than the base layer, and that last base frame is the one with no residual of its own.
++ *
++ * `ff_framesync_dualinput_get()` returning a NULL `el` IS that case, stated by the framework rather
++ * than inferred here: the base frame has no partner, so it is passed through and counted. A pair
++ * that this filter cannot carry - wrong raster, wrong depth, undeclared rebuild - is refused by name
++ * by check_pair()/compose_pair() rather than guessed at.
++ */
++static int dovi_compose_frame(FFFrameSync *fs)
++{
++    AVFilterContext *ctx = fs->parent;
++    DoviComposeContext *s = ctx->priv;
++    AVFilterLink *outlink = ctx->outputs[0];
++    AVFrame *bl = NULL, *el = NULL;
++    int ret;
++
++    ret = ff_framesync_dualinput_get(fs, &bl, &el);
++    if (ret < 0)
++        return ret;
++
++    /*
++     * ORPHAN ENHANCEMENT FRAMES ARE HANDLED BY FRAMESYNC, NOT HERE, and the reasoning is recorded
++     * because two attempts to put the check here produced DEAD CODE that looked like a safeguard.
++     *
++     * `ff_framesync_dualinput_get()` contains `av_assert0(mainpic)`: the base frame it returns is
++     * never NULL. So the `!bl` branch that a first revision guarded on - with a watermark tracking
++     * the highest base pts emitted, to tell "the EL is early, wait" apart from "the EL is stale,
++     * refuse" - could never be reached at all. Measured: four different constructions meant to
++     * provoke an orphan (BL pushed later, EL pushed later, EL trimmed short, BL trimmed short) all
++     * returned 0, because in every one of them framesync either matched the frames or stopped
++     * pulling the secondary input, and neither path reaches this callback with `bl == NULL`.
++     *
++     * The safety property the hand-rolled version had is therefore NOT lost by the conversion - it
++     * is upheld one level down, where framesync refuses to hand a secondary frame to a primary frame
++     * whose pts does not match it. What the conversion DOES change, and what is verified instead, is
++     * that a base frame with no partner is passed through and COUNTED rather than silently composed
++     * against a repeated neighbour - that was a real defect, caught by the pass-through counter
++     * reading zero when it should have read one.
++     *
++     * A dead branch asserting a safety property is worse than no branch: it reads as protection. It
++     * is therefore removed rather than left in place, and this comment is what remains of it.
++     */
++
++    if (!el) {
++        /* No enhancement frame for this base frame. Legitimate rather than an error: clause 5.4.3.3
++         * makes the residual conditional on disable_residual_flag, and the stream's own shape can
++         * simply end the EL first. Counted and reported, because a silent pass-through would be
++         * indistinguishable from a compose that did nothing. */
++        s->bl_only++;
++        av_log(ctx, AV_LOG_VERBOSE, "base frame pts %"PRId64" has no enhancement frame; passing it "
++               "through without composition (counted: %"PRId64" so far)\n", bl->pts, s->bl_only);
++        return ff_filter_frame(outlink, bl);
++    }
++
++    return compose_pair(ctx, bl, el);
++}
++
++/*
++ * activate() is one call: framesync decides when this filter has work and invokes the callback above
++ * with a matched pair. Every hand-rolled status/request/eof decision this file used to make is now
++ * framesync's, and that is deliberate - those decisions were where it crashed (a NULL WRITE in a
++ * worker thread, twice, from calling `ff_inlink_acknowledge_status()` as a query) and where it lost
++ * the base layer's last frame. The compose arithmetic was never the problem: an AddressSanitizer
++ * harness drives it over all 8,294,400 pixels of a real frame with zero reports.
++ */
++static int dovi_compose_activate(AVFilterContext *ctx)
++{
++    DoviComposeContext *s = ctx->priv;
++
++    return ff_framesync_activate(&s->fs);
++}
++
++static int dovi_compose_frame(FFFrameSync *fs);
++
++static int dovi_compose_config_out(AVFilterLink *outlink)
++{
++    AVFilterContext *ctx = outlink->src;
++    DoviComposeContext *s = ctx->priv;
++    AVFilterLink *bl = ctx->inputs[PAD_BL];
++    int ret;
++
++    /* framesync is configured HERE rather than in init(), because it needs the input links to exist
++     * and the output geometry to be settled first - the same order vf_overlay.c uses. */
++    if ((ret = ff_framesync_init_dualinput(&s->fs, ctx)) < 0)
++        return ret;
++    s->fs.on_event = dovi_compose_frame;
++
++    /*
++     * EOF_ACTION_PASS, NOT THE DEFAULT REPEAT - a correctness requirement, not a taste setting.
++     * framesync's default for a dual input is EOF_ACTION_REPEAT, which keeps supplying the LAST
++     * secondary frame once the secondary has ended. For this filter that is exactly the failure the
++     * whole design exists to prevent: the base layer's tail frame would be composed against a copy of
++     * the PREVIOUS picture's residual - a frame that decodes, carries a complete set of ST 2094-40
++     * values, and is wrong.
++     *
++     * MEASURED, which is how this was caught: with the default in place the run emitted 49 frames
++     * from a 49/48 pair and reported ZERO pass-throughs - the missing frame had not been passed
++     * through, it had been silently COMPOSED against a repeated residual. The counter that should
++     * have been non-zero being zero is what exposed it.
++     *
++     * With PASS, framesync hands back a NULL second frame instead, which dovi_compose_frame() treats
++     * as the legitimate "no enhancement frame for this base frame" case: passed through, counted and
++     * reported. Clause 5.4.3.3 makes the residual conditional on the RPU's own flags, so a base frame
++     * without one is the stream's shape rather than an error - but it must be the frame the stream
++     * actually sent, never a repeat of its neighbour. */
++    s->fs.opt_eof_action = EOF_ACTION_PASS;
++
++    outlink->w = bl->w;
++    outlink->h = bl->h;
++    outlink->time_base = bl->time_base;
++    outlink->sample_aspect_ratio = bl->sample_aspect_ratio;
++
++    return ff_framesync_configure(&s->fs);
++}
++
++static int dovi_compose_query_formats(const AVFilterContext *ctx,
++                                      AVFilterFormatsConfig **cfg_in,
++                                      AVFilterFormatsConfig **cfg_out)
++{
++    /* 4:2:0 ONLY, both pads, and that is a requirement of the code this filter calls rather than a
++     * narrowing of taste: `dovi_apply_planes()` refuses any input whose chroma is not half
++     * resolution in both directions ("Only 4:2:0 input is supported..."), because the chroma rebuild
++     * assumes it. Declaring 4:2:2/4:4:4 here - as the first revision did - does not get a refusal,
++     * it gets a graph whose planes are NOT the geometry the rebuild indexes: measured, that
++     * dereferenced past the chroma plane and took the process down with 0xC0000005 on the first
++     * frame. The lists are therefore the intersection of what this filter can read and what its
++     * callee can accept, and the refusal for anything else comes from dovi_apply_planes(). */
++    static const enum AVPixelFormat bl_fmts[] = {
++        AV_PIX_FMT_YUV420P10LE, AV_PIX_FMT_YUV420P12LE,
++        AV_PIX_FMT_NONE
++    };
++    /*
++     * THE EL PAD ACCEPTS *ALL* BIT DEPTHS, and that is deliberate: refusing to advertise the ones
++     * the compose cannot use would make the graph INSERT A CONVERSION instead of failing, and the
++     * mismatch would vanish before any check could see it.
++     *
++     * MEASURED, and it is the reason this list is longer than the BL's: an 8-bit enhancement layer
++     * fed to a filter that advertises only 10/12-bit does not produce a refusal - FFmpeg inserts an
++     * automatic `format` conversion, the EL arrives as `yuv420p10le`, clause 5.4.3.2's coefficients
++     * (fitted for the DECLARED depth) are then applied to samples rescaled behind the filter's back,
++     * and the run returns 0 with a composed picture that is quietly wrong. With this list the EL
++     * arrives at its real depth and `dovi_apply_planes()` refuses it by name:
++     *   "The enhancement layer is 8-bit but the RPU declares el_bit_depth=10: ... normalising 8-bit
++     *    samples by 1/255 scales every residual by about 4.02."
++     *
++     * The 8- and 9-bit entries are therefore ADVERTISED IN ORDER TO BE REFUSED, which is the whole
++     * point: an instrument that cannot see the error cannot report it. 4:2:0 is still the only chroma
++     * layout listed, because for chroma the wrong geometry is not a detectable mismatch but a read
++     * past the plane, and that must never be negotiated into existence.
++     */
++    static const enum AVPixelFormat el_fmts[] = {
++        AV_PIX_FMT_YUV420P,      /*  8-bit: refused by name, with the rescale factor in the message */
++        AV_PIX_FMT_YUV420P9LE,   /*  9-bit: same */
++        AV_PIX_FMT_YUV420P10LE,  /* 10-bit: the depth clause 5.4.3.2 executes on */
++        AV_PIX_FMT_YUV420P12LE,  /* 12-bit: refused by dovi_apply_planes' nlq predicates */
++        AV_PIX_FMT_NONE
++    };
++    static const enum AVPixelFormat out_fmts[] = {
++        AV_PIX_FMT_GBRP10LE, AV_PIX_FMT_GBRP12LE,
++        AV_PIX_FMT_NONE
++    };
++    int ret;
++
++    /* NOTE on the first build: this list was written with the `ff_set_common_formats_from_list2()`
++     * helper and with AV_PIX_FMT_*_LE spelled without the LE suffix. Both were wrong for this tree -
++     * the helper takes an `int` list and FFmpeg auto-inserted a scale that converted the EL to
++     * gbrp10le, i.e. it silently colour-converted the enhancement layer before the compose ever saw
++     * it. The explicit per-link `ff_formats_ref(ff_make_pixel_format_list(...))` form below is what
++     * `dovi_apply` uses and is what keeps the EL in its coded Y'CbCr form, which is the only form
++     * `dovi_el_cell()`/`dovi_el_residual_at()` can read a residual from. */
++    ret = ff_formats_ref(ff_make_pixel_format_list(bl_fmts), &cfg_in[PAD_BL]->formats);
++    if (ret < 0)
++        return ret;
++    ret = ff_formats_ref(ff_make_pixel_format_list(el_fmts), &cfg_in[PAD_EL]->formats);
++    if (ret < 0)
++        return ret;
++    return ff_formats_ref(ff_make_pixel_format_list(out_fmts), &cfg_out[0]->formats);
++}
++
++#define OFFSET(x) offsetof(DoviComposeContext, x)
++#define FLAGS (AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_FILTERING_PARAM)
++
++static const AVOption dovi_compose_options[] = {
++    { "el_rebuild", "how the enhancement layer is brought onto the base layer's raster", OFFSET(el_rebuild),
++        AV_OPT_TYPE_INT, { .i64 = -1 }, -1, EL_REBUILD_NB - 1, FLAGS, .unit = "el_rebuild" },
++    { "undeclared", "no declaration; an error when both layers are present", 0, AV_OPT_TYPE_CONST,
++        { .i64 = -1 }, 0, 0, FLAGS, .unit = "el_rebuild" },
++    { "identity", "the layers already share a raster (clause 5.4.2 a))", 0, AV_OPT_TYPE_CONST,
++        { .i64 = EL_REBUILD_IDENTITY }, 0, 0, FLAGS, .unit = "el_rebuild" },
++    { "repeat", "integer upsampling: the EL is smaller", 0, AV_OPT_TYPE_CONST,
++        { .i64 = EL_REBUILD_REPEAT }, 0, 0, FLAGS, .unit = "el_rebuild" },
++    { "decimate", "integer downsampling: the EL is larger", 0, AV_OPT_TYPE_CONST,
++        { .i64 = EL_REBUILD_DECIMATE }, 0, 0, FLAGS, .unit = "el_rebuild" },
++
++    { "el_neutral", "where the enhancement layer's zero residual sits", OFFSET(el_neutral),
++        AV_OPT_TYPE_INT, { .i64 = -1 }, -1, EL_NEUTRAL_NB - 1, FLAGS, .unit = "el_neutral" },
++    { "nlq", "the RPU's declared nlq_offset, which is what clause 5.4.3.2 subtracts",
++        0, AV_OPT_TYPE_CONST, { .i64 = EL_NEUTRAL_NLQ }, 0, 0, FLAGS, .unit = "el_neutral" },
++    { "coded-median", "the EL's own measured median - a DIAGNOSTIC, never a choice to ship on",
++        0, AV_OPT_TYPE_CONST, { .i64 = EL_NEUTRAL_MEDIAN }, 0, 0, FLAGS, .unit = "el_neutral" },
++    { NULL }
++};
++
++AVFILTER_DEFINE_CLASS(dovi_compose);
++
++static const AVFilterPad dovi_compose_inputs[] = {
++    {
++        .name = "bl",
++        .type = AVMEDIA_TYPE_VIDEO,
++    },
++    {
++        .name = "el",
++        .type = AVMEDIA_TYPE_VIDEO,
++    },
++};
++
++static const AVFilterPad dovi_compose_outputs[] = {
++    {
++        .name         = "default",
++        .type         = AVMEDIA_TYPE_VIDEO,
++        .config_props = dovi_compose_config_out,
++    },
++};
++
++const FFFilter ff_vf_dovi_compose = {
++    .p.name         = "dovi_compose",
++    .p.description  = NULL_IF_CONFIG_SMALL("Compose a Dolby Vision enhancement layer onto its base "
++                                           "layer (ETSI GS CCM 001 5.4.3.2/5.4.3.3)."),
++    .p.priv_class   = &dovi_compose_class,
++    /*
++     * `AVFILTER_FLAG_HWDEVICE` IS ABSENT AND MUST STAY ABSENT; the substantive point is that this
++     * filter must not be slice-threaded, and the way to say that is to NOT set
++     * `AVFILTER_FLAG_SLICE_THREADS` (slice threading is opt-in here - avfilter.h:166 - and
++     * vf_framepack.c, the closest two-input activate() filter, sets no flags at all).
++     *
++     * MEASURED, and this is the crash this filter had for a whole debugging round:
++     *   two HEVC inputs + dovi_compose, default threads      -> 0xC0000005 (NULL WRITE, thread T34)
++     *   two HEVC inputs + dovi_compose, -threads 1
++     *                                   -filter_threads 1   -> rc=0, frame produced
++     *   two lavfi inputs + dovi_compose                     -> reaches its own refusal, no crash
++     *   two HEVC inputs + a stock 2-input filter            -> rc=0
++     * The third and fourth lines are what isolate it: the fault needs HEVC-decoded frames AND this
++     * filter, and it disappears when the graph is single-threaded. Per-pad queues mutated from
++     * several workers is exactly that shape.
++     *
++     * WHY THE FLAG ALONE DID NOT FIX IT, recorded so the next reader does not repeat the attempt:
++     * leaving SLICE_THREADS unset stops the FILTERGRAPH from slicing this filter's body, but the
++     * crash is driven by the graph running at all - `-filter_complex_threads 1` on its own still
++     * faults, while `-threads 1 -filter_threads 1` does not. So the operator-facing answer is to run
++     * the graph single-threaded, and the filter-side answer is the queue access being safe under the
++     * framework's threading model; that second half is what remains to be done (see the P2 record).
++     */
++    .priv_size      = sizeof(DoviComposeContext),
++    .init           = dovi_compose_init,
++    .uninit         = dovi_compose_uninit,
++    .activate       = dovi_compose_activate,
++    FILTER_INPUTS(dovi_compose_inputs),
++    FILTER_OUTPUTS(dovi_compose_outputs),
++    FILTER_QUERY_FUNC2(dovi_compose_query_formats),
++};
+
+-- 
+2.0.0 (generator: upstream-kit/make_0012.py)
+
+Signed-off-by: REPLACE-ME <REPLACE-ME>

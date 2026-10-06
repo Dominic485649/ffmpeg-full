@@ -1,0 +1,188 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: REPLACE-ME <you@example>
+Date: Mon, 05 Oct 2026 04:44:08 +0800
+Subject: [PATCH] avfilter/vf_setparams: add max_cll and max_fall, an attach point for content light
+
+The container side of HDR10+ static metadata is already carried end to end in this build: a
+frame with AV_FRAME_DATA_CONTENT_LIGHT_LEVEL reaches AVCodecContext.decoded_side_data, is mapped
+to coded_side_data for the encoder, and movenc.c / matroskaenc.c write the MP4 clli and Matroska
+CoLL box from it. What was missing is any way to put that side data on a frame in the first
+place, so the chain could only ever be fed by a decoder. setparams is the filter whose whole job
+is "assert a metadata field on the outgoing frame" - it already does that for six colour
+properties and the field flag - and it simply had nothing for light levels.
+
+Add max_cll and max_fall (cd/m^2, the same unit and the same width the box stores) as frame side
+data through av_content_light_metadata_create_side_data(). Three decisions are worth reviewing.
+
+Neither option given attaches nothing, rather than an all-zero AVContentLightMetadata. The two are
+not interchangeable downstream: a zeroed entry makes the encoder write a box that positively
+asserts MaxCLL=0 MaxFALL=0, which a reader cannot tell apart from "the author meant zero". Absence
+is the honest encoding of "not asked for", and 0 keeps its CEA-861.3 meaning of unspecified for a
+number left unset while the other one was given.
+
+A frame that already carries content light makes the filter fail with AVERROR(EINVAL) instead of
+choosing between the two. A container box, a bitstream SEI and an explicit setparams on the same
+command line are three sources for the same number; whichever one a filter picked, nothing
+downstream could tell that a choice had been made on the reader's behalf. The refusal reports and
+drops the frame - libavfilter does not unref the frame for a filter whose filter_frame returns an
+error.
+
+The range check runs in the filter's init, which avfilter_init_dict() reaches after applying every
+option and before the graph is configured, so an impossible value fails at the point it was typed
+rather than on the first frame. For that to be the check a user sees, the two AVOptions span the
+whole int domain in their declarations; the comment at the table says why.
+
+doc/filters.texi is not touched by this commit.
+
+Signed-off-by: REPLACE-ME <REPLACE-ME>
+ libavfilter/vf_setparams.c | +83/-0, 7 hunks
+---
+diff --git a/libavfilter/vf_setparams.c b/libavfilter/vf_setparams.c
+index 17ffa09..3e73957 100644
+--- a/libavfilter/vf_setparams.c
++++ b/libavfilter/vf_setparams.c
+@@ -20,6 +20,7 @@
+ 
+ #include "config_components.h"
+ 
++#include "libavutil/mastering_display_metadata.h"
+ #include "libavutil/pixfmt.h"
+ #include "libavutil/opt.h"
+ #include "avfilter.h"
+@@ -43,11 +44,25 @@ typedef struct SetParamsContext {
+     int colorspace;
+     int chroma_location;
+     int alpha_mode;
++    /* Content light level in cd/m^2, the two numbers the container's clli / CoLL box
++     * stores. CONTENT_LIGHT_UNSET (-1) and 0 both mean "nothing to attach" - see
++     * init_setparams(); neither may create a side data entry. */
++    int max_cll;
++    int max_fall;
+ } SetParamsContext;
+ 
+ #define OFFSET(x) offsetof(SetParamsContext, x)
+ #define FLAGS AV_OPT_FLAG_FILTERING_PARAM|AV_OPT_FLAG_VIDEO_PARAM
+ 
++/* Both numbers reach the container as 16-bit fields - mov_write_clli_tag() in
++ * libavformat/movenc.c and the CoLL entry in libavformat/matroskaenc.c each store them
++ * with avio_wb16() - so CONTENT_LIGHT_MAX is the largest value that can be carried at
++ * all. -1 is this filter's existing spelling for "keep what the input says"; 0 is what
++ * CEA-861.3 calls unspecified. Neither one attaches anything, because an all-zero
++ * AVContentLightMetadata is not absence but a box asserting 0/0. */
++#define CONTENT_LIGHT_UNSET (-1)
++#define CONTENT_LIGHT_MAX   65535
++
+ static const AVOption setparams_options[] = {
+     {"field_mode", "select interlace mode", OFFSET(field_mode), AV_OPT_TYPE_INT, {.i64=MODE_AUTO}, -1, MODE_PROG, FLAGS, .unit = "mode"},
+     {"auto", "keep the same input field",  0, AV_OPT_TYPE_CONST, {.i64=MODE_AUTO}, 0, 0, FLAGS, .unit = "mode"},
+@@ -141,11 +156,40 @@ static const AVOption setparams_options[] = {
+     {"unknown",                          NULL, 0, AV_OPT_TYPE_CONST, {.i64=AVALPHA_MODE_UNSPECIFIED},   0, 0, FLAGS, .unit = "alpha_mode"},
+     {"premultiplied",                    NULL, 0, AV_OPT_TYPE_CONST, {.i64=AVALPHA_MODE_PREMULTIPLIED}, 0, 0, FLAGS, .unit = "alpha_mode"},
+     {"straight",                         NULL, 0, AV_OPT_TYPE_CONST, {.i64=AVALPHA_MODE_STRAIGHT},      0, 0, FLAGS, .unit = "alpha_mode"},
++
++    /* The declared range is the whole int domain on purpose: init_setparams() is what
++     * validates these two, so an impossible value comes back as this filter's own
++     * AVERROR(EINVAL) with the box's 16-bit width named, instead of avutil's generic
++     * out-of-range ERANGE from write_number() before the filter is ever constructed. */
++    {"max_cll",  "set MaxCLL, max content light level in cd/m^2, -1 or 0 attaches nothing",
++        OFFSET(max_cll),  AV_OPT_TYPE_INT, {.i64=CONTENT_LIGHT_UNSET}, INT_MIN, INT_MAX, FLAGS},
++    {"max_fall", "set MaxFALL, max frame average light level in cd/m^2, -1 or 0 attaches nothing",
++        OFFSET(max_fall), AV_OPT_TYPE_INT, {.i64=CONTENT_LIGHT_UNSET}, INT_MIN, INT_MAX, FLAGS},
+     {NULL}
+ };
+ 
+ AVFILTER_DEFINE_CLASS(setparams);
+ 
++static av_cold int init_setparams(AVFilterContext *ctx)
++{
++    SetParamsContext *s = ctx->priv;
++
++    /* Refused here - filter-construction time, which avfilter_init_dict() reaches after
++     * it has applied every option and before the graph is configured - and not per
++     * frame: a number the container cannot store is a command-line mistake, and saying
++     * so on the first frame would let an encode run to completion on a wrong assumption. */
++    if (s->max_cll < CONTENT_LIGHT_UNSET || s->max_cll > CONTENT_LIGHT_MAX ||
++        s->max_fall < CONTENT_LIGHT_UNSET || s->max_fall > CONTENT_LIGHT_MAX) {
++        av_log(ctx, AV_LOG_ERROR, "max_cll=%d and max_fall=%d must each be %d (leave it "
++               "alone) or between 0 and %d, the widest value the container's 16-bit "
++               "field can carry\n",
++               s->max_cll, s->max_fall, CONTENT_LIGHT_UNSET, CONTENT_LIGHT_MAX);
++        return AVERROR(EINVAL);
++    }
++
++    return 0;
++}
++
+ static int query_formats(const AVFilterContext *ctx,
+                          AVFilterFormatsConfig **cfg_in,
+                          AVFilterFormatsConfig **cfg_out)
+@@ -207,6 +251,39 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
+     if (s->alpha_mode >= 0)
+         frame->alpha_mode = s->alpha_mode;
+ 
++    /* Content light is frame side data, not a frame field, so it does not follow the
++     * ">= 0 means set" rule above: an entry is only worth making when at least one of
++     * the two is an actual number (0 and -1 both mean "nothing here"), because an
++     * all-zero AVContentLightMetadata would have the encoder assert 0/0 in the box. */
++    if (s->max_cll > 0 || s->max_fall > 0) {
++        AVContentLightMetadata *clm;
++
++        /* The input already stating a content light level means two sources for one
++         * number - a container box or a bitstream SEI, and this option. Which one wins
++         * cannot be read off the stream, and overwriting or duplicating it would hide
++         * that a choice had been made, so the filter refuses. */
++        if (av_frame_get_side_data(frame, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL)) {
++            av_log(ctx, AV_LOG_ERROR, "input frame already carries content light level "
++                   "side data, so max_cll=%d max_fall=%d would be a second source for "
++                   "the same number; refusing instead of choosing\n",
++                   s->max_cll, s->max_fall);
++            av_frame_free(&frame);
++            return AVERROR(EINVAL);
++        }
++
++        clm = av_content_light_metadata_create_side_data(frame);
++        if (!clm) {
++            av_frame_free(&frame);
++            return AVERROR(ENOMEM);
++        }
++        /* create_side_data() zeroes the struct, so a number that was not given stays 0,
++         * which is "unspecified" to whoever reads the box and not an invented value. */
++        if (s->max_cll > 0)
++            clm->MaxCLL = s->max_cll;
++        if (s->max_fall > 0)
++            clm->MaxFALL = s->max_fall;
++    }
++
+     return ff_filter_frame(ctx->outputs[0], frame);
+ }
+ 
+@@ -224,6 +301,7 @@ const FFFilter ff_vf_setparams = {
+     .p.priv_class  = &setparams_class,
+     .p.flags       = AVFILTER_FLAG_METADATA_ONLY,
+     .priv_size   = sizeof(SetParamsContext),
++    .init        = init_setparams,
+     FILTER_INPUTS(inputs),
+     FILTER_OUTPUTS(ff_video_default_filterpad),
+     FILTER_QUERY_FUNC2(query_formats),
+@@ -257,6 +335,9 @@ static av_cold int init_setrange(AVFilterContext *ctx)
+     s->colorspace      = -1;
+     s->chroma_location = -1;
+     s->alpha_mode      = -1;
++    /* Not offered by setrange_options, and setrange must stay exactly as inert about
++     * light levels as it is about fields - filter_frame() is shared. */
++    s->max_cll = s->max_fall = CONTENT_LIGHT_UNSET;
+     return 0;
+ }
+ 
+@@ -295,6 +376,8 @@ static av_cold int init_setfield(AVFilterContext *ctx)
+     s->colorspace      = -1;
+     s->chroma_location = -1;
+     s->alpha_mode      = -1;
++    /* Shared filter_frame(): setfield keeps its hands off content light. */
++    s->max_cll = s->max_fall = CONTENT_LIGHT_UNSET;
+     return 0;
+ }
+ 
+-- 
+2.49.0
+

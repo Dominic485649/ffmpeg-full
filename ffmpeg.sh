@@ -1606,8 +1606,9 @@ stage_src() {
   local src="$ROOT/$name"
   local stage="$BUILDROOT/_src/$name"
 
-  if [[ "$INCREMENTAL_BUILD" == "1" && -d "$stage" ]]; then
-    # Reuse the existing build tree when it represents the same source commit.
+  if [[ "$name" != "ffmpeg-source" && "$INCREMENTAL_BUILD" == "1" && -d "$stage" ]]; then
+    # FFmpeg always gets a clean tree so stale objects cannot survive source or patch changes.
+    # Other dependencies may reuse their build tree when they represent the same source commit.
     # Reset only tracked source edits; keep generated objects/caches for make/ninja.
     if [[ -d "$src/.git" && -d "$stage/.git" ]]; then
       local src_head stage_has_head
@@ -3255,12 +3256,10 @@ if s.count(anchor) != 1:
     raise SystemExit(f"{p}: add_hdr_plus anchor not unique")
 s = s.replace(anchor, helper + anchor, 1)
 
-call_old = ('        aom_img_remove_metadata(rawimg);\n'
-            '        sd = av_frame_get_side_data(frame, AV_FRAME_DATA_DOVI_METADATA);\n')
+call_old = '        aom_img_remove_metadata(rawimg);\n'
 call_new = ('        aom_img_remove_metadata(rawimg);\n'
             '        if ((res = add_hdr_static(avctx, rawimg, frame)) < 0)\n'
-            '            return res;\n'
-            '        sd = av_frame_get_side_data(frame, AV_FRAME_DATA_DOVI_METADATA);\n')
+            '            return res;\n')
 if s.count(call_old) != 1:
     raise SystemExit(f"{p}: dovi call anchor not unique")
 s = s.replace(call_old, call_new, 1)
@@ -5479,6 +5478,7 @@ EOF
 
       local ff_stage
       ff_stage="$(stage_src "ffmpeg-source")"
+      "$ROOT/shared-patches/apply-ffmpeg-patches.sh" "$ff_stage" full
       patch_ffmpeg_jxr "$ff_stage"
       patch_ffmpeg_libplacebo_vulkan_import "$ff_stage"
       patch_ffmpeg_cxx_runtime "$ff_stage"

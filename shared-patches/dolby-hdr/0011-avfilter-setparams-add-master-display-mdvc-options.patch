@@ -1,0 +1,257 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: REPLACE-ME <you@example.com>
+Date: Mon, 05 Oct 2026 17:00:00 +0800
+Subject: [PATCH] avfilter/vf_setparams: add master_display, the MDCV attach point
+ 0010 left open
+
+0010 gave setparams an attach point for MaxCLL/MaxFALL and left MDCV without one. That
+split is the wrong way round against the specification this chain exists to satisfy.
+AOMediaCodec/av1-hdr10plus says of HDR10 Static Metadata
+
+    "MDCV shall be present while MaxCLL and/or MaxFALL may be present."
+    (index.bs:234, under HDR10+ bitstream constraints)
+
+so MDCV is the mandatory half and content light the optional one. A deliverable can
+therefore be non-conformant with the clli box present and the mdcv box absent - which is
+the state measured on this box after 0010. The container does carry both: movenc.c:2692
+mov_write_clli_tag and :2712 mov_write_mdcv_tag write them from packet side data, the
+latter returning early unless has_primaries && has_luminance. What was missing was any way
+to put that side data on a frame.
+
+Units are the one real decision, and getting them wrong is silent, so: chromaticity is
+given in 0.00002 units (ST 2086's own) and luminance in 0.0001 cd/m^2. The option values
+are the numbers the box stores, so no rescaling happens between the command line and the
+file. Note the asymmetry in mov_write_mdcv_tag - chromaticity is eight avio_wb16 calls but
+the two luminance fields are avio_wb32; a bound copied from the 16-bit side makes an
+ordinary 1000 cd/m^2 display unrepresentable, which is what the first version of this
+change did before it was caught by testing.
+
+Absence stays absence. Nothing is attached unless all ten values were given, because
+mov_write_mdcv_tag drops the whole box when either flag is clear - so three of five pairs
+would produce no box while appearing to have asked for one. The duplicate-source refusal
+0010 uses applies unchanged: an input that already states a mastering volume gives this
+filter two sources for one number, which it cannot resolve from the stream.
+
+Verified on this box: a real encode through setparams writes an mdcv box of 32 bytes
+carrying G(8500,39850) B(6550,2300) R(35400,14600) WP(15635,16450) and luminance
+0.005..1000 cd/m^2, matching the command line exactly; a 99999 chromaticity and a
+two-of-ten partial set are both refused at filter-construction time.
+
+Apply after 0010; it edits the same file and expects 0010's content-light options.
+Signed-off-by: REPLACE-ME <you@example.com>
+---
+ libavfilter/vf_setparams.c | 169 +++++++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 166 insertions(+), 3 deletions(-)
+--- a/libavfilter/vf_setparams.c
++++ b/libavfilter/vf_setparams.c
+@@ -49,6 +49,16 @@
+      * init_setparams(); neither may create a side data entry. */
+     int max_cll;
+     int max_fall;
++    /* Mastering display colour volume (SMPTE ST 2086), the numbers the container's
++     * mdcv / MasterM box stores. Chromaticity is in units of 0.00002 and luminance in
++     * units of 0.0001 cd/m^2 - the units the box itself uses, so what a caller writes is
++     * what a reader gets back. MASTER_DISPLAY_UNSET (-1) on any one of the ten means
++     * "not asked for"; md_count is how many were given, and anything other than 0 or 10
++     * is refused - see init_setparams(). */
++    int md_rx, md_ry, md_gx, md_gy, md_bx, md_by;
++    int md_wx, md_wy;
++    int md_lum_min, md_lum_max;
++    int md_count;
+ } SetParamsContext;
+ 
+ #define OFFSET(x) offsetof(SetParamsContext, x)
+@@ -63,6 +73,21 @@
+ #define CONTENT_LIGHT_UNSET (-1)
+ #define CONTENT_LIGHT_MAX   65535
+ 
++/* Mastering display bounds. Chromaticity: the box stores 16 bits per coordinate
++ * (mov_write_mdcv_tag's eight avio_wb16 calls) and ST 2086's unit is 0.00002, so
++ * 0.00002 * 65535 would exceed 1.0; 49999 keeps x and y just inside the unit square.
++ *
++ * Luminance is the trap. The box writes it with avio_wb32, 32 bits, in units of 0.0001
++ * cd/m^2 - and the option is ALREADY in those units, so 1000 cd/m^2 is written as
++ * 10000000 and the bound is simply the int32 domain. Two wrong versions of this line came
++ * before the right one, both by copying a neighbour's width instead of reading the call:
++ * 65535 (the chroma width) made an ordinary 1000 cd/m^2 display unrepresentable, and
++ * INT32_MAX/10000 divided by the unit a second time and refused it again. Verified
++ * against movenc.c:2738 avio_wb32(max_luminance) and by writing a real mdcv box. */
++#define MASTER_DISPLAY_UNSET (-1)
++#define CHROMA_MAX           49999
++#define LUMA_MAX             INT32_MAX             /* option units are 0.0001 cd/m^2 */
++
+ static const AVOption setparams_options[] = {
+     {"field_mode", "select interlace mode", OFFSET(field_mode), AV_OPT_TYPE_INT, {.i64=MODE_AUTO}, -1, MODE_PROG, FLAGS, .unit = "mode"},
+     {"auto", "keep the same input field",  0, AV_OPT_TYPE_CONST, {.i64=MODE_AUTO}, 0, 0, FLAGS, .unit = "mode"},
+@@ -165,6 +190,31 @@
+         OFFSET(max_cll),  AV_OPT_TYPE_INT, {.i64=CONTENT_LIGHT_UNSET}, INT_MIN, INT_MAX, FLAGS},
+     {"max_fall", "set MaxFALL, max frame average light level in cd/m^2, -1 or 0 attaches nothing",
+         OFFSET(max_fall), AV_OPT_TYPE_INT, {.i64=CONTENT_LIGHT_UNSET}, INT_MIN, INT_MAX, FLAGS},
++
++    /* Mastering display. All ten must be given together or none at all; init_setparams()
++     * counts them and refuses anything in between, because mov_write_mdcv_tag() drops the
++     * whole box unless has_primaries AND has_luminance are set - so a partial request would
++     * produce no mdcv box while looking like it had asked for one. */
++    {"master_display_rx", "MDCV red primary x, units of 0.00002",
++        OFFSET(md_rx), AV_OPT_TYPE_INT, {.i64=MASTER_DISPLAY_UNSET}, INT_MIN, INT_MAX, FLAGS},
++    {"master_display_ry", "MDCV red primary y, units of 0.00002",
++        OFFSET(md_ry), AV_OPT_TYPE_INT, {.i64=MASTER_DISPLAY_UNSET}, INT_MIN, INT_MAX, FLAGS},
++    {"master_display_gx", "MDCV green primary x, units of 0.00002",
++        OFFSET(md_gx), AV_OPT_TYPE_INT, {.i64=MASTER_DISPLAY_UNSET}, INT_MIN, INT_MAX, FLAGS},
++    {"master_display_gy", "MDCV green primary y, units of 0.00002",
++        OFFSET(md_gy), AV_OPT_TYPE_INT, {.i64=MASTER_DISPLAY_UNSET}, INT_MIN, INT_MAX, FLAGS},
++    {"master_display_bx", "MDCV blue primary x, units of 0.00002",
++        OFFSET(md_bx), AV_OPT_TYPE_INT, {.i64=MASTER_DISPLAY_UNSET}, INT_MIN, INT_MAX, FLAGS},
++    {"master_display_by", "MDCV blue primary y, units of 0.00002",
++        OFFSET(md_by), AV_OPT_TYPE_INT, {.i64=MASTER_DISPLAY_UNSET}, INT_MIN, INT_MAX, FLAGS},
++    {"master_display_wx", "MDCV white point x, units of 0.00002",
++        OFFSET(md_wx), AV_OPT_TYPE_INT, {.i64=MASTER_DISPLAY_UNSET}, INT_MIN, INT_MAX, FLAGS},
++    {"master_display_wy", "MDCV white point y, units of 0.00002",
++        OFFSET(md_wy), AV_OPT_TYPE_INT, {.i64=MASTER_DISPLAY_UNSET}, INT_MIN, INT_MAX, FLAGS},
++    {"master_display_lum_min", "MDCV minimum luminance, units of 0.0001 cd/m^2",
++        OFFSET(md_lum_min), AV_OPT_TYPE_INT, {.i64=MASTER_DISPLAY_UNSET}, INT_MIN, INT_MAX, FLAGS},
++    {"master_display_lum_max", "MDCV maximum luminance, units of 0.0001 cd/m^2",
++        OFFSET(md_lum_max), AV_OPT_TYPE_INT, {.i64=MASTER_DISPLAY_UNSET}, INT_MIN, INT_MAX, FLAGS},
+     {NULL}
+ };
+ 
+@@ -174,6 +224,22 @@
+ {
+     SetParamsContext *s = ctx->priv;
+ 
++    /* Count the mastering-display values that were actually given, so "all ten or none" is one
++     * number to check rather than ten comparisons repeated in three places.
++     *
++     * This has to happen HERE, in the filter that actually reads the options.  Putting it only in
++     * init_setfield() - which is what the first version of this change did - leaves md_count as
++     * uninitialised private data for setparams, and the symptom is not a crash: the "all ten"
++     * check reads a non-zero count of nothing, the attach step is skipped, and the filter quietly
++     * writes no mdcv box while every option looks accepted.  Measured: master_display_rx=99999
++     * was NOT refused and no side data appeared, which is how this was found. */
++    s->md_count = (s->md_rx != MASTER_DISPLAY_UNSET) + (s->md_ry != MASTER_DISPLAY_UNSET) +
++                  (s->md_gx != MASTER_DISPLAY_UNSET) + (s->md_gy != MASTER_DISPLAY_UNSET) +
++                  (s->md_bx != MASTER_DISPLAY_UNSET) + (s->md_by != MASTER_DISPLAY_UNSET) +
++                  (s->md_wx != MASTER_DISPLAY_UNSET) + (s->md_wy != MASTER_DISPLAY_UNSET) +
++                  (s->md_lum_min != MASTER_DISPLAY_UNSET) +
++                  (s->md_lum_max != MASTER_DISPLAY_UNSET);
++
+     /* Refused here - filter-construction time, which avfilter_init_dict() reaches after
+      * it has applied every option and before the graph is configured - and not per
+      * frame: a number the container cannot store is a command-line mistake, and saying
+@@ -187,6 +253,43 @@
+         return AVERROR(EINVAL);
+     }
+ 
++    /* Mastering display: all ten or none.
++     *
++     * All-or-nothing is not tidiness. mov_write_mdcv_tag() (libavformat/movenc.c:2712)
++     * returns without emitting the box unless has_primaries AND has_luminance are both
++     * set, so a caller who gives three of the five pairs and believes they asked for a
++     * mastering display gets a file with no mdcv box and no complaint. That silent
++     * outcome is the expensive one here: av1-hdr10plus says "MDCV shall be present
++     * while MaxCLL and/or MaxFALL may be present" (index.bs:234), so MDCV is the
++     * mandatory half of HDR10 static metadata. Counting the options that were actually
++     * given and refusing anything between 0 and 10 turns that into a message. */
++    if (s->md_count != 0 && s->md_count != 10) {
++        av_log(ctx, AV_LOG_ERROR, "master_display needs all ten values together (rx ry gx "
++               "gy bx by wx wy lum_min lum_max); %d of 10 were given, which would write no "
++               "mdcv box at all\n", s->md_count);
++        return AVERROR(EINVAL);
++    }
++    if (s->md_count == 10) {
++        if (s->md_rx < 0 || s->md_rx > CHROMA_MAX || s->md_ry < 0 || s->md_ry > CHROMA_MAX ||
++            s->md_gx < 0 || s->md_gx > CHROMA_MAX || s->md_gy < 0 || s->md_gy > CHROMA_MAX ||
++            s->md_bx < 0 || s->md_bx > CHROMA_MAX || s->md_by < 0 || s->md_by > CHROMA_MAX ||
++            s->md_wx < 0 || s->md_wx > CHROMA_MAX || s->md_wy < 0 || s->md_wy > CHROMA_MAX) {
++            av_log(ctx, AV_LOG_ERROR, "master_display chromaticity must be in 0..%d, units of "
++                   "0.00002 (the box stores 16 bits of that unit); got rx=%d ry=%d gx=%d gy=%d "
++                   "bx=%d by=%d wx=%d wy=%d\n", CHROMA_MAX, s->md_rx, s->md_ry, s->md_gx,
++                   s->md_gy, s->md_bx, s->md_by, s->md_wx, s->md_wy);
++            return AVERROR(EINVAL);
++        }
++        if (s->md_lum_min < 0 || s->md_lum_min > LUMA_MAX ||
++            s->md_lum_max < 0 || s->md_lum_max > LUMA_MAX ||
++            s->md_lum_min > s->md_lum_max) {
++            av_log(ctx, AV_LOG_ERROR, "master_display luminance must be in 0..%d, units of "
++                   "0.0001 cd/m^2, with min <= max; got %d..%d\n",
++                   LUMA_MAX, s->md_lum_min, s->md_lum_max);
++            return AVERROR(EINVAL);
++        }
++    }
++
+     return 0;
+ }
+ 
+@@ -284,6 +387,43 @@
+             clm->MaxFALL = s->max_fall;
+     }
+ 
++    /* Mastering display is frame side data too, and the same "second source for one
++     * number" argument as above applies: if the input already states a mastering volume,
++     * which of the two the container should carry cannot be read off the stream. */
++    if (s->md_count == 10) {
++        AVMasteringDisplayMetadata *mdm;
++
++        if (av_frame_get_side_data(frame, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA)) {
++            av_log(ctx, AV_LOG_ERROR, "input frame already carries mastering display "
++                   "metadata, so master_display would be a second source for the same "
++                   "volume; refusing instead of choosing\n");
++            av_frame_free(&frame);
++            return AVERROR(EINVAL);
++        }
++
++        mdm = av_mastering_display_metadata_create_side_data(frame);
++        if (!mdm) {
++            av_frame_free(&frame);
++            return AVERROR(ENOMEM);
++        }
++        /* AVMasteringDisplayMetadata holds R, G, B then the white point. The denominators
++         * are the box's own units, so the rationals are exact and mov_write_mdcv_tag()'s
++         * rescale_rational() lands on the same integer the caller wrote. */
++        mdm->display_primaries[0][0] = av_make_q(s->md_rx, 50000);
++        mdm->display_primaries[0][1] = av_make_q(s->md_ry, 50000);
++        mdm->display_primaries[1][0] = av_make_q(s->md_gx, 50000);
++        mdm->display_primaries[1][1] = av_make_q(s->md_gy, 50000);
++        mdm->display_primaries[2][0] = av_make_q(s->md_bx, 50000);
++        mdm->display_primaries[2][1] = av_make_q(s->md_by, 50000);
++        mdm->white_point[0]          = av_make_q(s->md_wx, 50000);
++        mdm->white_point[1]          = av_make_q(s->md_wy, 50000);
++        mdm->min_luminance           = av_make_q(s->md_lum_min, 10000);
++        mdm->max_luminance           = av_make_q(s->md_lum_max, 10000);
++        /* Both flags, or the muxer returns before writing the box. */
++        mdm->has_primaries = 1;
++        mdm->has_luminance = 1;
++    }
++
+     return ff_filter_frame(ctx->outputs[0], frame);
+ }
+ 
+@@ -338,6 +478,7 @@
+     /* Not offered by setrange_options, and setrange must stay exactly as inert about
+      * light levels as it is about fields - filter_frame() is shared. */
+     s->max_cll = s->max_fall = CONTENT_LIGHT_UNSET;
++    s->md_count = 0;
+     return 0;
+ }
+ 
+@@ -376,8 +517,17 @@
+     s->colorspace      = -1;
+     s->chroma_location = -1;
+     s->alpha_mode      = -1;
+-    /* Shared filter_frame(): setfield keeps its hands off content light. */
++    /* Shared filter_frame(): setfield keeps its hands off content light and mastering
++     * display, so neither may create a side data entry for this filter. */
+     s->max_cll = s->max_fall = CONTENT_LIGHT_UNSET;
++    /* Count the mastering-display values that were actually given, so "all ten or none"
++     * is one number to check rather than ten comparisons repeated in two places. */
++    s->md_count = (s->md_rx != MASTER_DISPLAY_UNSET) + (s->md_ry != MASTER_DISPLAY_UNSET) +
++                  (s->md_gx != MASTER_DISPLAY_UNSET) + (s->md_gy != MASTER_DISPLAY_UNSET) +
++                  (s->md_bx != MASTER_DISPLAY_UNSET) + (s->md_by != MASTER_DISPLAY_UNSET) +
++                  (s->md_wx != MASTER_DISPLAY_UNSET) + (s->md_wy != MASTER_DISPLAY_UNSET) +
++                  (s->md_lum_min != MASTER_DISPLAY_UNSET) +
++                  (s->md_lum_max != MASTER_DISPLAY_UNSET);
+     return 0;
+ }
+ 
+-- 
+2.49.0

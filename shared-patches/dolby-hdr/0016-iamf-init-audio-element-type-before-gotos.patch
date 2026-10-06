@@ -1,0 +1,19 @@
+diff --git a/fftools/ffmpeg_mux_init.c b/fftools/ffmpeg_mux_init.c
+--- a/fftools/ffmpeg_mux_init.c
++++ b/fftools/ffmpeg_mux_init.c
+@@ -2656,6 +2656,7 @@
+     };
+     const AVClass *pclass = &class;
+     int type, ret;
++    char *元素类型值 = NULL;
+ 
+     ret = av_dict_parse_string(&dict, token, "=", ":", AV_DICT_MULTIKEY);
+     if (ret < 0) {
+@@ -2715,7 +2716,6 @@
+      *      `token = av_strtok(str, ",", &ptr)` 先按逗号切，
+      *      所以 `...:audio_element_type=object,layer=...` 里那个键属于 token 段。
+      */
+-    char *元素类型值 = NULL;
+     {
+         const AVDictionaryEntry *类型项 =
+             av_dict_get(tmp, "audio_element_type", NULL, AV_DICT_IGNORE_SUFFIX);
