@@ -5870,11 +5870,12 @@ write_full_manifest() {
     --skip "QSV HEVC P8 RPU injection was compiled but not round-trip tested on compatible hardware"
     --validate "NVENC HEVC Profile 8 and AV1 Profile 10 per-frame Dolby Vision RPU injection patches are present in the compiled source; hardware round-trip remains unverified"
     --validate "QSV HEVC Profile 8 per-frame Dolby Vision RPU injection patch is present in the compiled source; hardware round-trip remains unverified"
-    --skip "QSV AV1 Profile 10 RPU injection remains unavailable because oneVPL exposes no generic per-frame AV1 metadata payload channel"
+    --skip "QSV AV1 Profile 10 Dolby Vision RPU injection is not implemented: oneVPL has no AV1 payload channel, and a packet-PTS OBU path still needs Intel hardware round-trip validation"
     --skip "MPEG-TS Dolby Vision metadata descriptor output is not implemented; demux and decode input support remains enabled"
     --skip "No changing-scene HDR10+ HEVC/AV1 bitstream round-trip was run; compile-time path presence does not prove per-frame metadata survived encoding"
-    --skip "Dolby Vision Profile 7 FEL reconstruction and HDR10+ regeneration remain unavailable until a validated FEL reconstructor and frame-analysis generator are installed"
-    --skip "Audio Vivid AV3A encode/decode SDK integration and model loading were not built or tested"
+    --skip "P7 FEL reconstruction is not integrated or validated against a trusted reference; no FEL sample/reference or reconstructor is available"
+    --skip "Dolby Vision-to-HDR10+ regeneration is unavailable: no authorized frame-analysis generator is installed; hdr10plus_tool only edits or injects existing metadata"
+    --skip "Audio Vivid decoder-only integration is unavailable: UWA AV3A source, FFmpeg demux/decode patch, model.bin, and usage/distribution authorization are absent; AV3A encoding is out of scope"
     --skip "av1_qsv HDR10+ metadata injection is not implemented; QSV dynamic-metadata paths are not runtime-verified"
   )
   if [[ "$ffmpeg_built" == "1" ]] && is_in_array jxrlib "$@"; then
