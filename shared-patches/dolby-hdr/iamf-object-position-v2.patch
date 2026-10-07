@@ -385,7 +385,7 @@ diff --git a/libavcodec/packet.h b/libavcodec/packet.h
 diff --git a/libavformat/iamf_writer.c b/libavformat/iamf_writer.c
 --- a/libavformat/iamf_writer.c
 +++ b/libavformat/iamf_writer.c
-@@ -232,13 +232,51 @@ int ff_iamf_add_audio_element(IAMFContext *iamf, const AVStreamGroup *stg, void
+@@ -232,13 +232,47 @@ int ff_iamf_add_audio_element(IAMFContext *iamf, const AVStreamGroup *stg, void
      if (!stg->nb_streams) {
          av_log(log_ctx, AV_LOG_ERROR, "Audio Element id %"PRId64" has no streams\n", stg->id);
          return AVERROR(EINVAL);
@@ -393,13 +393,10 @@ diff --git a/libavformat/iamf_writer.c b/libavformat/iamf_writer.c
  
      iamf_audio_element = stg->params.iamf_audio_element;
 -    if (iamf_audio_element->audio_element_type == AV_IAMF_AUDIO_ELEMENT_TYPE_SCENE) {
-+    av_log(log_ctx, AV_LOG_ERROR, "TRACE-A nb_layers=%u type=%d nb_streams=%u\n",
-+           iamf_audio_element->nb_layers, iamf_audio_element->audio_element_type, stg->nb_streams);
 +    if (iamf_audio_element->audio_element_type == AV_IAMF_AUDIO_ELEMENT_TYPE_OBJECT) {
 +        /* 本地补丁（2026-10-06）：对象元素形状校验（IAMF 3.6.5）
 +         *   · 1 层；· 每个对象一路单声道子流；· 对象数 > 0。
 +         * 位置参数不在这里管。 */
-+        av_log(log_ctx, AV_LOG_ERROR, "T2 obj branch nb_layers=%u\n", iamf_audio_element->nb_layers);
 +        if (iamf_audio_element->nb_layers != 1) {
 +            av_log(log_ctx, AV_LOG_ERROR,
 +                   "Invalid amount of layers for OBJECT_BASED audio element. Must be 1\n");
@@ -430,7 +427,6 @@ diff --git a/libavformat/iamf_writer.c b/libavformat/iamf_writer.c
 +         *       调用者可能用的是 `u.map`（custom 序）指针，我按 mask 解读就踩空了）。
 +         *   ⇒ 真正干净的做法：**不改调用者的结构**，而是在下面那个铺子流的循环里，
 +         *     对对象元素改用"每个子流一路"的规则（见 `对象元素` 分支）。 */
-+        av_log(log_ctx, AV_LOG_ERROR, "TRACE-B 过了对象校验\n");
 +    } else if (iamf_audio_element->audio_element_type == AV_IAMF_AUDIO_ELEMENT_TYPE_SCENE) {
          const AVIAMFLayer *layer = iamf_audio_element->layers[0];
          if (iamf_audio_element->nb_layers != 1) {
@@ -438,7 +434,7 @@ diff --git a/libavformat/iamf_writer.c b/libavformat/iamf_writer.c
              return AVERROR(EINVAL);
          }
          if (layer->ch_layout.order != AV_CHANNEL_ORDER_CUSTOM &&
-@@ -345,17 +383,31 @@ int ff_iamf_add_audio_element(IAMFContext *iamf, const AVStreamGroup *stg, void
+@@ -345,17 +379,31 @@ int ff_iamf_add_audio_element(IAMFContext *iamf, const AVStreamGroup *stg, void
      if (!audio_element->layers) {
          ret = AVERROR(ENOMEM);
          goto fail;
@@ -472,7 +468,7 @@ diff --git a/libavformat/iamf_writer.c b/libavformat/iamf_writer.c
              IAMFSubStream *substream = &audio_element->substreams[j];
  
              substream->audio_substream_id = st->id;
-@@ -412,12 +464,36 @@ int ff_iamf_add_audio_element(IAMFContext *iamf, const AVStreamGroup *stg, void
+@@ -412,12 +460,36 @@ int ff_iamf_add_audio_element(IAMFContext *iamf, const AVStreamGroup *stg, void
              ret = add_param_definition(iamf, param, audio_element, log_ctx);
              if (ret < 0)
                  goto fail;
@@ -509,7 +505,7 @@ diff --git a/libavformat/iamf_writer.c b/libavformat/iamf_writer.c
          goto fail;
      }
  
-@@ -729,12 +805,24 @@ static int param_definition(const IAMFContext *iamf,
+@@ -729,12 +801,24 @@ static int param_definition(const IAMFContext *iamf,
                  }
                  case AV_IAMF_PARAMETER_DEFINITION_RECON_GAIN: {
                      const AVIAMFReconGain *recon = subblock;
@@ -534,7 +530,7 @@ diff --git a/libavformat/iamf_writer.c b/libavformat/iamf_writer.c
      }
  
      return 0;
-@@ -761,21 +849,41 @@ static int iamf_write_audio_element(const IAMFContext *iamf,
+@@ -761,21 +845,41 @@ static int iamf_write_audio_element(const IAMFContext *iamf,
      init_put_bits(&pbc, header, sizeof(header));
      put_bits(&pbc, 3, element->audio_element_type);
      put_bits(&pbc, 5, 0);
@@ -577,7 +573,7 @@ diff --git a/libavformat/iamf_writer.c b/libavformat/iamf_writer.c
          /* When the loudspeaker_layout = 15, the type PARAMETER_DEFINITION_DEMIXING SHALL NOT be present. */
          if (layout == 15) {
              param_definition_types &= ~AV_IAMF_PARAMETER_DEFINITION_DEMIXING;
-@@ -810,13 +918,35 @@ static int iamf_write_audio_element(const IAMFContext *iamf,
+@@ -810,13 +914,35 @@ static int iamf_write_audio_element(const IAMFContext *iamf,
                  }
              }
              param_definition_types &= ~AV_IAMF_PARAMETER_DEFINITION_DEMIXING;
@@ -614,7 +610,7 @@ diff --git a/libavformat/iamf_writer.c b/libavformat/iamf_writer.c
          const IAMFParamDefinition *param_def;
          const AVIAMFDemixingInfo *demix;
  
-@@ -849,12 +979,16 @@ static int iamf_write_audio_element(const IAMFContext *iamf,
+@@ -849,12 +975,16 @@ static int iamf_write_audio_element(const IAMFContext *iamf,
      }
  
      if (element->audio_element_type == AV_IAMF_AUDIO_ELEMENT_TYPE_CHANNEL) {
@@ -631,7 +627,7 @@ diff --git a/libavformat/iamf_writer.c b/libavformat/iamf_writer.c
              return ret;
      }
  
-@@ -1051,13 +1185,14 @@ static int write_parameter_block(const IAMFContext *iamf, AVIOContext *pb,
+@@ -1051,13 +1181,14 @@ static int write_parameter_block(const IAMFContext *iamf, AVIOContext *pb,
      const IAMFParamDefinition *param_definition = ff_iamf_get_param_definition(iamf, param->parameter_id);
      PutBitContext pbc;
      AVIOContext *dyn_bc;
@@ -647,7 +643,7 @@ diff --git a/libavformat/iamf_writer.c b/libavformat/iamf_writer.c
      }
  
      if (!param_definition) {
-@@ -1118,12 +1253,98 @@ static int write_parameter_block(const IAMFContext *iamf, AVIOContext *pb,
+@@ -1118,12 +1249,98 @@ static int write_parameter_block(const IAMFContext *iamf, AVIOContext *pb,
              if (!param_definition->mode && param->constant_subblock_duration == 0)
                  ffio_write_leb(dyn_bc, demix->subblock_duration);
  
@@ -746,7 +742,7 @@ diff --git a/libavformat/iamf_writer.c b/libavformat/iamf_writer.c
  
              if (!param_definition->mode && param->constant_subblock_duration == 0)
                  ffio_write_leb(dyn_bc, recon->subblock_duration);
-@@ -1197,12 +1418,34 @@ int ff_iamf_write_parameter_blocks(const IAMFContext *iamf, AVIOContext *pb,
+@@ -1197,12 +1414,34 @@ int ff_iamf_write_parameter_blocks(const IAMFContext *iamf, AVIOContext *pb,
      }
      if (recon) {
          int ret = write_parameter_block(iamf, pb, recon, log_ctx);
@@ -781,7 +777,7 @@ diff --git a/libavformat/iamf_writer.c b/libavformat/iamf_writer.c
  
  static IAMFAudioElement *get_audio_element(const IAMFContext *c,
                                             unsigned int audio_substream_id)
-@@ -1233,17 +1476,19 @@ int ff_iamf_write_audio_frame(const IAMFContext *iamf, AVIOContext *pb,
+@@ -1233,17 +1472,19 @@ int ff_iamf_write_audio_frame(const IAMFContext *iamf, AVIOContext *pb,
      size_t side_data_size;
      int dyn_size, type = audio_substream_id <= 17 ?
                           audio_substream_id + IAMF_OBU_IA_AUDIO_FRAME_ID0 : IAMF_OBU_IA_AUDIO_FRAME;

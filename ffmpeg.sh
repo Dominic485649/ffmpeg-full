@@ -209,7 +209,7 @@ declare -A TAG_REGEX=(
   [libshaderc]='^v[0-9]+\.[0-9]+$'
   [libplacebo]='^v[0-9]+(\.[0-9]+)*$'
   [vulkan-headers]='^v[0-9]+(\.[0-9]+)*$'
-  [mbedtls]='^v3\.[0-9]+(\.[0-9]+)*$'
+  [mbedtls]='^v3\.'
   [avisynth]='^v[0-9]+(\.[0-9]+)*$'
   [libssh]='^(libssh-)?v?[0-9]+(\.[0-9]+)+$'
   [opencl-headers]='^v[0-9]{4}\.[0-9]{2}\.[0-9]{2}$'
@@ -1616,6 +1616,9 @@ stage_src() {
       stage_has_head="$(git -C "$stage" cat-file -t "$src_head" 2>/dev/null || true)"
       if [[ -n "$src_head" && "$stage_has_head" == "commit" ]]; then
         git -C "$stage" reset --hard "$src_head" >/dev/null
+        if [[ "$name" == "mbedtls" ]]; then
+          git -C "$stage" submodule update --init --recursive
+        fi
         echo "$stage"
         return 0
       fi
@@ -2638,10 +2641,6 @@ patch_ffmpeg_nvenc_hdr10plus() {
     echo "FFmpeg NVENC HDR10+ passthrough patch already applied"
     return 0
   fi
-  if grep -q 'AV_FRAME_DATA_DYNAMIC_HDR_PLUS' "$nvenc_c"; then
-    echo "FFmpeg NVENC already contains HDR10+ side-data handling; skip local patch"
-    return 0
-  fi
 
   echo "== Patch FFmpeg NVENC HDR10+ passthrough =="
   git -C "$ff_stage" apply --recount --whitespace=nowarn <<'PATCH_NVENC_HDR10PLUS'
@@ -2721,11 +2720,7 @@ index 5ea094e095..0b138e1ccd 100644
          }
      }
  
-+    if (avctx->codec->id == AV_CODEC_ID_HEVC
-+#if CONFIG_AV1_NVENC_ENCODER
-+        || avctx->codec->id == AV_CODEC_ID_AV1
-+#endif
-+    ) {
++    if (avctx->codec->id == AV_CODEC_ID_HEVC) {
 +        uint8_t *hdr_plus_data = NULL;
 +        size_t hdr_plus_size = 0;
 +
@@ -2748,12 +2743,7 @@ index 5ea094e095..0b138e1ccd 100644
 +            ctx->sei_data = tmp;
 +            ctx->sei_data[sei_count].payloadSize = (uint32_t)hdr_plus_size;
 +            ctx->sei_data[sei_count].payload = hdr_plus_data;
-+#if CONFIG_AV1_NVENC_ENCODER
-+            if (avctx->codec->id == AV_CODEC_ID_AV1)
-+                ctx->sei_data[sei_count].payloadType = AV1_METADATA_TYPE_ITUT_T35;
-+            else
-+#endif
-+                ctx->sei_data[sei_count].payloadType = SEI_TYPE_USER_DATA_REGISTERED_ITU_T_T35;
++            ctx->sei_data[sei_count].payloadType = SEI_TYPE_USER_DATA_REGISTERED_ITU_T_T35;
 +            sei_count++;
 +        }
 +    }
@@ -3751,12 +3741,13 @@ verify_full_ffmpeg_config() {
     CONFIG_LIBMYSOFA CONFIG_LIBOPENMPT CONFIG_LIBDVDREAD CONFIG_LIBDVDNAV
     CONFIG_CHROMAPRINT CONFIG_LIBZMQ CONFIG_LIBZVBI CONFIG_LIBGSM
     CONFIG_LIBOPENCORE_AMRNB CONFIG_LIBOPENCORE_AMRWB CONFIG_LIBVO_AMRWBENC
-    CONFIG_ICONV CONFIG_LIBPLACEBO_FILTER CONFIG_VULKAN
+    CONFIG_ICONV CONFIG_LIBPLACEBO_FILTER CONFIG_HDR10PLUS_FILTER CONFIG_VULKAN
     CONFIG_LIBJXR CONFIG_LIBJXR_ENCODER CONFIG_LIBJXR_DECODER
     CONFIG_LIBVPL CONFIG_AV1_QSV_ENCODER CONFIG_HEVC_QSV_ENCODER
     CONFIG_LIBAOM_AV1_ENCODER CONFIG_LIBSVTAV1_ENCODER
     CONFIG_LIBX264_ENCODER CONFIG_LIBX265_ENCODER CONFIG_LIBVVENC_ENCODER
     CONFIG_LIBVMAF_FILTER
+    CONFIG_AVS_DECODER CONFIG_CAVS_DECODER
     CONFIG_HEVC_DECODER CONFIG_AV1_DECODER CONFIG_LIBDAV1D_DECODER
     CONFIG_DOVI_RPUDEC CONFIG_DOVI_RPUENC CONFIG_DOVI_RPU_BSF CONFIG_DOVI_SPLIT_BSF
     CONFIG_MOV_DEMUXER CONFIG_MOV_MUXER CONFIG_MATROSKA_DEMUXER CONFIG_MATROSKA_MUXER
@@ -3778,6 +3769,18 @@ verify_full_ffmpeg_config() {
   fi
   for key in "${required[@]}"; do
     grep -q "^$key=yes$" "$cfg" || { echo "FFmpeg required feature disabled: $key"; exit 1; }
+  done
+  grep -q 'ff_parse_itu_t_t35_to_dynamic_hdr_vivid' "$ff_stage/libavcodec/itut35.c" || {
+    echo "FFmpeg mainline HDR Vivid T.35 parser is missing" >&2; exit 1;
+  }
+  grep -q 'AV_FRAME_DATA_DYNAMIC_HDR_VIVID' "$ff_stage/libavcodec/hevc/hevcdec.c" || {
+    echo "FFmpeg HEVC HDR Vivid frame metadata path is missing" >&2; exit 1;
+  }
+  for key in CONFIG_LIBDAVS2_DECODER CONFIG_LIBUAVS3D_DECODER CONFIG_LIBXAVS_ENCODER CONFIG_LIBXAVS2_ENCODER; do
+    if grep -q "^$key=yes$" "$cfg"; then
+      echo "External AVS2/3 decoder or AVS encoder unexpectedly enabled: $key"
+      exit 1
+    fi
   done
   if grep -Eq '^CONFIG_(CUVID|.*_CUVID_DECODER)=yes$' "$cfg"; then
     echo "FFmpeg legacy CUVID decoder is unexpectedly enabled"
@@ -3940,6 +3943,13 @@ verify_dolby_vision_support() {
     exit 1
   }
 
+  grep -Eq "[[:space:]]hdr10plus([[:space:]]|$)" <<<"$filters" || { echo "HDR10+ producer filter is missing" >&2; exit 1; }
+  help="$($ffmpeg -hide_banner -h filter=hdr10plus 2>&1)"
+  grep -q 'peak' <<<"$help" || { echo "HDR10+ producer filter options are missing" >&2; exit 1; }
+  "$ffmpeg" -hide_banner -loglevel error -f lavfi -i 'color=c=gray:s=64x64:r=1,format=yuv420p10le,setparams=colorspace=bt2020nc:color_primaries=bt2020:color_trc=smpte2084' -vf hdr10plus -frames:v 1 -f null - || { echo "HDR10+ producer filter smoke test failed" >&2; exit 1; }
+  for codec in avs cavs; do
+    grep -Eq "[[:space:]]$codec([[:space:]]|$)" <<<"$decoders" || { echo "Native AVS1 decoder is missing: $codec" >&2; exit 1; }
+  done
   for codec in hevc av1 libdav1d; do
     grep -Eq "[[:space:]]$codec([[:space:]]|$)" <<<"$decoders" || {
       echo "Dolby Vision decoder path is missing: $codec" >&2
@@ -4454,8 +4464,7 @@ EOF
     mbedtls)
       local stage
       stage="$(stage_src "mbedtls")"
-      # libssh's mbedTLS backend requires a real mutex implementation. llvm-mingw
-      # provides winpthreads; keep this change confined to the staged source.
+      # LibSSH needs public pthread settings; use its latest compatible Mbed TLS 3.6 LTS line.
       sed -i \
         -e 's|^//#define MBEDTLS_THREADING_PTHREAD$|#define MBEDTLS_THREADING_PTHREAD|' \
         -e 's|^//#define MBEDTLS_THREADING_C$|#define MBEDTLS_THREADING_C|' \
@@ -4475,6 +4484,7 @@ EOF
         -DBUILD_SHARED_LIBS=OFF \
         -DENABLE_TESTING=OFF \
         -DENABLE_PROGRAMS=OFF \
+        -DLINK_WITH_PTHREAD=ON \
         -DCMAKE_POLICY_VERSION_MINIMUM=3.5
       cmake --build "$bld" --parallel "$JOBS"
       cmake --install "$bld"
@@ -5694,6 +5704,10 @@ EOF
         --enable-ffmpeg \
         --enable-ffnvcodec \
         --disable-cuvid \
+        --disable-decoder=libdavs2 \
+        --disable-decoder=libuavs3d \
+        --disable-encoder=libxavs \
+        --disable-encoder=libxavs2 \
         --enable-nvenc \
         --enable-nvdec \
         --enable-libopus \
@@ -5854,6 +5868,8 @@ write_full_manifest() {
   done
 
   manifest_args+=(--validate "Requested Full build scope completed: ${BUILT_STAGES[*]}")
+  manifest_args+=(--validate "Native AVS1 decoders included; external AVS2/3 codecs and AVS encoders remain disabled; Audio Vivid/AV3A is unavailable")
+  manifest_args+=(--validate "FFmpeg mainline HEVC decoding includes ITU-T T.35 HDR Vivid frame metadata parsing; HDR Vivid generation/encoding is unavailable")
   if [[ "$ffmpeg_built" == "1" ]]; then
     manifest_args+=(--validate "FFmpeg stage configured, linked, and its runtime DLL closure was checked")
   else
@@ -5874,7 +5890,9 @@ write_full_manifest() {
     --skip "MPEG-TS Dolby Vision metadata descriptor output is not implemented; demux and decode input support remains enabled"
     --skip "No changing-scene HDR10+ HEVC/AV1 bitstream round-trip was run; compile-time path presence does not prove per-frame metadata survived encoding"
     --skip "P7 FEL reconstruction is not integrated or validated against a trusted reference; no FEL sample/reference or reconstructor is available"
-    --skip "Dolby Vision-to-HDR10+ regeneration is unavailable: no authorized frame-analysis generator is installed; hdr10plus_tool only edits or injects existing metadata"
+    --validate "HDR10+ producer filter is compiled, exposes options, and passed a synthetic PQ-frame smoke test"
+    --skip "HDR10+ producer measures each frame as a one-frame scene; no scene-level real-content validation was run"
+    --skip "Audio Vivid/AV3A integration is unavailable; external AVS2/3 decoders and AVS encoders remain excluded"
     --skip "Audio Vivid decoder-only integration is unavailable: UWA AV3A source, FFmpeg demux/decode patch, model.bin, and usage/distribution authorization are absent; AV3A encoding is out of scope"
     --skip "av1_qsv HDR10+ metadata injection is not implemented; QSV dynamic-metadata paths are not runtime-verified"
   )

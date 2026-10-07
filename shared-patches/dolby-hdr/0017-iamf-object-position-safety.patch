@@ -1,0 +1,1884 @@
+diff --git a/doc/APIchanges b/doc/APIchanges
+index f6e68f5eac..4a3310ac76 100644
+--- a/doc/APIchanges
++++ b/doc/APIchanges
+@@ -2,6 +2,12 @@ The last version increases of all libraries were on 2026-06-23.
+ 
+ API changes, most recent first:
+ 
++2026-10-07 - xxxxxxxxxx - lavc 63.18.100 - packet.h
++  Add IAMF object-position AVPacketSideData types.
++
++2026-10-07 - xxxxxxxxxx - lavu 61.12.100 - iamf.h
++  Add IAMF v2 object-position parameter definitions and subblocks.
++
+ 2026-10-03 - xxxxxxxxxx - lavu 61.11.100 - pixfmt.h
+   Add AV_PIX_FMT_XYZP12LE, AV_PIX_FMT_XYZP12BE, and AV_PIX_FMT_XYZP12.
+ 
+diff --git a/fftools/ffmpeg_mux_init.c b/fftools/ffmpeg_mux_init.c
+index fa9bcc981e..75e0263bc1 100644
+--- a/fftools/ffmpeg_mux_init.c
++++ b/fftools/ffmpeg_mux_init.c
+@@ -2344,6 +2344,83 @@ fail:
+     return ret;
+ }
+ 
++static int of_prepare_iamf_mix_gain_param(Muxer *mux,
++                                           AVIAMFParamDefinition **pparam,
++                                           AVDictionary **pdict,
++                                           const char *token)
++{
++    const AVDictionaryEntry *entry;
++    AVDictionary *dict = *pdict;
++    unsigned int duration = 0, constant_duration = 0, nb_subblocks = 0;
++    const char *p;
++
++    entry = av_dict_get(dict, "duration", NULL, 0);
++    if (entry) {
++        char *end;
++        unsigned long value = strtoul(entry->value, &end, 0);
++        if (*end || value > UINT_MAX)
++            return AVERROR(EINVAL);
++        duration = value;
++    }
++    entry = av_dict_get(dict, "constant_subblock_duration", NULL, 0);
++    if (entry) {
++        char *end;
++        unsigned long value = strtoul(entry->value, &end, 0);
++        if (*end || value > UINT_MAX)
++            return AVERROR(EINVAL);
++        constant_duration = value;
++    }
++
++    if (duration && constant_duration) {
++        nb_subblocks = duration / constant_duration + (duration % constant_duration != 0);
++    } else if (duration) {
++        for (p = token; (p = strstr(p, "subblock_duration=")); p++) {
++            if (p == token || p[-1] == ':')
++                nb_subblocks++;
++        }
++    }
++    if (nb_subblocks > 1024) {
++        av_log(mux, AV_LOG_ERROR, "Too many IAMF mix-gain subblocks: %u\n", nb_subblocks);
++        return AVERROR(EINVAL);
++    }
++
++    if ((*pparam)->nb_subblocks != nb_subblocks) {
++        AVIAMFParamDefinition *param = av_iamf_param_definition_alloc(
++            AV_IAMF_PARAMETER_DEFINITION_MIX_GAIN, nb_subblocks, NULL);
++        if (!param)
++            return AVERROR(ENOMEM);
++        param->parameter_id = (*pparam)->parameter_id;
++        param->parameter_rate = (*pparam)->parameter_rate;
++        av_free(*pparam);
++        *pparam = param;
++    }
++
++    if (duration && !constant_duration) {
++        unsigned int index = 0;
++        for (p = token; (p = strstr(p, "subblock_duration=")); p++) {
++            unsigned int value;
++            char *end;
++            if (p != token && p[-1] != ':')
++                continue;
++            value = strtoul(p + strlen("subblock_duration="), &end, 0);
++            if (end == p + strlen("subblock_duration=") || value > UINT_MAX ||
++                index >= nb_subblocks)
++                return AVERROR(EINVAL);
++            ((AVIAMFMixGain *)av_iamf_param_definition_get_subblock(*pparam, index++))->subblock_duration = value;
++        }
++        if (index != nb_subblocks)
++            return AVERROR_INVALIDDATA;
++    }
++
++    av_dict_set(pdict, "subblock_duration", NULL, 0);
++    av_dict_set(pdict, "animation_type", NULL, 0);
++    av_dict_set(pdict, "start_point_value", NULL, 0);
++    av_dict_set(pdict, "end_point_value", NULL, 0);
++    av_dict_set(pdict, "control_point_value", NULL, 0);
++    av_dict_set(pdict, "control_point_relative_time", NULL, 0);
++    return 0;
++}
++
+ static int of_parse_iamf_submixes(Muxer *mux, AVStreamGroup *stg, char *ptr)
+ {
+     AVFormatContext *oc = mux->fc;
+@@ -2429,10 +2506,39 @@ static int of_parse_iamf_submixes(Muxer *mux, AVStreamGroup *stg, char *ptr)
+ 
+                 submix_element->element_mix_config =
+                     av_iamf_param_definition_alloc(AV_IAMF_PARAMETER_DEFINITION_MIX_GAIN, 0, NULL);
+-                if (!submix_element->element_mix_config)
++                if (!submix_element->element_mix_config) {
+                     ret = AVERROR(ENOMEM);
++                    goto fail;
++                }
+                 av_dict_set(&dict, "stg", NULL, 0);
+-                av_opt_set_dict2(submix_element, &dict, AV_OPT_SEARCH_CHILDREN);
++                ret = of_prepare_iamf_mix_gain_param(mux, &submix_element->element_mix_config,
++                                                     &dict, subtoken);
++                if (ret < 0)
++                    goto fail;
++                ret = av_opt_set_dict2(submix_element, &dict, AV_OPT_SEARCH_CHILDREN);
++                if (ret < 0) {
++                    av_log(mux, AV_LOG_ERROR, "Error setting IAMF submix element options");
++                    goto fail;
++                }
++                if (submix_element->position_type >= 0 &&
++                    submix_element->position_type < AV_IAMF_PARAMETER_DEFINITION_POLAR) {
++                    av_log(mux, AV_LOG_ERROR, "Invalid IAMF position parameter type %d\n",
++                           submix_element->position_type);
++                    ret = AVERROR(EINVAL);
++                    goto fail;
++                }
++                if (submix_element->position_type >= AV_IAMF_PARAMETER_DEFINITION_POLAR) {
++                    submix_element->position_info =
++                        av_iamf_param_definition_alloc(submix_element->position_type, 0, NULL);
++                    if (!submix_element->position_info) {
++                        ret = AVERROR(ENOMEM);
++                        goto fail;
++                    }
++                    submix_element->position_info->parameter_id =
++                        submix_element->position_parameter_id;
++                    submix_element->position_info->parameter_rate =
++                        submix_element->position_parameter_rate;
++                }
+             } else if (layout) {
+                 AVIAMFSubmixLayout *submix_layout = av_iamf_submix_add_layout(submix);
+                 if (!submix_layout) {
+@@ -2441,8 +2547,13 @@ static int of_parse_iamf_submixes(Muxer *mux, AVStreamGroup *stg, char *ptr)
+                     goto fail;
+                 }
+                 av_opt_set_dict(submix_layout, &dict);
+-            } else
+-                av_opt_set_dict2(submix, &dict, AV_OPT_SEARCH_CHILDREN);
++            } else {
++                ret = of_prepare_iamf_mix_gain_param(mux, &submix->output_mix_config,
++                                                     &dict, subtoken);
++                if (ret < 0)
++                    goto fail;
++                ret = av_opt_set_dict2(submix, &dict, AV_OPT_SEARCH_CHILDREN);
++            }
+ 
+             if (ret < 0) {
+                 goto fail;
+@@ -2656,7 +2767,7 @@ static int of_parse_group_token(Muxer *mux, const char *token, char *ptr)
+     };
+     const AVClass *pclass = &class;
+     int type, ret;
+-    char *元素类型值 = NULL;
++    char *audio_element_type_name = NULL;
+ 
+     ret = av_dict_parse_string(&dict, token, "=", ":", AV_DICT_MULTIKEY);
+     if (ret < 0) {
+@@ -2703,25 +2814,13 @@ static int of_parse_group_token(Muxer *mux, const char *token, char *ptr)
+         goto end;
+     }
+ 
+-    /*
+-     * 本地补丁（2026-10-06）：把 `audio_element_type=` 摘出来单独存，并在 create 前
+-     * 从字典里删掉。
+-     *
+-     * 两件事都必须在这里做：
+-     *   ① 它必须**从传给 create 的字典里消失**。`avformat_stream_group_create()`
+-     *      末尾会 `av_opt_set_dict2(stg, options, AV_OPT_SEARCH_CHILDREN)`，
+-     *      字典里若有它认不得的键就 `goto fail → ff_free_stream_group → return NULL`。
+-     *      `audio_element_type` 是 AVIAMFAudioElement 的选项，流组本身不认。
+-     *   ② 它**在 dict 里、不在 ptr 里** —— 调用方
+-     *      `token = av_strtok(str, ",", &ptr)` 先按逗号切，
+-     *      所以 `...:audio_element_type=object,layer=...` 里那个键属于 token 段。
+-     */
++
+     {
+-        const AVDictionaryEntry *类型项 =
++        const AVDictionaryEntry *audio_element_entry =
+             av_dict_get(tmp, "audio_element_type", NULL, AV_DICT_IGNORE_SUFFIX);
+-        if (类型项)
+-            元素类型值 = av_strdup(类型项->value);
+-        if (类型项 && !元素类型值) { ret = AVERROR(ENOMEM); goto end; }
++        if (audio_element_entry)
++            audio_element_type_name = av_strdup(audio_element_entry->value);
++        if (audio_element_entry && !audio_element_type_name) { ret = AVERROR(ENOMEM); goto end; }
+     }
+     av_dict_set(&tmp, "audio_element_type", NULL, 0);
+ 
+@@ -2744,7 +2843,7 @@ static int of_parse_group_token(Muxer *mux, const char *token, char *ptr)
+         if (ret < 0)
+             goto end;
+         OutputStream *ost = mux->of.streams[idx];
+-        /* 本地补丁（2026-10-06）：`ost` 可能为 NULL，原来无条件 `ost->enc` 会崩。 */
++
+         if (ost && ost->enc && (type == AV_STREAM_GROUP_PARAMS_IAMF_AUDIO_ELEMENT ||
+                                 type == AV_STREAM_GROUP_PARAMS_IAMF_MIX_PRESENTATION))
+             ost->enc->flags2 |= AV_CODEC_FLAG2_FIXED_FRAME_SIZE;
+@@ -2766,19 +2865,12 @@ static int of_parse_group_token(Muxer *mux, const char *token, char *ptr)
+ 
+     switch(type) {
+     case AV_STREAM_GROUP_PARAMS_IAMF_AUDIO_ELEMENT:
+-        /* 本地补丁（2026-10-06）：把摘出来的 `audio_element_type` 设到音频元素上。
+-         *
+-         * ⚠ 不能用 `av_opt_set(stg, ..., AV_OPT_SEARCH_CHILDREN)`：
+-         *   实测它返回 0（"成功"）、`av_opt_get` 也能读回 2，但
+-         *   `stg->params.iamf_audio_element->audio_element_type` 仍是 0 ——
+-         *   SEARCH_CHILDREN 走 child_class_iterate/child_next 拿"某个子对象实例"，
+-         *   未必就是 params 里这个元素。
+-         *   ⇒ 直接对**元素指针**设。 */
+-        if (元素类型值 && stg->params.iamf_audio_element) {
++
++        if (audio_element_type_name && stg->params.iamf_audio_element) {
+             ret = av_opt_set(stg->params.iamf_audio_element,
+-                             "audio_element_type", 元素类型值, 0);
++                             "audio_element_type", audio_element_type_name, 0);
+             if (ret < 0) {
+-                av_log(mux, AV_LOG_ERROR, "Invalid audio_element_type \"%s\"\n", 元素类型值);
++                av_log(mux, AV_LOG_ERROR, "Invalid audio_element_type \"%s\"\n", audio_element_type_name);
+                 goto end;
+             }
+         }
+@@ -2809,7 +2901,7 @@ static int of_parse_group_token(Muxer *mux, const char *token, char *ptr)
+ 
+     ret = 0;
+ end:
+-    av_free(元素类型值);
++    av_free(audio_element_type_name);
+     av_free(mapped_string);
+     av_dict_free(&dict);
+     av_dict_free(&tmp);
+diff --git a/fftools/ffprobe.c b/fftools/ffprobe.c
+index 3051fe43b5..2c8d871e54 100644
+--- a/fftools/ffprobe.c
++++ b/fftools/ffprobe.c
+@@ -2309,6 +2309,38 @@ static void print_iamf_submix_params(AVTextFormatContext *tfc, const AVIAMFSubmi
+         print_int("stream_id",                 element->audio_element_id);
+         print_q("default_mix_gain",            element->default_mix_gain, '/');
+         print_int("headphones_rendering_mode", element->headphones_rendering_mode);
++        if (element->position_info) {
++            print_int("position_type", element->position_info->type);
++            print_int("position_parameter_id", element->position_info->parameter_id);
++            print_int("position_parameter_rate", element->position_info->parameter_rate);
++            switch (element->position_info->type) {
++            case AV_IAMF_PARAMETER_DEFINITION_POLAR:
++            case AV_IAMF_PARAMETER_DEFINITION_DUAL_POLAR:
++                print_int("default_azimuth", element->default_azimuth);
++                print_int("default_elevation", element->default_elevation);
++                print_int("default_distance", element->default_distance);
++                if (element->position_info->type == AV_IAMF_PARAMETER_DEFINITION_DUAL_POLAR) {
++                    print_int("default_azimuth2", element->default_azimuth2);
++                    print_int("default_elevation2", element->default_elevation2);
++                    print_int("default_distance2", element->default_distance2);
++                }
++                break;
++            case AV_IAMF_PARAMETER_DEFINITION_CART8:
++            case AV_IAMF_PARAMETER_DEFINITION_CART16:
++            case AV_IAMF_PARAMETER_DEFINITION_DUAL_CART8:
++            case AV_IAMF_PARAMETER_DEFINITION_DUAL_CART16:
++                print_int("default_x", element->default_x);
++                print_int("default_y", element->default_y);
++                print_int("default_z", element->default_z);
++                if (element->position_info->type == AV_IAMF_PARAMETER_DEFINITION_DUAL_CART8 ||
++                    element->position_info->type == AV_IAMF_PARAMETER_DEFINITION_DUAL_CART16) {
++                    print_int("default_x2", element->default_x2);
++                    print_int("default_y2", element->default_y2);
++                    print_int("default_z2", element->default_z2);
++                }
++                break;
++            }
++        }
+         avtext_print_section_header(tfc, NULL, SECTION_ID_STREAM_GROUP_SUBPIECES);
+         if (element->annotations) {
+             const AVDictionaryEntry *annotation = NULL;
+diff --git a/fftools/textformat/avtextformat.h b/fftools/textformat/avtextformat.h
+index 401544b146..2b639e90eb 100644
+--- a/fftools/textformat/avtextformat.h
++++ b/fftools/textformat/avtextformat.h
+@@ -109,7 +109,7 @@ typedef struct AVTextFormatter {
+     int flags;                  ///< a combination or AV_TEXTFORMAT__FLAG_*
+ } AVTextFormatter;
+ 
+-#define SECTION_MAX_NB_LEVELS    12
++#define SECTION_MAX_NB_LEVELS    16
+ #define SECTION_MAX_NB_SECTIONS 100
+ 
+ typedef struct AVTextFormatOptions {
+diff --git a/libavcodec/packet.c b/libavcodec/packet.c
+index 49b5a814e3..b5a82cbd4c 100644
+--- a/libavcodec/packet.c
++++ b/libavcodec/packet.c
+@@ -306,6 +306,12 @@ const char *av_packet_side_data_name(enum AVPacketSideDataType type)
+     case AV_PKT_DATA_IAMF_MIX_GAIN_PARAM:        return "IAMF Mix Gain Parameter Data";
+     case AV_PKT_DATA_IAMF_DEMIXING_INFO_PARAM:   return "IAMF Demixing Info Parameter Data";
+     case AV_PKT_DATA_IAMF_RECON_GAIN_INFO_PARAM: return "IAMF Recon Gain Info Parameter Data";
++    case AV_PKT_DATA_IAMF_POLAR_POSITION_PARAM: return "IAMF Polar Position Parameter Data";
++    case AV_PKT_DATA_IAMF_CART8_POSITION_PARAM: return "IAMF Cartesian 8-bit Position Parameter Data";
++    case AV_PKT_DATA_IAMF_CART16_POSITION_PARAM: return "IAMF Cartesian 16-bit Position Parameter Data";
++    case AV_PKT_DATA_IAMF_DUAL_POLAR_POSITION_PARAM: return "IAMF Dual Polar Position Parameter Data";
++    case AV_PKT_DATA_IAMF_DUAL_CART8_POSITION_PARAM: return "IAMF Dual Cartesian 8-bit Position Parameter Data";
++    case AV_PKT_DATA_IAMF_DUAL_CART16_POSITION_PARAM: return "IAMF Dual Cartesian 16-bit Position Parameter Data";
+     case AV_PKT_DATA_FRAME_CROPPING:             return "Frame Cropping";
+     case AV_PKT_DATA_LCEVC:                      return "LCEVC NAL data";
+     case AV_PKT_DATA_3D_REFERENCE_DISPLAYS:      return "3D Reference Displays Info";
+diff --git a/libavcodec/packet.h b/libavcodec/packet.h
+index 0678f0596b..b28c09e53f 100644
+--- a/libavcodec/packet.h
++++ b/libavcodec/packet.h
+@@ -392,14 +392,9 @@ enum AVPacketSideDataType {
+      * needs to be updated as it assumes it to be smaller than other limits.
+      */
+     /**
+-     * 本地补丁（2026-10-06）：IAMF v2.0.0 的**位置参数**（6 种）各占一个 side-data 类型。
+-     * metadata 形式为 AVIAMFParamDefinition，其 `type` 决定子块语义：
+-     *   AV_IAMF_PARAMETER_DEFINITION_POLAR / CART8 / CART16 /
+-     *   DUAL_POLAR / DUAL_CART8 / DUAL_CART16
+-     * 子块统一是 AVIAMFPolarParamSubblock。位流见 iamf-tools 的 *_position_data.cc。
+-     *
+-     * ⚠ 加在**最后一个 IAMF 项之后、非 IAMF 项之前**：这一段取值会顺移，
+-     *   任何按数值硬编码 AV_PKT_DATA_* 的下游都会受影响（本树内已核：没有）。
++     * IAMF v2 object-position Parameter Data. Each side-data item contains
++     * one or more AVIAMFParamDefinition records of the corresponding type.
++     * These values must remain at the end of the IAMF side-data types.
+      */
+     AV_PKT_DATA_IAMF_POLAR_POSITION_PARAM,
+     AV_PKT_DATA_IAMF_CART8_POSITION_PARAM,
+diff --git a/libavcodec/version.h b/libavcodec/version.h
+index 2618016a83..65bc52fb24 100644
+--- a/libavcodec/version.h
++++ b/libavcodec/version.h
+@@ -29,7 +29,7 @@
+ 
+ #include "version_major.h"
+ 
+-#define LIBAVCODEC_VERSION_MINOR  17
++#define LIBAVCODEC_VERSION_MINOR  18
+ #define LIBAVCODEC_VERSION_MICRO 100
+ 
+ #define LIBAVCODEC_VERSION_INT  AV_VERSION_INT(LIBAVCODEC_VERSION_MAJOR, \
+diff --git a/libavformat/iamf.h b/libavformat/iamf.h
+index ad874c1fa8..dae6317ee3 100644
+--- a/libavformat/iamf.h
++++ b/libavformat/iamf.h
+@@ -99,6 +99,7 @@ typedef struct IAMFAudioElement {
+     unsigned int nb_substreams;
+ 
+     unsigned int codec_config_id;
++    unsigned int num_objects;
+ 
+     IAMFLayer *layers;
+     unsigned int nb_layers;
+diff --git a/libavformat/iamf_parse.c b/libavformat/iamf_parse.c
+index 6315d45203..506c602099 100644
+--- a/libavformat/iamf_parse.c
++++ b/libavformat/iamf_parse.c
+@@ -694,29 +694,17 @@ static int param_parse(void *s, IAMFContext *c, AVIOContext *pb,
+             recon->subblock_duration = subblock_duration;
+             break;
+         }
+-        /* 本地补丁（2026-10-06）：位置参数族（6 型）
+-         *
+-         * ⚠ 这里**只登记子块、不读默认位置**。为什么：
+-         *   写侧没往"参数定义"里写默认位置（只写 subblock_duration），
+-         *   读侧若去读坐标字节，就会**读穿到下一个字段**、把整个 OBU 解析带偏 ——
+-         *   实测症状是 "Cannot allocate memory"（后面字段全错、尺寸校验炸）。
+-         *   位置值走**数据块**，定义里保持"只有 duration"，读写两侧同形。 */
+         case AV_IAMF_PARAMETER_DEFINITION_POLAR:
+         case AV_IAMF_PARAMETER_DEFINITION_CART8:
+         case AV_IAMF_PARAMETER_DEFINITION_CART16:
+         case AV_IAMF_PARAMETER_DEFINITION_DUAL_POLAR:
+         case AV_IAMF_PARAMETER_DEFINITION_DUAL_CART8:
+         case AV_IAMF_PARAMETER_DEFINITION_DUAL_CART16: {
+-            AVIAMFPolarParamSubblock *pol = subblock;
+-            pol->subblock_duration = subblock_duration;
+-            pol->animation_type = 0;
+-            pol->has_second = 0;
+-            pol->azimuth = pol->elevation = pol->distance = 0;
+-            pol->x = pol->y = pol->z = 0;
+-            pol->azimuth2 = pol->elevation2 = pol->distance2 = 0;
+-            pol->x2 = pol->y2 = pol->z2 = 0;
++            AVIAMFPositionParamSubblock *position = subblock;
++            position->subblock_duration = subblock_duration;
+             break;
+         }
++
+         default:
+             av_free(param);
+             return AVERROR_INVALIDDATA;
+@@ -777,7 +765,7 @@ static int audio_element_obu(void *s, IAMFContext *c, AVIOContext *pb, int len)
+     FFIOContext b;
+     AVIOContext *pbc;
+     uint8_t *buf;
+-    unsigned audio_element_id, nb_substreams, codec_config_id, num_parameters;
++    unsigned audio_element_id, nb_substreams, codec_config_id, num_parameters, num_objects = 0;
+     int audio_element_type, ret;
+ 
+     buf = av_malloc(len);
+@@ -801,26 +789,26 @@ static int audio_element_obu(void *s, IAMFContext *c, AVIOContext *pb, int len)
+         }
+ 
+     audio_element_type = avio_r8(pbc) >> 5;
+-    /* 本地补丁（2026-10-06）：上界放宽到 OBJECT（=2），否则自己写的对象件读不回来 */
++
+     if (audio_element_type > AV_IAMF_AUDIO_ELEMENT_TYPE_OBJECT) {
+         av_log(s, AV_LOG_DEBUG, "Unknown audio_element_type referenced in an audio element. Ignoring\n");
+         ret = 0;
+         goto fail;
+     }
+ 
+-    /* 本地补丁（2026-10-06）：对象元素的 ObjectsConfig() 在 codec_config_id **之前**，
+-     * 必须在这里吃掉，否则后面所有字段都会错位一个 ObjectsConfig 的宽度。
+-     * 结构（规范 3.6.5）：num_objects(8) + objects_config_extension_bytes(8 位长度 + 载荷)。 */
+     if (audio_element_type == AV_IAMF_AUDIO_ELEMENT_TYPE_OBJECT) {
+-        unsigned int num_objects = avio_r8(pbc);
+-        unsigned int ext_len = avio_r8(pbc);
+-        if (num_objects == 0) {
+-            av_log(s, AV_LOG_ERROR, "OBJECT_BASED audio element with num_objects = 0\n");
++        unsigned int objects_config_size = ffio_read_leb(pbc);
++        if (objects_config_size < 1 || objects_config_size > len - avio_tell(pbc)) {
++            ret = AVERROR_INVALIDDATA;
++            goto fail;
++        }
++        num_objects = avio_r8(pbc);
++        if (num_objects < 1 || num_objects > 2) {
++            av_log(s, AV_LOG_ERROR, "Unsupported IAMF object count %u\n", num_objects);
+             ret = AVERROR_INVALIDDATA;
+             goto fail;
+         }
+-        for (unsigned int i = 0; i < ext_len; i++)
+-            avio_r8(pbc);
++        avio_skip(pbc, objects_config_size - 1);
+     }
+ 
+     codec_config_id = ffio_read_leb(pbc);
+@@ -860,6 +848,7 @@ static int audio_element_obu(void *s, IAMFContext *c, AVIOContext *pb, int len)
+     }
+     audio_element->codec_config_id = codec_config_id;
+     audio_element->audio_element_id = audio_element_id;
++    audio_element->num_objects = num_objects;
+     audio_element->substreams = av_calloc(nb_substreams, sizeof(*audio_element->substreams));
+     if (!audio_element->substreams) {
+         ret = AVERROR(ENOMEM);
+@@ -916,13 +905,8 @@ static int audio_element_obu(void *s, IAMFContext *c, AVIOContext *pb, int len)
+         ret = AVERROR_INVALIDDATA;
+         goto fail;
+     }
+-    /* 本地补丁（2026-10-06）：对象元素**可以**带参数块（位置参数就在这里声明）。
+-     * ⚠ 原来这条是"非 CHANNEL 就一律不许有参数"，把 SCENE 与 OBJECT 一起否了。
+-     *   对象元素必须放行，否则我们写出的对象件读回来时会被判
+-     *   "parameter count 1 is invalid for Scene representations" 而整件拒收。 */
+-    if (num_parameters && audio_element_type == AV_IAMF_AUDIO_ELEMENT_TYPE_SCENE) {
+-        av_log(s, AV_LOG_ERROR, "Audio Element parameter count %u is invalid"
+-                                " for Scene representations\n", num_parameters);
++    if (num_parameters && audio_element_type != AV_IAMF_AUDIO_ELEMENT_TYPE_CHANNEL) {
++        av_log(s, AV_LOG_ERROR, "Audio Element parameter definitions are invalid for this type\n");
+         ret = AVERROR_INVALIDDATA;
+         goto fail;
+     }
+@@ -931,6 +915,11 @@ static int audio_element_obu(void *s, IAMFContext *c, AVIOContext *pb, int len)
+         unsigned type;
+ 
+         type = ffio_read_leb(pbc);
++        if (type >= AV_IAMF_PARAMETER_DEFINITION_POLAR &&
++            type <= AV_IAMF_PARAMETER_DEFINITION_DUAL_CART16) {
++            ret = AVERROR_INVALIDDATA;
++            goto fail;
++        }
+         if (type == AV_IAMF_PARAMETER_DEFINITION_MIX_GAIN)
+             ret = AVERROR_INVALIDDATA;
+         else if (type == AV_IAMF_PARAMETER_DEFINITION_DEMIXING) {
+@@ -966,40 +955,28 @@ static int audio_element_obu(void *s, IAMFContext *c, AVIOContext *pb, int len)
+         if (ret < 0)
+             goto fail;
+     } else if (audio_element_type == AV_IAMF_AUDIO_ELEMENT_TYPE_OBJECT) {
+-        /* 本地补丁（2026-10-06）：对象元素没有 scalable/ambisonics config。
+-         *
+-         * ⚠ 但**必须建 layer**：后续代码无条件访问 `element->layers[...]`，
+-         *   而 layers 只在 CHANNEL(:397) / SCENE(:544) 两条支路里分配。
+-         *   我第一版在这里"什么都不做" ⇒ `layers == NULL` ⇒ 读回自己写的对象件时
+-         *   **访问违例崩掉**（实测 rc=0xC0000005）—— 典型"写得出、读不回"。
+-         * ⇒ 照 ambisonics_config 的建法补一个 layer（两套结构要分别设）：
+-         *     · 内部 `IAMFLayer`（audio_element->layers）装 substream 计数
+-         *     · 公开 `AVIAMFLayer`（element->layers）由 add_layer 分配
+-         */
++        AVIAMFLayer *layer;
++        if (nb_substreams != 1) {
++            ret = AVERROR_INVALIDDATA;
++            goto fail;
++        }
+         audio_element->layers = av_calloc(1, sizeof(*audio_element->layers));
+         if (!audio_element->layers) {
+             ret = AVERROR(ENOMEM);
+             goto fail;
+         }
+         audio_element->nb_layers = 1;
+-        audio_element->layers->substream_count         = nb_substreams;
+-        audio_element->layers->coupled_substream_count = 0;
++        audio_element->layers->substream_count = 1;
++        audio_element->layers->coupled_substream_count = num_objects == 2;
+ 
+-        {
+-            AVIAMFLayer *layer = av_iamf_audio_element_add_layer(element);
+-            if (!layer) {
+-                ret = AVERROR(ENOMEM);
+-                goto fail;
+-            }
+-            /* 对象各占一路单声道；不设 ambisonics_mode（那是 SCENE 的字段） */
+-            av_channel_layout_default(&layer->ch_layout, 1);
++        layer = av_iamf_audio_element_add_layer(element);
++        if (!layer) {
++            ret = AVERROR(ENOMEM);
++            goto fail;
+         }
++        av_channel_layout_default(&layer->ch_layout, num_objects);
++        audio_element->substreams[0].codecpar->ch_layout = layer->ch_layout;
+ 
+-        /* 每个 substream 的 codecpar 也要标 mono —— 否则解码器报
+-         * "Decoder requires channel layout to be set"（实测）。
+-         * 照 ambisonics_config(:559) 的同一手法。 */
+-        for (int i = 0; i < nb_substreams; i++)
+-            audio_element->substreams[i].codecpar->ch_layout = (AVChannelLayout)AV_CHANNEL_LAYOUT_MONO;
+     } else {
+         av_unreachable("audio_element_type should have been checked above");
+     }
+@@ -1035,6 +1012,60 @@ static int label_string(AVIOContext *pb, char **label)
+     return 0;
+ }
+ 
++static int read_position_defaults(AVIOContext *pb, unsigned int type,
++                                  AVIAMFSubmixElement *element)
++{
++    const int polar = type == AV_IAMF_PARAMETER_DEFINITION_POLAR ||
++                      type == AV_IAMF_PARAMETER_DEFINITION_DUAL_POLAR;
++    const int dual = type == AV_IAMF_PARAMETER_DEFINITION_DUAL_POLAR ||
++                     type == AV_IAMF_PARAMETER_DEFINITION_DUAL_CART8 ||
++                     type == AV_IAMF_PARAMETER_DEFINITION_DUAL_CART16;
++    const int cart_bits = type == AV_IAMF_PARAMETER_DEFINITION_CART16 ||
++                          type == AV_IAMF_PARAMETER_DEFINITION_DUAL_CART16 ? 16 :
++                          type == AV_IAMF_PARAMETER_DEFINITION_CART8 ||
++                          type == AV_IAMF_PARAMETER_DEFINITION_DUAL_CART8 ? 8 : 0;
++    const int bits = (polar ? 24 : cart_bits * 3) * (dual ? 2 : 1);
++    const int bytes = bits / 8;
++    uint8_t data[12];
++    int values[2][3] = { 0 };
++    GetBitContext gb;
++    int ret;
++
++    if (bits <= 0 || bits > sizeof(data) * 8)
++        return AVERROR_INVALIDDATA;
++    ret = ffio_read_size(pb, data, bytes);
++    if (ret < 0)
++        return ret;
++    ret = init_get_bits8(&gb, data, bytes);
++    if (ret < 0)
++        return ret;
++
++    for (int object = 0; object < (dual ? 2 : 1); object++) {
++        for (int axis = 0; axis < 3; axis++) {
++            int width = polar ? (axis == 0 ? 9 : axis == 1 ? 8 : 7) : cart_bits;
++            values[object][axis] = polar && axis == 2 ? get_bits(&gb, width) :
++                                                            get_sbits(&gb, width);
++        }
++    }
++
++    if (polar) {
++        element->default_azimuth = values[0][0];
++        element->default_elevation = values[0][1];
++        element->default_distance = values[0][2];
++        element->default_azimuth2 = values[1][0];
++        element->default_elevation2 = values[1][1];
++        element->default_distance2 = values[1][2];
++    } else {
++        element->default_x = values[0][0];
++        element->default_y = values[0][1];
++        element->default_z = values[0][2];
++        element->default_x2 = values[1][0];
++        element->default_y2 = values[1][1];
++        element->default_z2 = values[1][2];
++    }
++    return 0;
++}
++
+ static int mix_presentation_obu(void *s, IAMFContext *c, AVIOContext *pb, int len)
+ {
+     AVIAMFMixPresentation *mix;
+@@ -1182,10 +1213,64 @@ static int mix_presentation_obu(void *s, IAMFContext *c, AVIOContext *pb, int le
+                     goto fail;
+             }
+ 
+-            submix_element->headphones_rendering_mode = avio_r8(pbc) >> 6;
++            {
++                const unsigned int rendering_config_header = avio_r8(pbc);
++                unsigned int num_parameters = 0;
++                int rendering_config_start;
++
++                submix_element->headphones_rendering_mode = rendering_config_header >> 6;
++                rendering_config_extension_size = ffio_read_leb(pbc);
++                rendering_config_start = avio_tell(pbc);
++                if (rendering_config_extension_size > len - rendering_config_start) {
++                    ret = AVERROR_INVALIDDATA;
++                    goto fail;
++                }
+ 
+-            rendering_config_extension_size = ffio_read_leb(pbc);
+-            avio_skip(pbc, rendering_config_extension_size);
++                if (rendering_config_extension_size) {
++                    num_parameters = ffio_read_leb(pbc);
++                    if (num_parameters > 1) {
++                        ret = AVERROR_INVALIDDATA;
++                        goto fail;
++                    }
++                    if (num_parameters) {
++                        unsigned int type = ffio_read_leb(pbc);
++                        const int dual =
++                            type == AV_IAMF_PARAMETER_DEFINITION_DUAL_POLAR ||
++                            type == AV_IAMF_PARAMETER_DEFINITION_DUAL_CART8 ||
++                            type == AV_IAMF_PARAMETER_DEFINITION_DUAL_CART16;
++                        if (type < AV_IAMF_PARAMETER_DEFINITION_POLAR ||
++                            type > AV_IAMF_PARAMETER_DEFINITION_DUAL_CART16 ||
++                            audio_element->element->audio_element_type != AV_IAMF_AUDIO_ELEMENT_TYPE_OBJECT ||
++                            dual != (audio_element->num_objects == 2)) {
++                            ret = AVERROR_INVALIDDATA;
++                            goto fail;
++                        }
++                        ret = param_parse(s, c, pbc, type, audio_element, config,
++                                          &submix_element->position_info);
++                        if (ret < 0)
++                            goto fail;
++                        submix_element->position_type = type;
++                        submix_element->position_parameter_id =
++                            submix_element->position_info->parameter_id;
++                        submix_element->position_parameter_rate =
++                            submix_element->position_info->parameter_rate;
++                        ret = read_position_defaults(pbc, type, submix_element);
++                        if (ret < 0)
++                            goto fail;
++                    } else if (audio_element->element->audio_element_type ==
++                               AV_IAMF_AUDIO_ELEMENT_TYPE_OBJECT) {
++                        ret = AVERROR_INVALIDDATA;
++                        goto fail;
++                    }
++
++                    if (avio_tell(pbc) - rendering_config_start > rendering_config_extension_size) {
++                        ret = AVERROR_INVALIDDATA;
++                        goto fail;
++                    }
++                    avio_skip(pbc, rendering_config_extension_size -
++                              (avio_tell(pbc) - rendering_config_start));
++                }
++            }
+ 
+             ret = param_parse(s, c, pbc, AV_IAMF_PARAMETER_DEFINITION_MIX_GAIN,
+                               audio_element, config,
+diff --git a/libavformat/iamf_reader.c b/libavformat/iamf_reader.c
+index 1b963ee311..8060521a07 100644
+--- a/libavformat/iamf_reader.c
++++ b/libavformat/iamf_reader.c
+@@ -23,6 +23,7 @@
+ #include "libavutil/intreadwrite.h"
+ #include "libavutil/log.h"
+ #include "libavutil/mem.h"
++#include "libavcodec/get_bits.h"
+ #include "libavcodec/mathops.h"
+ #include "libavcodec/packet.h"
+ #include "avformat.h"
+@@ -41,6 +42,143 @@ static AVStream *find_stream_by_id(AVFormatContext *s, int id, int stream_id_off
+     return NULL;
+ }
+ 
++
++static const enum AVPacketSideDataType position_side_data_types[] = {
++    AV_PKT_DATA_IAMF_POLAR_POSITION_PARAM,
++    AV_PKT_DATA_IAMF_CART8_POSITION_PARAM,
++    AV_PKT_DATA_IAMF_CART16_POSITION_PARAM,
++    AV_PKT_DATA_IAMF_DUAL_POLAR_POSITION_PARAM,
++    AV_PKT_DATA_IAMF_DUAL_CART8_POSITION_PARAM,
++    AV_PKT_DATA_IAMF_DUAL_CART16_POSITION_PARAM,
++};
++
++static size_t position_param_size(const AVIAMFParamDefinition *param)
++{
++    if (!param || param->subblocks_offset < sizeof(*param) ||
++        !param->subblock_size ||
++        param->nb_subblocks > (SIZE_MAX - param->subblocks_offset) / param->subblock_size)
++        return 0;
++
++    return param->subblocks_offset + param->nb_subblocks * param->subblock_size;
++}
++
++static int update_position_param(IAMFDemuxContext *c,
++                                 const AVIAMFParamDefinition *param,
++                                 size_t param_size)
++{
++    const int slot = param->type - AV_IAMF_PARAMETER_DEFINITION_POLAR;
++    size_t offset = 0, old_record_size = 0;
++    int found = 0;
++
++    if (slot < 0 || slot >= FF_ARRAY_ELEMS(c->position) ||
++        position_param_size(param) != param_size)
++        return AVERROR_INVALIDDATA;
++
++    while (offset < c->position_size[slot]) {
++        const AVIAMFParamDefinition *old;
++        size_t record_size;
++
++        if (c->position_size[slot] - offset < sizeof(*old))
++            return AVERROR_INVALIDDATA;
++        old = (const AVIAMFParamDefinition *)(c->position[slot] + offset);
++        record_size = position_param_size(old);
++        if (!record_size || record_size > c->position_size[slot] - offset)
++            return AVERROR_INVALIDDATA;
++        if (old->parameter_id == param->parameter_id) {
++            found = 1;
++            old_record_size = record_size;
++            break;
++        }
++        offset += record_size;
++    }
++
++    if (found) {
++        size_t new_size = c->position_size[slot] - old_record_size + param_size;
++        uint8_t *new_data = av_malloc(new_size);
++        if (!new_data)
++            return AVERROR(ENOMEM);
++        memcpy(new_data, c->position[slot], offset);
++        memcpy(new_data + offset, param, param_size);
++        memcpy(new_data + offset + param_size,
++               c->position[slot] + offset + old_record_size,
++               c->position_size[slot] - offset - old_record_size);
++        av_freep(&c->position[slot]);
++        c->position[slot] = new_data;
++        c->position_size[slot] = new_size;
++    } else {
++        uint8_t *new_data;
++        if (param_size > SIZE_MAX - c->position_size[slot])
++            return AVERROR(ENOMEM);
++        new_data = av_realloc(c->position[slot], c->position_size[slot] + param_size);
++        if (!new_data)
++            return AVERROR(ENOMEM);
++        memcpy(new_data + c->position_size[slot], param, param_size);
++        c->position[slot] = new_data;
++        c->position_size[slot] += param_size;
++    }
++
++    return 0;
++}
++
++static int parse_position_data(AVIOContext *pb, unsigned int type,
++                               AVIAMFPositionParamSubblock *position)
++{
++    const int polar = type == AV_IAMF_PARAMETER_DEFINITION_POLAR ||
++                      type == AV_IAMF_PARAMETER_DEFINITION_DUAL_POLAR;
++    const int dual = type == AV_IAMF_PARAMETER_DEFINITION_DUAL_POLAR ||
++                     type == AV_IAMF_PARAMETER_DEFINITION_DUAL_CART8 ||
++                     type == AV_IAMF_PARAMETER_DEFINITION_DUAL_CART16;
++    const int cart_bits =
++        type == AV_IAMF_PARAMETER_DEFINITION_CART16 ||
++        type == AV_IAMF_PARAMETER_DEFINITION_DUAL_CART16 ? 16 : 8;
++    uint8_t data[48];
++    GetBitContext gb;
++    unsigned int animation = ffio_read_leb(pb);
++    int value_count, first_point, bits = 0, ret;
++
++    if (polar) {
++        if (animation != AV_IAMF_ANIMATION_TYPE_STEP &&
++            animation != AV_IAMF_ANIMATION_TYPE_INTER_LINEAR)
++            return AVERROR_INVALIDDATA;
++    } else if (animation != AV_IAMF_ANIMATION_TYPE_STEP &&
++               animation != AV_IAMF_ANIMATION_TYPE_INTER_LINEAR &&
++               animation != AV_IAMF_ANIMATION_TYPE_INTER_BEZIER) {
++        return AVERROR_INVALIDDATA;
++    }
++
++    value_count = animation == AV_IAMF_ANIMATION_TYPE_STEP ? 1 :
++                  animation == AV_IAMF_ANIMATION_TYPE_INTER_LINEAR ? 1 : 2;
++    first_point = animation == AV_IAMF_ANIMATION_TYPE_STEP ? 0 : 1;
++    for (int object = 0; object < (dual ? 2 : 1); object++)
++        for (int axis = 0; axis < 3; axis++)
++            bits += (polar ? (axis == 0 ? 9 : axis == 1 ? 8 : 7) : cart_bits) *
++                    value_count + (animation == AV_IAMF_ANIMATION_TYPE_INTER_BEZIER ? 8 : 0);
++
++    ret = ffio_read_size(pb, data, (bits + 7) / 8);
++    if (ret < 0)
++        return ret;
++    ret = init_get_bits8(&gb, data, (bits + 7) / 8);
++    if (ret < 0)
++        return ret;
++
++    position->animation_type = animation;
++    for (int object = 0; object < (dual ? 2 : 1); object++) {
++        for (int axis = 0; axis < 3; axis++) {
++            const int field_bits = polar ? (axis == 0 ? 9 : axis == 1 ? 8 : 7) : cart_bits;
++            const int is_signed = !polar || axis < 2;
++            for (int i = 0; i < value_count; i++) {
++                int32_t value = is_signed ? get_sbits(&gb, field_bits) :
++                                            get_bits(&gb, field_bits);
++                position->value[object][axis][first_point + i] = value;
++            }
++            if (animation == AV_IAMF_ANIMATION_TYPE_INTER_BEZIER)
++                position->control_point_relative_time[object][axis] = get_bits(&gb, 8);
++        }
++    }
++
++    return 0;
++}
++
+ static int audio_frame_obu(AVFormatContext *s, const IAMFDemuxContext *c,
+                            AVIOContext *pb, AVPacket *pkt,
+                            int len, enum IAMF_OBU_Type type,
+@@ -95,6 +233,16 @@ static int audio_frame_obu(AVFormatContext *s, const IAMFDemuxContext *c,
+         memcpy(side_data, c->recon, c->recon_size);
+     }
+ 
++    for (int i = 0; i < FF_ARRAY_ELEMS(c->position); i++) {
++        if (!c->position[i])
++            continue;
++        uint8_t *side_data = av_packet_new_side_data(pkt, position_side_data_types[i],
++                                                     c->position_size[i]);
++        if (!side_data)
++            return AVERROR(ENOMEM);
++        memcpy(side_data, c->position[i], c->position_size[i]);
++    }
++
+     if (st->discard == AVDISCARD_ALL)
+         pkt->flags |= AV_PKT_FLAG_DISCARD;
+ 
+@@ -238,6 +386,19 @@ static int parameter_block_obu(AVFormatContext *s, IAMFDemuxContext *c,
+             demix->subblock_duration = subblock_duration;
+             break;
+         }
++        case AV_IAMF_PARAMETER_DEFINITION_POLAR:
++        case AV_IAMF_PARAMETER_DEFINITION_CART8:
++        case AV_IAMF_PARAMETER_DEFINITION_CART16:
++        case AV_IAMF_PARAMETER_DEFINITION_DUAL_POLAR:
++        case AV_IAMF_PARAMETER_DEFINITION_DUAL_CART8:
++        case AV_IAMF_PARAMETER_DEFINITION_DUAL_CART16: {
++            AVIAMFPositionParamSubblock *position = subblock;
++            ret = parse_position_data(pb, param->type, position);
++            if (ret < 0)
++                goto fail;
++            position->subblock_duration = subblock_duration;
++            break;
++        }
+         case AV_IAMF_PARAMETER_DEFINITION_RECON_GAIN: {
+             AVIAMFReconGain *recon = subblock;
+             const AVIAMFAudioElement *element;
+@@ -292,6 +453,18 @@ static int parameter_block_obu(AVFormatContext *s, IAMFDemuxContext *c,
+         c->recon = out_param;
+         c->recon_size = out_param_size;
+         break;
++
++    case AV_IAMF_PARAMETER_DEFINITION_POLAR:
++    case AV_IAMF_PARAMETER_DEFINITION_CART8:
++    case AV_IAMF_PARAMETER_DEFINITION_CART16:
++    case AV_IAMF_PARAMETER_DEFINITION_DUAL_POLAR:
++    case AV_IAMF_PARAMETER_DEFINITION_DUAL_CART8:
++    case AV_IAMF_PARAMETER_DEFINITION_DUAL_CART16:
++        ret = update_position_param(c, out_param, out_param_size);
++        if (ret < 0)
++            goto fail;
++        out_param = NULL;
++        break;
+     default:
+         av_unreachable("param_definition_type should have been checked in descriptor");
+     }
+@@ -323,8 +496,8 @@ int ff_iamf_read_packet(AVFormatContext *s, IAMFDemuxContext *c,
+         size = avio_read(pb, header, FFMIN(MAX_IAMF_OBU_HEADER_SIZE, max_size));
+         if (size < 0)
+             return size;
+-        if (size != FFMIN(MAX_IAMF_OBU_HEADER_SIZE, max_size))
+-            return AVERROR_INVALIDDATA;
++        if (!size)
++            return AVERROR_EOF;
+ 
+         len = ff_iamf_parse_obu_header(header, size, &obu_size, &start_pos, &type,
+                                        &skip_samples, &discard_padding);
+@@ -353,6 +526,11 @@ int ff_iamf_read_packet(AVFormatContext *s, IAMFDemuxContext *c,
+             c->demix_size = 0;
+             av_freep(&c->recon);
+             c->recon_size = 0;
++
++            for (int i = 0; i < FF_ARRAY_ELEMS(c->position); i++) {
++                av_freep(&c->position[i]);
++                c->position_size[i] = 0;
++            }
+         } else {
+             int64_t offset = avio_skip(pb, obu_size);
+             if (offset < 0)
+@@ -380,4 +558,9 @@ void ff_iamf_read_deinit(IAMFDemuxContext *c)
+     c->demix_size = 0;
+     av_freep(&c->recon);
+     c->recon_size = 0;
++
++    for (int i = 0; i < FF_ARRAY_ELEMS(c->position); i++) {
++        av_freep(&c->position[i]);
++        c->position_size[i] = 0;
++    }
+ }
+diff --git a/libavformat/iamf_reader.h b/libavformat/iamf_reader.h
+index 279739cde9..8aba9b0308 100644
+--- a/libavformat/iamf_reader.h
++++ b/libavformat/iamf_reader.h
+@@ -39,6 +39,8 @@ typedef struct IAMFDemuxContext {
+     size_t demix_size;
+     AVIAMFParamDefinition *recon;
+     size_t recon_size;
++    uint8_t *position[6];
++    size_t position_size[6];
+ } IAMFDemuxContext;
+ 
+ int ff_iamf_read_packet(AVFormatContext *s, IAMFDemuxContext *c,
+diff --git a/libavformat/iamf_writer.c b/libavformat/iamf_writer.c
+index 036f1fb887..e9c2071127 100644
+--- a/libavformat/iamf_writer.c
++++ b/libavformat/iamf_writer.c
+@@ -236,39 +236,18 @@ int ff_iamf_add_audio_element(IAMFContext *iamf, const AVStreamGroup *stg, void
+ 
+     iamf_audio_element = stg->params.iamf_audio_element;
+     if (iamf_audio_element->audio_element_type == AV_IAMF_AUDIO_ELEMENT_TYPE_OBJECT) {
+-        /* 本地补丁（2026-10-06）：对象元素形状校验（IAMF 3.6.5）
+-         *   · 1 层；· 每个对象一路单声道子流；· 对象数 > 0。
+-         * 位置参数不在这里管。 */
+-        if (iamf_audio_element->nb_layers != 1) {
++        const AVIAMFLayer *layer;
++        if (iamf_audio_element->nb_layers != 1 || stg->nb_streams != 1) {
+             av_log(log_ctx, AV_LOG_ERROR,
+-                   "Invalid amount of layers for OBJECT_BASED audio element. Must be 1\n");
++                   "OBJECT_BASED audio element requires one layer and one audio substream\n");
+             return AVERROR(EINVAL);
+         }
+-        if (!stg->nb_streams) {
+-            av_log(log_ctx, AV_LOG_ERROR, "OBJECT_BASED audio element has no objects\n");
++        layer = iamf_audio_element->layers[0];
++        if (layer->ch_layout.nb_channels != 1 && layer->ch_layout.nb_channels != 2) {
++            av_log(log_ctx, AV_LOG_ERROR,
++                   "OBJECT_BASED audio element supports one mono object or two stereo objects\n");
+             return AVERROR(EINVAL);
+         }
+-        for (int i = 0; i < stg->nb_streams; i++) {
+-            if (stg->streams[i]->codecpar->ch_layout.nb_channels != 1) {
+-                av_log(log_ctx, AV_LOG_ERROR,
+-                       "OBJECT_BASED audio element requires mono streams (object %d has %d channels)\n",
+-                       i, stg->streams[i]->codecpar->ch_layout.nb_channels);
+-                return AVERROR(EINVAL);
+-            }
+-        }
+-        /* ⚠⚠ 承重的一步（实测踩到）：下面那个"按 layer 声道数铺子流"的循环
+-         *   （本函数后半段）会从 `layers[0]->ch_layout.nb_channels` 往下**扣**，
+-         *   扣到 0 就停。调用者给的对象 layer 通常是 mono（1 路）⇒ 只会登记
+-         *   **一个**子流，第二个对象就 `get_audio_element(id)` 找不到 ⇒
+-         *   写包时静默 EINVAL。
+-         *   ⇒ 把 layer 的声道数改成**对象数**（每个对象一路），使那段循环正好铺满。
+-         *
+-         *   ⚠⚠ 这里**绝不能动 `iamf_audio_element->layers[0]->ch_layout`**（试过两版都崩）：
+-         *     · `uninit + default` ⇒ 崩（改写了调用者的堆块，收尾时双重释放）；
+-         *     · 直接改 order/nb_channels/u.mask ⇒ 也崩（`u` 是 union，
+-         *       调用者可能用的是 `u.map`（custom 序）指针，我按 mask 解读就踩空了）。
+-         *   ⇒ 真正干净的做法：**不改调用者的结构**，而是在下面那个铺子流的循环里，
+-         *     对对象元素改用"每个子流一路"的规则（见 `对象元素` 分支）。 */
+     } else if (iamf_audio_element->audio_element_type == AV_IAMF_AUDIO_ELEMENT_TYPE_SCENE) {
+         const AVIAMFLayer *layer = iamf_audio_element->layers[0];
+         if (iamf_audio_element->nb_layers != 1) {
+@@ -381,35 +360,26 @@ int ff_iamf_add_audio_element(IAMFContext *iamf, const AVStreamGroup *stg, void
+         goto fail;
+     }
+ 
+-    for (int i = 0, j = 0; i < iamf_audio_element->nb_layers; i++) {
+-        /*
+-         * 本地补丁（2026-10-06）：对象元素的**子流铺设规则**。
+-         *
+-         * 上游这段是"按 layer 的声道数往下扣"：layer 声明几路就登记几路子流。
+-         * 但对象元素的 layer 语义不同 —— 规范里对象数写在 `ObjectsConfig.num_objects`，
+-         * layer 只是个占位（调用者通常给 mono）⇒ 按声道数扣只会登记 **1** 个子流，
+-         * 第二个对象就 `get_audio_element(id)` 找不到，写包时静默 EINVAL。
+-         * ⇒ 对象元素改成"**每个子流一路**"（stg->nb_streams 个对象全部铺满）。
+-         *
+-         * ⚠ 这样做不需要改调用者的 `layers[0]->ch_layout`（改它会崩，见上）。
+-         */
+-        const int 是对象元素 =
+-            iamf_audio_element->audio_element_type == AV_IAMF_AUDIO_ELEMENT_TYPE_OBJECT;
+-        int nb_channels = 是对象元素 ? stg->nb_streams
+-                                     : iamf_audio_element->layers[i]->ch_layout.nb_channels;
++    if (iamf_audio_element->audio_element_type == AV_IAMF_AUDIO_ELEMENT_TYPE_OBJECT)
++        audio_element->num_objects = iamf_audio_element->layers[0]->ch_layout.nb_channels;
+ 
++    for (int i = 0, j = 0; i < iamf_audio_element->nb_layers; i++) {
++        int nb_channels = iamf_audio_element->layers[i]->ch_layout.nb_channels;
+         IAMFLayer *layer = &audio_element->layers[i];
+ 
+-        if (i && !是对象元素)
++        if (i)
+             nb_channels -= iamf_audio_element->layers[i - 1]->ch_layout.nb_channels;
+         for (; nb_channels > 0 && j < stg->nb_streams; j++) {
+             const AVStream *st = stg->streams[j];
+             IAMFSubStream *substream = &audio_element->substreams[j];
++            int stream_channels = iamf_audio_element->audio_element_type ==
++                                  AV_IAMF_AUDIO_ELEMENT_TYPE_OBJECT ?
++                                  nb_channels : st->codecpar->ch_layout.nb_channels;
+ 
+             substream->audio_substream_id = st->id;
+             layer->substream_count++;
+-            layer->coupled_substream_count += st->codecpar->ch_layout.nb_channels == 2;
+-            nb_channels -= st->codecpar->ch_layout.nb_channels;
++            layer->coupled_substream_count += stream_channels == 2;
++            nb_channels -= stream_channels;
+         }
+         if (nb_channels) {
+             av_log(log_ctx, AV_LOG_ERROR, "Invalid channel count across substreams in layer %u from stream group %u\n",
+@@ -463,29 +433,6 @@ int ff_iamf_add_audio_element(IAMFContext *iamf, const AVStreamGroup *stg, void
+         }
+     }
+ 
+-    /* 本地补丁（2026-10-06）：位置参数（对象方位）也要**在写头时登记**
+-     *
+-     * 为什么必须在这一步：位置参数的**定义**要在 IA Sequence Header 里声明，
+-     * 而 packet 上的 side-data 只是"数据块"（逐帧值）。上游只登记
+-     * demixing/recon_gain 两种，位置参数没有登记点 ⇒ 写包时报
+-     * "Non-existent Parameter Definition with ID N referenced by a packet"。
+-     *
+-     * ⚠ 用 `param->nb_subblocks` 的**首个子块**当模板登记；duration/rate 由调用者填。
+-     *   六型共用同一条路径（类型不同而已）。 */
+-    if (iamf_audio_element->position_info) {
+-        AVIAMFParamDefinition *param = iamf_audio_element->position_info;
+-        if (param->nb_subblocks < 1) {
+-            av_log(log_ctx, AV_LOG_ERROR,
+-                   "nb_subblocks in position_info for stream group %u is not >= 1\n", stg->index);
+-            ret = AVERROR(EINVAL);
+-            goto fail;
+-        }
+-        if (!ff_iamf_get_param_definition(iamf, param->parameter_id)) {
+-            ret = add_param_definition(iamf, param, audio_element, log_ctx);
+-            if (ret < 0)
+-                goto fail;
+-        }
+-    }
+ 
+     tmp = av_realloc_array(iamf->audio_elements, iamf->nb_audio_elements + 1, sizeof(*iamf->audio_elements));
+     if (!tmp) {
+@@ -563,6 +510,60 @@ int ff_iamf_add_mix_presentation(IAMFContext *iamf, const AVStreamGroup *stg, vo
+                 if (ret < 0)
+                     goto fail;
+             }
++
++            {
++                const IAMFAudioElement *audio_element = NULL;
++                                for (int k = 0; k < iamf->nb_audio_elements; k++)
++                    if (iamf->audio_elements[k]->audio_element_id == element->audio_element_id) {
++                        audio_element = iamf->audio_elements[k];
++                        break;
++                    }
++                if (!audio_element) {
++                    av_log(log_ctx, AV_LOG_ERROR, "Unknown Audio Element %u in Mix Presentation\n",
++                           element->audio_element_id);
++                    ret = AVERROR(EINVAL);
++                    goto fail;
++                }
++                if (audio_element->celement->audio_element_type == AV_IAMF_AUDIO_ELEMENT_TYPE_OBJECT) {
++                    const int type = element->position_info ? element->position_info->type : -1;
++                    const int dual = type == AV_IAMF_PARAMETER_DEFINITION_DUAL_POLAR ||
++                                     type == AV_IAMF_PARAMETER_DEFINITION_DUAL_CART8 ||
++                                     type == AV_IAMF_PARAMETER_DEFINITION_DUAL_CART16;
++                    IAMFParamDefinition *position_def;
++                    if (!element->position_info ||
++                        type < AV_IAMF_PARAMETER_DEFINITION_POLAR ||
++                        type > AV_IAMF_PARAMETER_DEFINITION_DUAL_CART16 ||
++                        dual != (audio_element->num_objects == 2)) {
++                        av_log(log_ctx, AV_LOG_ERROR,
++                               "Invalid or missing position definition for object Audio Element %u\n",
++                               element->audio_element_id);
++                        ret = AVERROR(EINVAL);
++                        goto fail;
++                    }
++                    position_def = ff_iamf_get_param_definition(iamf,
++                                                                  element->position_info->parameter_id);
++                    if (position_def) {
++                        if (position_def->param->type != element->position_info->type ||
++                            position_def->audio_element != audio_element) {
++                            av_log(log_ctx, AV_LOG_ERROR,
++                                   "Conflicting IAMF position parameter id %u\n",
++                                   element->position_info->parameter_id);
++                            ret = AVERROR(EINVAL);
++                            goto fail;
++                        }
++                    } else {
++                        ret = add_param_definition(iamf, element->position_info,
++                                                   audio_element, log_ctx);
++                        if (ret < 0)
++                            goto fail;
++                    }
++                } else if (element->position_info) {
++                    av_log(log_ctx, AV_LOG_ERROR,
++                           "Position parameters are only valid for object Audio Elements\n");
++                    ret = AVERROR(EINVAL);
++                    goto fail;
++                }
++            }
+         }
+     }
+ 
+@@ -804,15 +805,14 @@ static int param_definition(const IAMFContext *iamf,
+                     ffio_write_leb(dyn_bc, recon->subblock_duration);
+                     break;
+                 }
+-                /* 本地补丁（2026-10-06）：位置参数族（6 型）—— 定义里只写 subblock_duration。
+-                 * 默认位置值**不写**：读写两侧同形（读侧也只登记不还原），避免字段错位。 */
++
+                 case AV_IAMF_PARAMETER_DEFINITION_POLAR:
+                 case AV_IAMF_PARAMETER_DEFINITION_CART8:
+                 case AV_IAMF_PARAMETER_DEFINITION_CART16:
+                 case AV_IAMF_PARAMETER_DEFINITION_DUAL_POLAR:
+                 case AV_IAMF_PARAMETER_DEFINITION_DUAL_CART8:
+                 case AV_IAMF_PARAMETER_DEFINITION_DUAL_CART16: {
+-                    const AVIAMFPolarParamSubblock *pol = subblock;
++                    const AVIAMFPositionParamSubblock *pol = subblock;
+                     ffio_write_leb(dyn_bc, pol->subblock_duration);
+                     break;
+                 }
+@@ -848,13 +848,9 @@ static int iamf_write_audio_element(const IAMFContext *iamf,
+     flush_put_bits(&pbc);
+     avio_write(dyn_bc, header, put_bytes_count(&pbc, 1));
+ 
+-    /* 本地补丁（2026-10-06）：对象元素先写 ObjectsConfig（规范 3.6.5 的字段次序）。 */
+     if (element->audio_element_type == AV_IAMF_AUDIO_ELEMENT_TYPE_OBJECT) {
+-        init_put_bits(&pbc, header, sizeof(header));
+-        put_bits(&pbc, 8, audio_element->nb_substreams);  /* num_objects */
+-        put_bits(&pbc, 8, 0);                             /* objects_config_extension_bytes 长度 = 0 */
+-        flush_put_bits(&pbc);
+-        avio_write(dyn_bc, header, put_bytes_count(&pbc, 1));
++        ffio_write_leb(dyn_bc, 1); // objects_config_size
++        avio_w8(dyn_bc, audio_element->num_objects);
+     }
+ 
+     ffio_write_leb(dyn_bc, audio_element->codec_config_id);
+@@ -863,18 +859,11 @@ static int iamf_write_audio_element(const IAMFContext *iamf,
+     for (int i = 0; i < audio_element->nb_substreams; i++)
+         ffio_write_leb(dyn_bc, audio_element->substreams[i].audio_substream_id);
+ 
+-    /* When audio_element_type = 1, num_parameters SHALL be set to 0。
+-     * 本地补丁（2026-10-06）：对象元素在**本树**下也声明 0 个参数块 ——
+-     * 位置参数（类型 3..8）不存在，声明了也没东西可写。 */
++
+     if (element->audio_element_type == AV_IAMF_AUDIO_ELEMENT_TYPE_SCENE)
+         param_definition_types = 0;
+     else if (element->audio_element_type == AV_IAMF_AUDIO_ELEMENT_TYPE_OBJECT) {
+-        /* 本地补丁（2026-10-06）：对象元素的参数声明。
+-         *
+-         * ⚠ `param_definition_types` 是**位掩码**（上游只用来表示 DEMIXING/RECON_GAIN
+-         *   两个 bit），而位置类型取值是 **3..8** —— 塞进位掩码会溢出/错义。
+-         *   ⇒ 位置参数走**独立的计数与写出**，不混进这个掩码。
+-         *   若调用者没给 position_info，声明 0 个（与改动前行为一致）。 */
++
+         param_definition_types = 0;
+     }
+     else {
+@@ -917,29 +906,7 @@ static int iamf_write_audio_element(const IAMFContext *iamf,
+         }
+     }
+ 
+-    /* 本地补丁（2026-10-06）：位置参数（对象方位）的声明
+-     *   num_parameters 要把它算进去；定义体在下面单独写（类型值 3..8 不进位掩码）。 */
+-    {
+-        const int 有位置 = element->position_info != NULL;
+-
+-        ffio_write_leb(dyn_bc, av_popcount(param_definition_types) + 有位置); // num_parameters
+-
+-        if (有位置) {
+-            const AVIAMFParamDefinition *param = element->position_info;
+-            const IAMFParamDefinition *param_def =
+-                ff_iamf_get_param_definition(iamf, param->parameter_id);
+-
+-            if (!param_def) {
+-                av_log(log_ctx, AV_LOG_ERROR,
+-                       "position_info parameter_id %u was not registered\n", param->parameter_id);
+-                return AVERROR(EINVAL);
+-            }
+-            ffio_write_leb(dyn_bc, param->type);            // type（3..8）
+-            ret = param_definition(iamf, param_def, dyn_bc, log_ctx);
+-            if (ret < 0)
+-                return ret;
+-        }
+-    }
++    ffio_write_leb(dyn_bc, av_popcount(param_definition_types)); // num_parameters
+ 
+     if (param_definition_types & AV_IAMF_PARAMETER_DEFINITION_DEMIXING) {
+         const AVIAMFParamDefinition *param = element->demixing_info;
+@@ -979,9 +946,7 @@ static int iamf_write_audio_element(const IAMFContext *iamf,
+         if (ret < 0)
+             return ret;
+     } else if (element->audio_element_type == AV_IAMF_AUDIO_ELEMENT_TYPE_OBJECT) {
+-        /* 本地补丁（2026-10-06）：对象元素没有 scalable/ambisonics config —— 配置已在上面写过。
+-         * ⚠ 原来这里是 `else`（只判 CHANNEL）⇒ 对象会被误送进 ambisonics_config()，
+-         *   写出"对象元素 + 声场配置"的四不像 ⇒ 参考解码器必拒。 */
++
+     } else {
+         ret = ambisonics_config(audio_element, dyn_bc);
+         if (ret < 0)
+@@ -1002,6 +967,68 @@ static int iamf_write_audio_element(const IAMFContext *iamf,
+     return 0;
+ }
+ 
++static int put_position_default(PutBitContext *pb, int value, int bits, int is_signed)
++{
++    int64_t min = is_signed ? -(INT64_C(1) << (bits - 1)) : 0;
++    int64_t max = is_signed ? (INT64_C(1) << (bits - 1)) - 1 :
++                              (INT64_C(1) << bits) - 1;
++
++    if (value < min || value > max)
++        return AVERROR(EINVAL);
++    if (is_signed)
++        put_sbits(pb, bits, value);
++    else
++        put_bits(pb, bits, value);
++    return 0;
++}
++
++static int write_position_defaults(AVIOContext *pb, unsigned int type,
++                                   const AVIAMFSubmixElement *element)
++{
++    int values[2][3];
++    const int polar = type == AV_IAMF_PARAMETER_DEFINITION_POLAR ||
++                      type == AV_IAMF_PARAMETER_DEFINITION_DUAL_POLAR;
++    const int dual = type == AV_IAMF_PARAMETER_DEFINITION_DUAL_POLAR ||
++                     type == AV_IAMF_PARAMETER_DEFINITION_DUAL_CART8 ||
++                     type == AV_IAMF_PARAMETER_DEFINITION_DUAL_CART16;
++    const int cart_bits = type == AV_IAMF_PARAMETER_DEFINITION_CART16 ||
++                          type == AV_IAMF_PARAMETER_DEFINITION_DUAL_CART16 ? 16 :
++                          type == AV_IAMF_PARAMETER_DEFINITION_CART8 ||
++                          type == AV_IAMF_PARAMETER_DEFINITION_DUAL_CART8 ? 8 : 0;
++    uint8_t data[12] = { 0 };
++    PutBitContext pbc;
++
++    if (polar) {
++        values[0][0] = element->default_azimuth;
++        values[0][1] = element->default_elevation;
++        values[0][2] = element->default_distance;
++        values[1][0] = element->default_azimuth2;
++        values[1][1] = element->default_elevation2;
++        values[1][2] = element->default_distance2;
++    } else {
++        values[0][0] = element->default_x;
++        values[0][1] = element->default_y;
++        values[0][2] = element->default_z;
++        values[1][0] = element->default_x2;
++        values[1][1] = element->default_y2;
++        values[1][2] = element->default_z2;
++    }
++
++    init_put_bits(&pbc, data, sizeof(data));
++    for (int object = 0; object < (dual ? 2 : 1); object++) {
++        for (int axis = 0; axis < 3; axis++) {
++            int bits = polar ? (axis == 0 ? 9 : axis == 1 ? 8 : 7) : cart_bits;
++            int is_signed = !polar || axis < 2;
++            int ret = put_position_default(&pbc, values[object][axis], bits, is_signed);
++            if (ret < 0)
++                return ret;
++        }
++    }
++    flush_put_bits(&pbc);
++    avio_write(pb, data, put_bytes_count(&pbc, 1));
++    return 0;
++}
++
+ static int iamf_write_mixing_presentation(const IAMFContext *iamf,
+                                           const IAMFMixPresentation *mix_presentation,
+                                           AVIOContext *pb, void *log_ctx)
+@@ -1053,12 +1080,51 @@ static int iamf_write_mixing_presentation(const IAMFContext *iamf,
+             while ((tag = av_dict_iterate(submix_element->annotations, tag)))
+                 avio_put_str(dyn_bc, tag->value);
+ 
+-            init_put_bits(&pbc, header, sizeof(header));
+-            put_bits(&pbc, 2, submix_element->headphones_rendering_mode);
+-            put_bits(&pbc, 6, 0); // reserved
+-            flush_put_bits(&pbc);
+-            avio_write(dyn_bc, header, put_bytes_count(&pbc, 1));
+-            ffio_write_leb(dyn_bc, 0); // rendering_config_extension_size
++            {
++                AVIOContext *rendering_config_ext;
++                uint8_t *rendering_config_ext_buf = NULL;
++                int rendering_config_ext_size;
++                int ret = avio_open_dyn_buf(&rendering_config_ext);
++                if (ret < 0)
++                    return ret;
++
++                if (submix_element->position_info) {
++                    const AVIAMFParamDefinition *position = submix_element->position_info;
++                    const unsigned int type = position->type;
++                    const IAMFParamDefinition *position_def =
++                        ff_iamf_get_param_definition(iamf, position->parameter_id);
++                    ffio_write_leb(rendering_config_ext, 1);
++                    ffio_write_leb(rendering_config_ext, type);
++                    if (!position_def) {
++                        ffio_free_dyn_buf(&rendering_config_ext);
++                        av_log(log_ctx, AV_LOG_ERROR, "Missing IAMF position parameter definition %u\n",
++                               position->parameter_id);
++                        return AVERROR(EINVAL);
++                    }
++                    ret = param_definition(iamf, position_def, rendering_config_ext, log_ctx);
++                    if (ret >= 0)
++                        ret = write_position_defaults(rendering_config_ext, type, submix_element);
++                    if (ret < 0) {
++                        ffio_free_dyn_buf(&rendering_config_ext);
++                        return ret;
++                    }
++                } else {
++                    ffio_write_leb(rendering_config_ext, 0);
++                }
++
++                rendering_config_ext_size = avio_get_dyn_buf(rendering_config_ext,
++                                                             &rendering_config_ext_buf);
++                init_put_bits(&pbc, header, sizeof(header));
++                put_bits(&pbc, 2, submix_element->headphones_rendering_mode);
++                put_bits(&pbc, 1, 0); // element_gain_offset_flag
++                put_bits(&pbc, 2, 0); // binaural_filter_profile
++                put_bits(&pbc, 3, 0); // reserved_for_future_use
++                flush_put_bits(&pbc);
++                avio_write(dyn_bc, header, put_bytes_count(&pbc, 1));
++                ffio_write_leb(dyn_bc, rendering_config_ext_size);
++                avio_write(dyn_bc, rendering_config_ext_buf, rendering_config_ext_size);
++                ffio_free_dyn_buf(&rendering_config_ext);
++            }
+ 
+             param_def = ff_iamf_get_param_definition(iamf, submix_element->element_mix_config->parameter_id);
+             ret = param_definition(iamf, param_def, dyn_bc, log_ctx);
+@@ -1184,7 +1250,7 @@ static int write_parameter_block(const IAMFContext *iamf, AVIOContext *pb,
+     uint8_t *dyn_buf = NULL;
+     int dyn_size, ret;
+ 
+-    /* 本地补丁（2026-10-06）：上界放宽到 DUAL_CART16(8)，否则位置参数块会被静默丢掉 */
++
+     if (param->type > AV_IAMF_PARAMETER_DEFINITION_DUAL_CART16) {
+         av_log(log_ctx, AV_LOG_DEBUG, "Ignoring side data with unknown type %u\n",
+                param->type);
+@@ -1252,86 +1318,61 @@ static int write_parameter_block(const IAMFContext *iamf, AVIOContext *pb,
+             avio_w8(dyn_bc, demix->dmixp_mode << 5);
+             break;
+         }
+-        /* 本地补丁（2026-10-06）：位置参数族数据块（IAMF v2.0.0，6 型）
+-         *
+-         * 位流（真值取自 AOM iamf-tools 与官方测试向量 iamf/tests/test_000800.textproto）：
+-         *   animation_type  uleb128（0=step 1=linear 2=bezier 3=interLinear 4=interBezier）
+-         *   坐标点数**由 animation_type 决定**，不是由参数类型决定：
+-         *     STEP(0)                     ⇒ 1 点（只有 start）
+-         *     LINEAR(1)/INTER_LINEAR(3)   ⇒ 2 点（start + end）
+-         *     BEZIER(2)/INTER_BEZIER(4)   ⇒ 3 点（start + end + control）+ 8bit 相对时间
+-         *   官方向量 test_000800 用的就是 INTER_LINEAR(3) + 两个端点：
+-         *     `"\x03"` 然后 `\x2d\x00\x7f`（+90°）—— 即 **2 点**。
+-         *   每点坐标：
+-         *     Polar  : azimuth 9s[-180,180] | elevation 8s[-90,90] | distance 7u[0,127]
+-         *     Cart8  : x 8s | y 8s | z 8s
+-         *     Cart16 : x 16s | y 16s | z 16s
+-         *
+-         * ⚠ 全是**跨字节位字段**（Polar 的 9+8+7 恰 24 bit 但不按字节对齐），
+-         *   所以必须走 put_bits，不能像 MIX_GAIN 那样 avio_wb16。
+-         * ⚠ pbuf 要够大：最多 3 点 × 3×16 = 144 bit = 18 B ⇒ 给 32 B 富余。 */
++
+         case AV_IAMF_PARAMETER_DEFINITION_POLAR:
+         case AV_IAMF_PARAMETER_DEFINITION_CART8:
+         case AV_IAMF_PARAMETER_DEFINITION_CART16:
+         case AV_IAMF_PARAMETER_DEFINITION_DUAL_POLAR:
+         case AV_IAMF_PARAMETER_DEFINITION_DUAL_CART8:
+         case AV_IAMF_PARAMETER_DEFINITION_DUAL_CART16: {
+-            const AVIAMFPolarParamSubblock *pol = subblock;
+-            const int 极坐标 = param->type == AV_IAMF_PARAMETER_DEFINITION_POLAR ||
+-                               param->type == AV_IAMF_PARAMETER_DEFINITION_DUAL_POLAR;
+-            const int 位宽 = (param->type == AV_IAMF_PARAMETER_DEFINITION_CART16 ||
+-                              param->type == AV_IAMF_PARAMETER_DEFINITION_DUAL_CART16) ? 16 : 8;
+-            /* ⚠⚠ 承重的一步（对着官方向量改的）：点数取**动画类型**与**参数类型**的较大者。
+-             *   原来只按参数类型（single=1 / dual=2）⇒ 对 single 型写 INTER_LINEAR 时
+-             *   会**只写 1 个点**，而解码器按 animation_type=3 要读 2 个点
+-             *   ⇒ 位流错位、后续全乱。反之 dual 型写 STEP 时多写一个端点也是错位。
+-             *   ⇒ 正确规则：需要几个点，就写几个点 ——
+-             *       STEP ⇒ 1 点；LINEAR/INTER_LINEAR ⇒ 2 点；BEZIER/INTER_BEZIER ⇒ 3 点；
+-             *       同时 dual 型**至少** 2 点（它的语义就是两点）。 */
+-            const int 动画 = pol->animation_type;
+-            int 点数;
+-            if (动画 == AV_IAMF_ANIMATION_TYPE_BEZIER ||
+-                动画 == AV_IAMF_ANIMATION_TYPE_INTER_BEZIER)
+-                点数 = 3;
+-            else if (动画 == AV_IAMF_ANIMATION_TYPE_LINEAR ||
+-                     动画 == AV_IAMF_ANIMATION_TYPE_INTER_LINEAR)
+-                点数 = 2;
+-            else
+-                点数 = 1;
+-            if (pol->has_second && 点数 < 2)
+-                点数 = 2;          /* dual 型必须两点 */
+-            if (点数 > 3)
+-                点数 = 3;
++            const AVIAMFPositionParamSubblock *position = subblock;
++            const int polar = param->type == AV_IAMF_PARAMETER_DEFINITION_POLAR ||
++                              param->type == AV_IAMF_PARAMETER_DEFINITION_DUAL_POLAR;
++            const int dual = param->type == AV_IAMF_PARAMETER_DEFINITION_DUAL_POLAR ||
++                             param->type == AV_IAMF_PARAMETER_DEFINITION_DUAL_CART8 ||
++                             param->type == AV_IAMF_PARAMETER_DEFINITION_DUAL_CART16;
++            const int bits = polar ? 0 :
++                (param->type == AV_IAMF_PARAMETER_DEFINITION_CART16 ||
++                 param->type == AV_IAMF_PARAMETER_DEFINITION_DUAL_CART16 ? 16 : 8);
++            const int objects = dual ? 2 : 1;
++            const unsigned int animation = position->animation_type;
+             PutBitContext pbp;
+-            uint8_t pbuf[32] = { 0 };
++            uint8_t pbuf[64] = { 0 };
+ 
++            if (animation != AV_IAMF_ANIMATION_TYPE_STEP &&
++                animation != AV_IAMF_ANIMATION_TYPE_INTER_LINEAR &&
++                (!(!polar && animation == AV_IAMF_ANIMATION_TYPE_INTER_BEZIER))) {
++                av_log(log_ctx, AV_LOG_ERROR, "Unsupported IAMF position animation type %u\n", animation);
++                return AVERROR(EINVAL);
++            }
+             if (!param_definition->mode && param->constant_subblock_duration == 0)
+-                ffio_write_leb(dyn_bc, pol->subblock_duration);
+-
+-            ffio_write_leb(dyn_bc, av_clip_uintp2(pol->animation_type, 8));
++                ffio_write_leb(dyn_bc, position->subblock_duration);
+ 
++            ffio_write_leb(dyn_bc, animation);
+             init_put_bits(&pbp, pbuf, sizeof(pbuf));
+-            for (int 点 = 0; 点 < 点数; 点++) {
+-                if (极坐标) {
+-                    const int az = 点 == 0 ? pol->azimuth   : (点 == 1 ? pol->azimuth2   : pol->azimuth2);
+-                    const int el = 点 == 0 ? pol->elevation : (点 == 1 ? pol->elevation2 : pol->elevation2);
+-                    const int di = 点 == 0 ? pol->distance  : (点 == 1 ? pol->distance2  : pol->distance2);
+-                    put_sbits(&pbp, 9, av_clip(az, -180, 180));
+-                    put_sbits(&pbp, 8, av_clip(el,  -90,  90));
+-                    put_bits (&pbp, 7, av_clip_uintp2(di, 7));
+-                } else {
+-                    const int cx = 点 == 0 ? pol->x : pol->x2;
+-                    const int cy = 点 == 0 ? pol->y : pol->y2;
+-                    const int cz = 点 == 0 ? pol->z : pol->z2;
+-                    if (位宽 == 16) {
+-                        put_sbits(&pbp, 16, av_clip(cx, -32768, 32767));
+-                        put_sbits(&pbp, 16, av_clip(cy, -32768, 32767));
+-                        put_sbits(&pbp, 16, av_clip(cz, -32768, 32767));
+-                    } else {
+-                        put_sbits(&pbp, 8, av_clip(cx, -128, 127));
+-                        put_sbits(&pbp, 8, av_clip(cy, -128, 127));
+-                        put_sbits(&pbp, 8, av_clip(cz, -128, 127));
++            for (int object = 0; object < objects; object++) {
++                for (int axis = 0; axis < 3; axis++) {
++                    const int field_bits = polar ? (axis == 0 ? 9 : axis == 1 ? 8 : 7) : bits;
++                    const int is_signed = !polar || axis < 2;
++                    const int value_count = animation == AV_IAMF_ANIMATION_TYPE_STEP ? 1 :
++                        animation == AV_IAMF_ANIMATION_TYPE_INTER_LINEAR ? 1 : 2;
++                    const int point = animation == AV_IAMF_ANIMATION_TYPE_STEP ? 0 : 1;
++                    for (int value_index = 0; value_index < value_count; value_index++) {
++                        int value = position->value[object][axis][point + value_index];
++                        int64_t min = is_signed ? -(INT64_C(1) << (field_bits - 1)) : 0;
++                        int64_t max = is_signed ? (INT64_C(1) << (field_bits - 1)) - 1 :
++                                                 (INT64_C(1) << field_bits) - 1;
++                        if (value < min || value > max) {
++                            av_log(log_ctx, AV_LOG_ERROR, "IAMF position value out of range\n");
++                            return AVERROR(EINVAL);
++                        }
++                        if (is_signed)
++                            put_sbits(&pbp, field_bits, value);
++                        else
++                            put_bits(&pbp, field_bits, value);
+                     }
++                    if (animation == AV_IAMF_ANIMATION_TYPE_INTER_BEZIER)
++                        put_bits(&pbp, 8, position->control_point_relative_time[object][axis]);
+                 }
+             }
+             flush_put_bits(&pbp);
+@@ -1417,11 +1458,8 @@ int ff_iamf_write_parameter_blocks(const IAMFContext *iamf, AVIOContext *pb,
+         if (ret < 0)
+            return ret;
+     }
+-    /* 本地补丁（2026-10-06）：位置参数块（对象方位，6 型）
+-     * 读侧不看它（FFmpeg 的 IAMF demuxer 只解描述、不还原参数块载荷），
+-     * 所以这条支路的验证方式是**逐字节看写出的位流**，不是 ffprobe 读回。 */
+     {
+-        static const enum AVPacketSideDataType 位置类型[] = {
++        static const enum AVPacketSideDataType position_side_data_types[] = {
+             AV_PKT_DATA_IAMF_POLAR_POSITION_PARAM,
+             AV_PKT_DATA_IAMF_CART8_POSITION_PARAM,
+             AV_PKT_DATA_IAMF_CART16_POSITION_PARAM,
+@@ -1429,13 +1467,34 @@ int ff_iamf_write_parameter_blocks(const IAMFContext *iamf, AVIOContext *pb,
+             AV_PKT_DATA_IAMF_DUAL_CART8_POSITION_PARAM,
+             AV_PKT_DATA_IAMF_DUAL_CART16_POSITION_PARAM,
+         };
+-        for (size_t k = 0; k < FF_ARRAY_ELEMS(位置类型); k++) {
+-            AVIAMFParamDefinition *pos =
+-                (AVIAMFParamDefinition *)av_packet_get_side_data(pkt, 位置类型[k], NULL);
+-            if (pos) {
+-                int ret = write_parameter_block(iamf, pb, pos, log_ctx);
++        for (int i = 0; i < FF_ARRAY_ELEMS(position_side_data_types); i++) {
++            size_t size;
++            const uint8_t *data = av_packet_get_side_data(pkt, position_side_data_types[i], &size);
++            size_t offset = 0;
++
++            while (offset < size) {
++                const AVIAMFParamDefinition *position;
++                size_t param_size;
++                int ret;
++
++                if (size - offset < sizeof(*position))
++                    return AVERROR_INVALIDDATA;
++                position = (const AVIAMFParamDefinition *)(data + offset);
++                if (position->type != AV_IAMF_PARAMETER_DEFINITION_POLAR + i ||
++                    position->subblocks_offset < sizeof(*position) ||
++                    !position->subblock_size ||
++                    position->nb_subblocks >
++                        (SIZE_MAX - position->subblocks_offset) / position->subblock_size)
++                    return AVERROR_INVALIDDATA;
++                param_size = position->subblocks_offset +
++                             position->nb_subblocks * position->subblock_size;
++                if (param_size > size - offset)
++                    return AVERROR_INVALIDDATA;
++                ret = write_parameter_block(iamf, pb,
++                                             (AVIAMFParamDefinition *)position, log_ctx);
+                 if (ret < 0)
+                     return ret;
++                offset += param_size;
+             }
+         }
+     }
+diff --git a/libavutil/iamf.c b/libavutil/iamf.c
+index fb0844ecb7..6b0700eabf 100644
+--- a/libavutil/iamf.c
++++ b/libavutil/iamf.c
+@@ -109,37 +109,21 @@ static const AVClass recon_gain_class = {
+     .option         = recon_gain_options,
+ };
+ 
+-/* 本地补丁（2026-10-06）：极坐标位置（对象方位）。
+- * 选项名与 AOM iamf-tools 的字段名对齐（azimuth / elevation / distance），
+- * 这样 CLI 侧写起来与参考实现同词。 */
+ #undef OFFSET
+-#define OFFSET(x) offsetof(AVIAMFPolarParamSubblock, x)
+-static const AVOption polar_options[] = {
+-    { "subblock_duration", "set subblock_duration", OFFSET(subblock_duration), AV_OPT_TYPE_UINT, {.i64 = 1 }, 1, UINT_MAX, FLAGS },
+-    { "animation_type",    "set animation_type",    OFFSET(animation_type),    AV_OPT_TYPE_UINT, {.i64 = 0 }, 0, 4, FLAGS },
+-    /* Polar（9s/8s/7u）*/
+-    { "azimuth",   "set azimuth (9 bit)",   OFFSET(azimuth),   AV_OPT_TYPE_INT, {.i64 = 0 }, -180, 180, FLAGS },
+-    { "elevation", "set elevation (8 bit)", OFFSET(elevation), AV_OPT_TYPE_INT, {.i64 = 0 },  -90,  90, FLAGS },
+-    { "distance",  "set distance (7 bit)",  OFFSET(distance),  AV_OPT_TYPE_INT, {.i64 = 0 },    0, 127, FLAGS },
+-    /* Cartesian 起点（8s 或 16s，按 type 定；这里按 16 位放宽，写出时 clip）*/
+-    { "x", "set x", OFFSET(x), AV_OPT_TYPE_INT, {.i64 = 0 }, -32768, 32767, FLAGS },
+-    { "y", "set y", OFFSET(y), AV_OPT_TYPE_INT, {.i64 = 0 }, -32768, 32767, FLAGS },
+-    { "z", "set z", OFFSET(z), AV_OPT_TYPE_INT, {.i64 = 0 }, -32768, 32767, FLAGS },
+-    /* 终点（仅 dual 用）*/
+-    { "azimuth2",   "set second azimuth",   OFFSET(azimuth2),   AV_OPT_TYPE_INT, {.i64 = 0 }, -180, 180, FLAGS },
+-    { "elevation2", "set second elevation", OFFSET(elevation2), AV_OPT_TYPE_INT, {.i64 = 0 },  -90,  90, FLAGS },
+-    { "distance2",  "set second distance",  OFFSET(distance2),  AV_OPT_TYPE_INT, {.i64 = 0 },    0, 127, FLAGS },
+-    { "x2", "set second x", OFFSET(x2), AV_OPT_TYPE_INT, {.i64 = 0 }, -32768, 32767, FLAGS },
+-    { "y2", "set second y", OFFSET(y2), AV_OPT_TYPE_INT, {.i64 = 0 }, -32768, 32767, FLAGS },
+-    { "z2", "set second z", OFFSET(z2), AV_OPT_TYPE_INT, {.i64 = 0 }, -32768, 32767, FLAGS },
++#define OFFSET(x) offsetof(AVIAMFPositionParamSubblock, x)
++static const AVOption position_options[] = {
++    { "subblock_duration", "set subblock_duration", OFFSET(subblock_duration), AV_OPT_TYPE_UINT,
++      {.i64 = 1 }, 1, UINT_MAX, FLAGS },
++    { "animation_type", "set animation_type", OFFSET(animation_type), AV_OPT_TYPE_UINT,
++      {.i64 = 0 }, 0, 4, FLAGS },
+     { NULL },
+ };
+ 
+-static const AVClass polar_class = {
+-    .class_name     = "AVIAMFPolarParamSubblock",
++static const AVClass position_class = {
++    .class_name     = "AVIAMFPositionParamSubblock",
+     .item_name      = av_default_item_name,
+     .version        = LIBAVUTIL_VERSION_INT,
+-    .option         = polar_options,
++    .option         = position_options,
+ };
+ 
+ #undef OFFSET
+@@ -167,14 +151,14 @@ static const AVClass *param_definition_child_iterate(void **opaque)
+     case AV_IAMF_PARAMETER_DEFINITION_RECON_GAIN:
+         ret = &recon_gain_class;
+         break;
+-    /* 本地补丁（2026-10-06）：位置参数族 */
++
+     case AV_IAMF_PARAMETER_DEFINITION_POLAR:
+     case AV_IAMF_PARAMETER_DEFINITION_CART8:
+     case AV_IAMF_PARAMETER_DEFINITION_CART16:
+     case AV_IAMF_PARAMETER_DEFINITION_DUAL_POLAR:
+     case AV_IAMF_PARAMETER_DEFINITION_DUAL_CART8:
+     case AV_IAMF_PARAMETER_DEFINITION_DUAL_CART16:
+-        ret = &polar_class;
++        ret = &position_class;
+         break;
+     default:
+         break;
+@@ -214,10 +198,10 @@ AVIAMFParamDefinition *av_iamf_param_definition_alloc(enum AVIAMFParamDefinition
+         AVIAMFParamDefinition p;
+         AVIAMFReconGain r;
+     };
+-    /* 本地补丁（2026-10-06）：极坐标位置参数的子块容器 */
++
+     struct PolarStruct {
+         AVIAMFParamDefinition p;
+-        AVIAMFPolarParamSubblock s;
++        AVIAMFPositionParamSubblock s;
+     };
+     size_t subblocks_offset, subblock_size;
+     size_t size;
+@@ -236,7 +220,7 @@ AVIAMFParamDefinition *av_iamf_param_definition_alloc(enum AVIAMFParamDefinition
+         subblocks_offset = offsetof(struct ReconGainStruct, r);
+         subblock_size = sizeof(AVIAMFReconGain);
+         break;
+-    /* 本地补丁（2026-10-06）：位置参数族（6 型共用同一子块结构） */
++
+     case AV_IAMF_PARAMETER_DEFINITION_POLAR:
+     case AV_IAMF_PARAMETER_DEFINITION_CART8:
+     case AV_IAMF_PARAMETER_DEFINITION_CART16:
+@@ -244,7 +228,7 @@ AVIAMFParamDefinition *av_iamf_param_definition_alloc(enum AVIAMFParamDefinition
+     case AV_IAMF_PARAMETER_DEFINITION_DUAL_CART8:
+     case AV_IAMF_PARAMETER_DEFINITION_DUAL_CART16:
+         subblocks_offset = offsetof(struct PolarStruct, s);
+-        subblock_size = sizeof(AVIAMFPolarParamSubblock);
++        subblock_size = sizeof(AVIAMFPositionParamSubblock);
+         break;
+     default:
+         return NULL;
+@@ -280,16 +264,14 @@ AVIAMFParamDefinition *av_iamf_param_definition_alloc(enum AVIAMFParamDefinition
+         case AV_IAMF_PARAMETER_DEFINITION_RECON_GAIN:
+             ((AVIAMFReconGain *)subblock)->av_class = &recon_gain_class;
+             break;
+-        /* 本地补丁（2026-10-06）：位置参数族
+-         * ⚠ 上游这里是 `default: av_assert0(0);` —— 不加这些 case，
+-         *   传位置类型进来会**直接 assert 崩掉**（不是返回错误）。 */
++
+         case AV_IAMF_PARAMETER_DEFINITION_POLAR:
+         case AV_IAMF_PARAMETER_DEFINITION_CART8:
+         case AV_IAMF_PARAMETER_DEFINITION_CART16:
+         case AV_IAMF_PARAMETER_DEFINITION_DUAL_POLAR:
+         case AV_IAMF_PARAMETER_DEFINITION_DUAL_CART8:
+         case AV_IAMF_PARAMETER_DEFINITION_DUAL_CART16:
+-            ((AVIAMFPolarParamSubblock *)subblock)->av_class = &polar_class;
++            ((AVIAMFPositionParamSubblock *)subblock)->av_class = &position_class;
+             break;
+         default:
+             av_assert0(0);
+@@ -354,7 +336,7 @@ static const AVClass layer_class = {
+ static const AVOption audio_element_options[] = {
+     { "audio_element_type", "set audio_element_type", OFFSET(audio_element_type), AV_OPT_TYPE_INT,
+             {.i64 = AV_IAMF_AUDIO_ELEMENT_TYPE_CHANNEL },
+-            /* 本地补丁（2026-10-06）：上界放宽到 OBJECT，否则用户选了也传不进来 */
++
+             AV_IAMF_AUDIO_ELEMENT_TYPE_CHANNEL, AV_IAMF_AUDIO_ELEMENT_TYPE_OBJECT, FLAGS, .unit = "audio_element_type" },
+         { "channel", NULL, 0, AV_OPT_TYPE_CONST,
+                    { .i64 = AV_IAMF_AUDIO_ELEMENT_TYPE_CHANNEL }, .unit = "audio_element_type" },
+@@ -440,6 +422,28 @@ static const AVOption submix_element_options[] = {
+         { "binaural", NULL, 0, AV_OPT_TYPE_CONST,
+                    { .i64 = AV_IAMF_HEADPHONES_MODE_BINAURAL }, .unit = "headphones_rendering_mode" },
+     { "default_mix_gain", "Default mix gain", OFFSET(default_mix_gain), AV_OPT_TYPE_RATIONAL, { .dbl = 0 }, -128.0, 128.0, FLAGS },
++    { "position_type", "Object position parameter type", OFFSET(position_type), AV_OPT_TYPE_INT,
++      { .i64 = -1 }, -1, AV_IAMF_PARAMETER_DEFINITION_DUAL_CART16, FLAGS, .unit = "position_type" },
++        { "polar", NULL, 0, AV_OPT_TYPE_CONST, { .i64 = AV_IAMF_PARAMETER_DEFINITION_POLAR }, INT_MIN, INT_MAX, FLAGS, .unit = "position_type" },
++        { "cart8", NULL, 0, AV_OPT_TYPE_CONST, { .i64 = AV_IAMF_PARAMETER_DEFINITION_CART8 }, INT_MIN, INT_MAX, FLAGS, .unit = "position_type" },
++        { "cart16", NULL, 0, AV_OPT_TYPE_CONST, { .i64 = AV_IAMF_PARAMETER_DEFINITION_CART16 }, INT_MIN, INT_MAX, FLAGS, .unit = "position_type" },
++        { "dual_polar", NULL, 0, AV_OPT_TYPE_CONST, { .i64 = AV_IAMF_PARAMETER_DEFINITION_DUAL_POLAR }, INT_MIN, INT_MAX, FLAGS, .unit = "position_type" },
++        { "dual_cart8", NULL, 0, AV_OPT_TYPE_CONST, { .i64 = AV_IAMF_PARAMETER_DEFINITION_DUAL_CART8 }, INT_MIN, INT_MAX, FLAGS, .unit = "position_type" },
++        { "dual_cart16", NULL, 0, AV_OPT_TYPE_CONST, { .i64 = AV_IAMF_PARAMETER_DEFINITION_DUAL_CART16 }, INT_MIN, INT_MAX, FLAGS, .unit = "position_type" },
++    { "position_parameter_id", "Position parameter id", OFFSET(position_parameter_id), AV_OPT_TYPE_UINT, { .i64 = 0 }, 0, UINT_MAX, FLAGS },
++    { "position_parameter_rate", "Position parameter rate", OFFSET(position_parameter_rate), AV_OPT_TYPE_UINT, { .i64 = 0 }, 0, UINT_MAX, FLAGS },
++    { "default_azimuth", "Default azimuth", OFFSET(default_azimuth), AV_OPT_TYPE_INT, { .i64 = 0 }, -180, 180, FLAGS },
++    { "default_elevation", "Default elevation", OFFSET(default_elevation), AV_OPT_TYPE_INT, { .i64 = 0 }, -90, 90, FLAGS },
++    { "default_distance", "Default distance", OFFSET(default_distance), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 127, FLAGS },
++    { "default_x", "Default X", OFFSET(default_x), AV_OPT_TYPE_INT, { .i64 = 0 }, -32768, 32767, FLAGS },
++    { "default_y", "Default Y", OFFSET(default_y), AV_OPT_TYPE_INT, { .i64 = 0 }, -32768, 32767, FLAGS },
++    { "default_z", "Default Z", OFFSET(default_z), AV_OPT_TYPE_INT, { .i64 = 0 }, -32768, 32767, FLAGS },
++    { "default_azimuth2", "Default second azimuth", OFFSET(default_azimuth2), AV_OPT_TYPE_INT, { .i64 = 0 }, -180, 180, FLAGS },
++    { "default_elevation2", "Default second elevation", OFFSET(default_elevation2), AV_OPT_TYPE_INT, { .i64 = 0 }, -90, 90, FLAGS },
++    { "default_distance2", "Default second distance", OFFSET(default_distance2), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 127, FLAGS },
++    { "default_x2", "Default second X", OFFSET(default_x2), AV_OPT_TYPE_INT, { .i64 = 0 }, -32768, 32767, FLAGS },
++    { "default_y2", "Default second Y", OFFSET(default_y2), AV_OPT_TYPE_INT, { .i64 = 0 }, -32768, 32767, FLAGS },
++    { "default_z2", "Default second Z", OFFSET(default_z2), AV_OPT_TYPE_INT, { .i64 = 0 }, -32768, 32767, FLAGS },
+     { "annotations", "Annotations", OFFSET(annotations), AV_OPT_TYPE_DICT, { .str = NULL }, 0, 0, FLAGS },
+     { NULL },
+ };
+@@ -617,6 +621,7 @@ void av_iamf_mix_presentation_free(AVIAMFMixPresentation **pmix_presentation)
+             AVIAMFSubmixElement *submix_element = sub_mix->elements[j];
+             av_opt_free(submix_element);
+             av_free(submix_element->element_mix_config);
++            av_free(submix_element->position_info);
+             av_free(submix_element);
+         }
+         av_free(sub_mix->elements);
+diff --git a/libavutil/iamf.h b/libavutil/iamf.h
+index c600d2c186..1a0b81fbf9 100644
+--- a/libavutil/iamf.h
++++ b/libavutil/iamf.h
+@@ -67,13 +67,7 @@ enum AVIAMFAnimationType {
+     AV_IAMF_ANIMATION_TYPE_STEP,
+     AV_IAMF_ANIMATION_TYPE_LINEAR,
+     AV_IAMF_ANIMATION_TYPE_BEZIER,
+-    /* 本地补丁（2026-10-06）：IAMF v2.0.0 新增的两种"帧间"动画。
+-     * 真值取自 AOM iamf-tools 与官方测试向量 iamf/tests/test_000800.textproto
+-     * （那个向量用的就是 INTER_LINEAR(3) + 两个端点）。
+-     *
+-     * ⚠ 必须**追加在末尾并显式赋值**：往枚举中间插会静默改掉后继者的数值，
+-     *   这条在参数定义类型上已经踩过一次（把 MIX_GAIN 顶成 4，导致连普通
+-     *   channel 件都写不出来）。 */
++    /* IAMF v2 frame-interpolated animation types. */
+     AV_IAMF_ANIMATION_TYPE_INTER_LINEAR = 3,
+     AV_IAMF_ANIMATION_TYPE_INTER_BEZIER = 4,
+ };
+@@ -135,41 +129,38 @@ typedef struct AVIAMFMixGain {
+  * @note This struct's size is not a part of the public ABI.
+  */
+ /**
+- * 本地补丁（2026-10-06）：极坐标位置（对象方位）。
+- * 单个点（single）即可表达静态位置；双点留给后续（DualPolar）。
+- */
+-typedef struct AVIAMFPolarPosition {
+-    int32_t azimuth;    /* 9 bit，[-180, 180] */
+-    int32_t elevation;  /* 8 bit，[-90, 90] */
+-    int32_t distance;   /* 7 bit，[0, 127] */
+-} AVIAMFPolarPosition;
+-
+-/**
+- * 本地补丁（2026-10-06）：极坐标位置参数的**子块**（逐帧）。
+- * animation_type 沿用 IAMF 的取值（0=step 静态、1=linear）。
+- * 本补丁只实现 step（静态位置）—— 正好对得上"分段定值"的素材。
++ * Object position Parameter Data as defined by IAMF v2.
++ *
++ * Values are quantized coordinates. Their interpretation and legal
++ * animation types depend on the Parameter Definition type.
++ *
++ * @note This struct's size is not part of the public ABI.
+  */
+-typedef struct AVIAMFPolarParamSubblock {
+-    const AVClass *av_class;   /* 必须首成员：与兄弟子块同形，av_opt_set_dict 依赖它 */
++typedef struct AVIAMFPositionParamSubblock {
++    const AVClass *av_class;
+ 
++    /**
++     * Duration for this subblock, in units of 1 / parameter_rate.
++     */
+     unsigned int subblock_duration;
+-    unsigned int animation_type;   /* 0=step 1=linear 2=bezier 3=interLinear 4=interBezier */
+ 
+-    /* 位置字段刻意**扁平**：实测在 AVOption 表里对**嵌套成员**取 OFFSET
+-     * （如 `first.azimuth`）会让 mux init 直接 ENOMEM，连普通 channel 件都写不出来。
+-     *
+-     * 六种类型共用这一组字段：
+-     *   Polar / DualPolar : azimuth(9s) elevation(8s) distance(7u)
+-     *   Cart8 / DualCart8 : x,y,z 各 8s
+-     *   Cart16/DualCart16 : x,y,z 各 16s
+-     * `first_*` = 起点（single 时即全部）；`second_*` = 终点（仅 dual 用）。
+-     * 存储用 int（够放 16 位有符号），写出时按类型 clip 到对应位宽。 */
+-    int azimuth, elevation, distance;              /* Polar 起点 */
+-    int x, y, z;                                   /* Cartesian 起点 */
+-    int has_second;
+-    int azimuth2, elevation2, distance2;           /* Polar 终点 */
+-    int x2, y2, z2;                                /* Cartesian 终点 */
+-} AVIAMFPolarParamSubblock;
++    /**
++     * Animation applied to the object coordinates.
++     */
++    enum AVIAMFAnimationType animation_type;
++
++    /**
++     * Quantized coordinate values indexed by [object][axis][point].
++     * Points are start, end, and Bezier control point.
++     */
++    int32_t value[2][3][3];
++
++    /**
++     * Relative time of each Bezier control point, in the range 0..255.
++     */
++    uint8_t control_point_relative_time[2][3];
++} AVIAMFPositionParamSubblock;
++
+ 
+ typedef struct AVIAMFDemixingInfo {
+     const AVClass *av_class;
+@@ -225,16 +216,7 @@ enum AVIAMFParamDefinitionType {
+      * Subblocks are of struct type AVIAMFReconGain
+      */
+     AV_IAMF_PARAMETER_DEFINITION_RECON_GAIN,
+-    /**
+-     * 本地补丁（2026-10-06）：IAMF v2.0.0 的位置参数族，一共 6 种。
+-     * 数值与规范一致（iamf-tools/param_definitions/param_definition_base.h）：
+-     *   3 Polar 4 Cart8 5 Cart16 6 DualPolar 7 DualCart8 8 DualCart16
+-     *
+-     * ⚠⚠ 必须放在**最后**且**显式赋全值**。我第一版把 POLAR 插在枚举**开头**，
+-     *   于是 MIX_GAIN 被顶成 4、DEMIXING 5、RECON_GAIN 6 —— 三个原有类型全部错位，
+-     *   症状是**连普通 channel 件都写不出来**（mux init 报 ENOMEM）。
+-     *   ⇒ 往枚举中间插值 = 静默改掉所有后继者的数值。
+-     */
++
+     AV_IAMF_PARAMETER_DEFINITION_POLAR       = 3,
+     AV_IAMF_PARAMETER_DEFINITION_CART8       = 4,
+     AV_IAMF_PARAMETER_DEFINITION_CART16      = 5,
+@@ -353,10 +335,7 @@ enum AVIAMFAmbisonicsMode {
+  * @note The struct should be allocated with av_iamf_audio_element_add_layer()
+  *       and its size is not a part of the public ABI.
+  */
+-/**
+- * 本地补丁（2026-10-06）：极坐标位置（对象方位）。
+- * （已上移到 AVIAMFPolarParamSubblock 之前 —— 先声明后使用）
+- */
++
+ 
+ typedef struct AVIAMFLayer {
+     const AVClass *av_class;
+@@ -414,16 +393,8 @@ typedef struct AVIAMFLayer {
+ enum AVIAMFAudioElementType {
+     AV_IAMF_AUDIO_ELEMENT_TYPE_CHANNEL,
+     AV_IAMF_AUDIO_ELEMENT_TYPE_SCENE,
+-    /**
+-     * Object-based audio element (IAMF 3.6.5 `ObjectsConfig`), value 2.
+-     *
+-     * 本地补丁（2026-10-06）。上游 FFmpeg 只写 CHANNEL/SCENE 两支，没有对象元素。
+-     * 规范里 `audio_element_type` 是 3 bit，0/1/2 有效、3–7 保留。
+-     *
+-     * ⚠ 能力边界：这**只让"对象元素容器"能写出来**（类型=2 + num_objects）。
+-     * 要表达**对象方位**还需要 v2.0.0 的逐帧位置参数（Polar/Cart8/Cart16/Dual…，
+-     * 参数定义类型 3..8），那六种在本树里不存在 ⇒ 方位传不过去。
+-     */
++
++    /** Object-based audio using IAMF v2 ObjectsConfig. */
+     AV_IAMF_AUDIO_ELEMENT_TYPE_OBJECT,
+ };
+ 
+@@ -463,18 +434,6 @@ typedef struct AVIAMFAudioElement {
+      */
+     AVIAMFParamDefinition *recon_gain_info;
+ 
+-    /**
+-     * 本地补丁（2026-10-06）：位置参数（对象方位）的**定义**。
+-     *
+-     * 为什么要有这个字段：位置参数的逐帧值随包走（side-data），但**定义**
+-     * 必须在写头时登记进 IA Sequence Header —— 上游只给 demixing/recon_gain
+-     * 留了登记点，位置参数没有 ⇒ 写包时报
+-     * "Non-existent Parameter Definition with ID N referenced by a packet"。
+-     *
+-     * `type` 取 6 种位置类型之一（POLAR/CART8/CART16/DUAL_*）；
+-     * 子块是 AVIAMFPolarParamSubblock。**只在 OBJECT_BASED 元素上有意义。**
+-     */
+-    AVIAMFParamDefinition *position_info;
+ 
+     /**
+      * Audio element type as defined in section 3.6 of IAMF.
+@@ -582,6 +541,20 @@ typedef struct AVIAMFSubmixElement {
+      * @ref AVDictionaryEntry.value "value".
+      */
+     AVDictionary *annotations;
++
++    /**
++     * IAMF v2 object-position definition and default coordinates.
++     * These fields are used only for object Audio Elements. They are appended
++     * to preserve the offsets of existing fields.
++     */
++    AVIAMFParamDefinition *position_info;
++    int position_type;
++    unsigned int position_parameter_id;
++    unsigned int position_parameter_rate;
++    int32_t default_azimuth, default_elevation, default_distance;
++    int32_t default_x, default_y, default_z;
++    int32_t default_azimuth2, default_elevation2, default_distance2;
++    int32_t default_x2, default_y2, default_z2;
+ } AVIAMFSubmixElement;
+ 
+ enum AVIAMFSubmixLayoutType {
+diff --git a/libavutil/version.h b/libavutil/version.h
+index edc3fa5832..e98751aa4e 100644
+--- a/libavutil/version.h
++++ b/libavutil/version.h
+@@ -79,7 +79,7 @@
+  */
+ 
+ #define LIBAVUTIL_VERSION_MAJOR  61
+-#define LIBAVUTIL_VERSION_MINOR   11
++#define LIBAVUTIL_VERSION_MINOR   12
+ #define LIBAVUTIL_VERSION_MICRO 100
+ 
+ #define LIBAVUTIL_VERSION_INT   AV_VERSION_INT(LIBAVUTIL_VERSION_MAJOR, \

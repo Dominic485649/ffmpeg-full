@@ -1,0 +1,82 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: REPLACE-ME <you@example.com>
+Date: Tue, 06 Oct 2026 15:00:00 +0800
+Subject: [PATCH] avcodec/itut35: tag ICtCp frames from the RPU on the T.35 route
+
+ The RPU is the only place that says what an ICtCp base layer's planes hold, and
+ dovi_rpudec.c already fills the tag in for that reason - but only on the route HEVC
+ takes. `ff_dovi_attach_side_data()` has one caller in the tree
+ (`libavcodec/hevc/hevcdec.c`), while every AV1 decoder reaches the same metadata by a
+ different path: `av1dec.c` -> `ff_itut_t35_parse_payload_to_frame()` ->
+ `ff_dovi_rpu_parse()`. `libaomdec.c` and `libdav1d.c` arrive at the same function.
+
+ So on an AV1-carried stream the tag is never applied, and Profile 10 - which IS the
+ AV1-carried ICtCp profile - reaches a filter that refuses a disputed representation:
+
+     The RPU declares ICtCp but this frame is tagged colorspace=2, not
+     AVCOL_SPC_ICTCP(14): refusing to reshape planes whose representation is
+     disputed.
+
+ Tagging here rather than in av1dec.c covers all three AV1 decoders at once, and the
+ condition is deliberately word-for-word the one dovi_rpudec.c uses: fill in an
+ UNSPECIFIED colorspace, accept one that already says ICtCp, and leave an explicitly
+ signalled different colorspace alone with a warning, because an RPU and a bitstream
+ that disagree is a question to raise rather than a tie for a decoder to break.
+
+Signed-off-by: REPLACE-ME <REPLACE-ME>
+---
+diff --git a/libavcodec/itut35.c b/libavcodec/itut35.c
+--- a/libavcodec/itut35.c
++++ b/libavcodec/itut35.c
+@@ -362,6 +362,51 @@ int ff_itut_t35_parse_payload_to_frame(FFITUTT35 *const itut_t35, FFITUTT35Aux *
+             return AVERROR(ENOMEM);
+         }
+         metadata.dovi = NULL;
++
++        /* Tag an ICtCp base layer, on the ITU-T T.35 route as well as the HEVC one.
++         *
++         * WHY THIS EXISTS HERE AND NOT ONLY IN dovi_rpudec.c. `ff_dovi_attach_side_data()` already
++         * does exactly this tagging, but it is reached from ONE caller in the whole tree -
++         * `libavcodec/hevc/hevcdec.c`, at the point where an HEVC picture is finished. The AV1
++         * decoder does not go through it: it parses Dolby's T.35 payload via
++         * `av1dec.c:export_itut_t35()` -> this function -> `ff_dovi_rpu_parse()`, and it never calls
++         * the HEVC helper. Measured before this block existed: `attach_side_data` had zero hits
++         * anywhere under `libavcodec/av1*`.
++         *
++         * The consequence was a real refusal rather than a silent error, but a refusal with no way
++         * out. `vf_dovi_apply` stops on a disputed representation:
++         *
++         *   "The RPU declares ICtCp but this frame is tagged colorspace=2, not AVCOL_SPC_ICTCP(14):
++         *    refusing to reshape planes whose representation is disputed. Tag them (patch 0005 makes
++         *    the decoder do it from the RPU) or convert them deliberately, and say which you did."
++         *
++         * and 0005's promise is true for HEVC and false for AV1 - which is precisely the Profile 10
++         * case, since Profile 10 IS the AV1-carried ICtCp profile. So the documented remedy did not
++         * exist on the route it was documented for, and every P10 run had to hand-tag with
++         * `setparams=colorspace=ictcp` or stop.
++         *
++         * THE CONDITION MIRRORS dovi_rpudec.c EXACTLY, deliberately: only fill in an UNSPECIFIED
++         * colorspace, and only accept one that already says ICtCp. An explicitly signalled different
++         * colorspace is reported and left alone, because an RPU and a bitstream that disagree is a
++         * question to raise, not a tie for a decoder to break. Keeping the two implementations
++         * word-for-word identical is what makes "0005 tags ICtCp frames" a statement that does not
++         * depend on which demuxer path the picture arrived through.
++         *
++         * NOTE ON avctx BEING UNUSED FOR THE MESSAGE: av_log(NULL, ...) matches the HEVC site, and
++         * for AV1 the log context is reachable as avctx, which is better than NULL. Both are used
++         * here - avctx when present - so the warning lands somewhere a caller can act on. */
++        {
++            const AVDOVIMetadata *dm = (const AVDOVIMetadata *)sd->data;
++
++            if (av_dovi_get_color(dm)->signal_color_space == 2) {
++                if (frame->colorspace == AVCOL_SPC_UNSPECIFIED ||
++                    frame->colorspace == AVCOL_SPC_ICTCP)
++                    frame->colorspace = AVCOL_SPC_ICTCP;
++                else
++                    av_log(avctx, AV_LOG_WARNING, "DOVI RPU signals ICtCp but the frame is tagged "
++                           "colorspace %d; leaving it alone\n", frame->colorspace);
++            }
++        }
+     }
+ 
+     if (metadata.hdr_smpte2094_app5) {

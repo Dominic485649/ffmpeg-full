@@ -1,0 +1,139 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: REPLACE-ME <you@example>
+Date: Fri, 02 Oct 2026 02:39:42 +0800
+Subject: [PATCH] avcodec/libx265: write HDR10+ dynamic metadata as a per-picture SEI
+
+libx265.c already builds a per-picture x265_sei list and hands it to the encoder
+(pic->userSEI, emitted at x265 encoder.cpp:1083), and it already uses
+SEI_TYPE_USER_DATA_REGISTERED_ITU_T_T35 for the closed-caption path. Nothing fed HDR10+ into
+it, so a frame carrying AV_FRAME_DATA_DYNAMIC_HDR_PLUS could reach libaom (whose wrapper reads
+that side data) but never HEVC through this encoder: the only way to get HDR10+ out of x265 was
+to hand the encoder a JSON file via dhdr10-info, which needs x265 built with ENABLE_HDR10_PLUS
+and, in the versions available here, cannot carry FractionBrightPixels at all (its writer
+hardcodes 0).
+
+This adds the missing loop: serialise with av_dynamic_hdr_plus_to_t35(), prepend the six T.35
+identity bytes the same way libaomenc.c and matroskaenc.c do (a payload without them parses as
+another application - measured, flipping country 0xB5 / provider 0x003C / assigned 0x0001 makes
+a decoder return zero pictures), and append it to the same SEI list. Payload memory is the
+encoder's normal av_malloc block, which free_picture() already walks and releases.
+
+Compiled as a single translation unit against x265's public headers with cl /W3 on master
+bf243bb, pristine file as the control arm: both exit 0, and the warning lines match one for one
+after the line shift (7 pre-existing in each) - the added block introduces none. Deliberately no
+option is added: like libaomenc, the metadata is written when the frame carries it.
+
+Not executed end to end here: this box has no MSVC-linkable x265 import library, so there is no
+HEVC bitstream produced by this code path yet. The AV1 legs of the same side data are executed
+(libaom 12/12 pictures; libsvtav1 via 0001 with a real encode), and the payload bytes this patch
+emits are the bytes those paths already deliver.
+
+Signed-off-by: REPLACE-ME <REPLACE-ME>
+
+---
+ libavcodec/libx265.c
+ 1 file changed, 77 insertions(+)
+diff --git a/libavcodec/libx265.c b/libavcodec/libx265.c
+--- a/libavcodec/libx265.c
++++ b/libavcodec/libx265.c
+@@ -29,6 +29,7 @@
+ 
+ #include "libavutil/avassert.h"
+ #include "libavutil/buffer.h"
++#include "libavutil/hdr_dynamic_metadata.h"
+ #include "libavutil/internal.h"
+ #include "libavutil/mastering_display_metadata.h"
+ #include "libavutil/mem.h"
+@@ -39,6 +40,7 @@
+ #include "dovi_rpu.h"
+ #include "encode.h"
+ #include "atsc_a53.h"
++#include "itut35.h"
+ #include "sei.h"
+ 
+ #if defined(X265_ENABLE_ALPHA) && MAX_LAYERS > 2
+@@ -844,6 +846,81 @@ static int libx265_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
+             }
+         }
+ 
++        /* HDR10+ dynamic metadata (SMPTE ST 2094-40 Application #4) rides the same per-picture
++         * user SEI channel as the closed captions and unregistered SEI above, so a picture that
++         * carries AV_FRAME_DATA_DYNAMIC_HDR_PLUS - from the hdr10plus filter, or from a decoded
++         * source that kept its side data - is written out as a registered ITU-T T.35 SEI.
++         * av_dynamic_hdr_plus_to_t35() emits only the metadata_block; the six identity bytes are
++         * added here exactly as libaomenc.c and matroskaenc.c add them, because a payload without
++         * them parses as some other application: measured, flipping any of country 0xB5 / provider
++         * 0x003C / assigned 0x0001 makes a decoder report zero pictures.
++         */
++        for (i = 0; i < pic->nb_side_data; i++) {
++            AVFrameSideData *hdr_plus = pic->side_data[i];
++            uint8_t *block = NULL, *payload = NULL;
++            size_t block_size = 0;
++            void *tmp;
++            x265_sei_payload *sei_payload;
++
++            if (hdr_plus->type != AV_FRAME_DATA_DYNAMIC_HDR_PLUS)
++                continue;
++
++            ret = av_dynamic_hdr_plus_to_t35((const AVDynamicHDRPlus *)hdr_plus->data,
++                                             &block, &block_size);
++            if (ret < 0) {
++                av_log(avctx, AV_LOG_ERROR, "HDR10+ metadata could not be serialised: %s\n",
++                       av_err2str(ret));
++                continue;
++            }
++
++            payload = av_malloc(6 + block_size);
++            if (!payload) {
++                av_free(block);
++                free_picture(ctx, &x265pic);
++                return AVERROR(ENOMEM);
++            }
++            tmp = av_fast_realloc(ctx->sei_data, &ctx->sei_data_size,
++                                  (sei->numPayloads + 1) * sizeof(*sei_payload));
++            if (!tmp) {
++                av_free(payload);
++                av_free(block);
++                free_picture(ctx, &x265pic);
++                return AVERROR(ENOMEM);
++            }
++            ctx->sei_data = tmp;
++            sei->payloads = ctx->sei_data;
++            sei_payload = &sei->payloads[sei->numPayloads];
++
++            /* The six identity bytes, written directly rather than through bytestream.h: that
++             * header newly pulled in ~20 pre-existing C4244 diagnostics under cl /W3 for a
++             * six-byte fixed layout, which buys nothing here.
++             * bytestream_put_*() would also have advanced the cursor - getting that backwards
++             * hands the encoder a payload without its identity, which parses as another
++             * application entirely. */
++            payload[0] = ITU_T_T35_COUNTRY_CODE_US;
++            payload[1] = ITU_T_T35_PROVIDER_CODE_SAMSUNG >> 8;
++            payload[2] = ITU_T_T35_PROVIDER_CODE_SAMSUNG & 0xFF;
++            payload[3] = 0x00;                     /* provider_oriented_code, big endian */
++            payload[4] = 0x01;
++            payload[5] = 0x04;                     /* application_identifier: HDR10+ */
++            memcpy(payload + 6, block, block_size);
++            av_free(block);
++
++            if (block_size > AV_HDR_PLUS_MAX_PAYLOAD_SIZE) {
++                /* Cannot happen while to_t35() clamps itself, but the field it is headed for is
++                 * an int, so say so here instead of handing back a truncated length. */
++                av_log(avctx, AV_LOG_ERROR, "serialised HDR10+ block of %zu bytes exceeds the "
++                       "documented maximum of %d\n", block_size, AV_HDR_PLUS_MAX_PAYLOAD_SIZE);
++                av_free(block);
++                av_free(payload);
++                continue;
++            }
++            sei_payload->payload     = payload;  /* released by free_picture() */
++            sei_payload->payloadSize = (int)(6 + block_size);
++            sei_payload->payloadType  = (SEIPayloadType)SEI_TYPE_USER_DATA_REGISTERED_ITU_T_T35;
++            sei->numPayloads++;
++        }
++
+ #if X265_BUILD >= 167
+         sd = av_frame_get_side_data(pic, AV_FRAME_DATA_DOVI_METADATA);
+         if (ctx->dovi.cfg.dv_profile && sd) {
+
+-- 
+2.0.0 (generator: upstream-kit/make_0007.py)

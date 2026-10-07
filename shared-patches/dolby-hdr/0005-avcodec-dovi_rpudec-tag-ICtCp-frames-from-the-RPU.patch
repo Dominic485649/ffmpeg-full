@@ -1,0 +1,49 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: REPLACE-ME <you@example>
+Date: Sat, 03 Oct 2026 03:55:38 +0800
+Subject: [PATCH] avcodec/dovi_rpudec: tag ICtCp frames from the RPU
+
+Profile 5 codes its base layer in ICtCp, and signal_color_space is the only place in the
+bitstream that says so. Nothing consumed it: a decoded P5 frame reached the filtergraph with
+an unspecified colorspace, so any auto-inserted format or scale conversion applied a
+Y'CbCr->RGB matrix to ICtCp samples and produced a picture that looked valid while being
+wrong in direction.
+
+Set AVCOL_SPC_ICTCP on the frame when the RPU declares ICtCp and the bitstream did not
+contradict it. libswscale already refuses to colour-convert ICtCp (its decode/encode colour
+helpers return ENOTSUP for it), so this converts a silent matrix misapplication into a
+negotiation-time failure. A frame whose colorspace was explicitly signalled as something
+else is logged and left alone rather than overridden.
+
+Signed-off-by: REPLACE-ME <REPLACE-ME>
+---
+diff --git a/libavcodec/dovi_rpudec.c b/libavcodec/dovi_rpudec.c
+index 79717f6..af61b5e 100644
+--- a/libavcodec/dovi_rpudec.c
++++ b/libavcodec/dovi_rpudec.c
+@@ -84,6 +84,22 @@ int ff_dovi_attach_side_data(DOVIContext *s, AVFrame *frame)
+         return AVERROR(ENOMEM);
+     }
+ 
++    /* The RPU is the only place that says what these planes actually hold: a Profile 5 base layer
++     * is coded in ICtCp (ITU-R BT.2100), while the container typically leaves matrix_coefficients
++     * unspecified. Left untagged, consumers assume Y'CbCr and libswscale will happily apply a
++     * BT.709/601 matrix to ICtCp samples; it refuses to convert a frame tagged AVCOL_SPC_ICTCP,
++     * so the tag is what turns that silent rematrisation into an explicit failure.
++     * An explicitly signalled different colorspace is left alone: RPU and bitstream disagreeing is
++     * a question to report, not a tie for a decoder to break. */
++    if (av_dovi_get_color(dovi)->signal_color_space == 2) {
++        if (frame->colorspace == AVCOL_SPC_UNSPECIFIED ||
++            frame->colorspace == AVCOL_SPC_ICTCP)
++            frame->colorspace = AVCOL_SPC_ICTCP;
++        else
++            av_log(NULL, AV_LOG_WARNING, "DOVI RPU signals ICtCp but the frame is tagged "
++                   "colorspace %d; leaving it alone\n", frame->colorspace);
++    }
++
+     return 0;
+ }
+ 
+-- 
+2.49.0
+

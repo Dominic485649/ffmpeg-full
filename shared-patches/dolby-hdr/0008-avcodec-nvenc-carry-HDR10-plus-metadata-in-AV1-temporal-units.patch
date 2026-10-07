@@ -1,0 +1,462 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: REPLACE-ME <you@example>
+Date: Sun, 04 Oct 2026 02:34:13 +0800
+Subject: [PATCH] avcodec/nvenc: carry HDR10+ metadata in AV1 temporal units
+
+libaomenc.c already reads AV_FRAME_DATA_DYNAMIC_HDR_PLUS off the frame and
+hands it to the encoder as an itu_t_t35 metadata OBU (add_hdr_plus(), with
+the six identity bytes per "HDR10+ AV1 Metadata Handling Specification"
+v1.0.1 section 2.1). NVENC cannot take that route: its SDK input hook
+(obuPayloadArray) does accept AV1_METADATA_TYPE_ITUT_T35, but where the
+driver puts the resulting OBU is not controllable, and measured on this
+box the blocks land unevenly - some temporal units receive three, and the
+units whose only picture OBU carries show_existing_frame=1 receive none.
+Meanwhile the output path is a single memcpy of the locked bitstream in
+process_output_surface(), so no AV1 structure is visible to FFmpeg at all.
+
+Do it on the output side, where the temporal unit is in hand. Build the
+OBU once per submitted frame in nvenc_store_frame_data() and keep it in
+NvencFrameData, because nvenc.c frees the SDK payloads immediately after
+nvEncEncodePicture(); then walk the returned buffer per temporal unit
+(split on OBU_TEMPORAL_DELIMITER) and splice one metadata OBU in front of
+the unit's last picture OBU, which is the picture that unit displays -
+the position libaom, SVT-AV1 and NVENC's own native blocks all use. A unit
+that already carries an itu_t_t35 OBU is left alone; a unit that cannot be
+walked, or that holds no picture OBU, is left alone and counted rather
+than guessed at. Like libaomenc no option is added: the carrier acts only
+when the frame carries the side data, so an encode without it produces the
+same bytes it does today.
+
+Verified here on an RTX 5080 and an RTX 4060 laptop, FFmpeg 8.0.git
+(8864fd0) configured --toolchain=msvc --enable-nvenc --enable-ffnvcodec
+against ffnvcodec 13.1.15.1, with the metadata produced in-graph by
+vf_hdr10plus: 38 assertions / 0 failures. 12 of 12 temporal units carry
+exactly one 49-byte T35 OBU with identity b5 00 3c 00 01 04; every
+picture's decoded average_maxrgb, maxscl and percentile count equal the
+values measured on the same frames before the encoder ran, frame by frame,
+read back by two separate builds that agree with each other; the five
+re-display units keep their frame_to_show_map_idx values and are precisely
+the units that had no block before; stripping the inserted OBUs reproduces
+the filter-free encode byte for byte in all 12 units and the decoded
+pictures of both streams hash identically; MP4 and Matroska keep 12/12. A
+copy of the same stream with every unit's block shifted by one is equal in
+size and shape (12237 B, 12 units, one block each) yet the value check
+reports 12 of 12 frames wrong on it, so the pass above discriminates.
+
+Verified beyond that fixture, with the same ruler over five settings - 12
+and 24 frames, 320x240 / 1920x1080 / 3840x2160, presets p1 and p4, and
+-zerolatency 1: every unit carries exactly one block and no delivered
+block disagrees with its frame (0 of 12, 0 of 24 mismatched), and an
+unpatched build decodes every picture of each stream. Note what that
+granularity is: units do hold more than one picture OBU (17 over 12 units
+at 320x240, 5 of them show_existing_frame-only), so this delivers one
+block per temporal unit, which is one per DISPLAYED picture, not one per
+coded frame. That is what a HDR10+ block describes; a consumer wanting
+metadata for every coded frame would still need DPB bookkeeping this
+patch does not do. Real content was measured after this paragraph
+was first written: 12 frames of a Dolby Vision Profile 8 clip
+through dovi_apply -> hdr10plus -> av1_nvenc give {1:12} with
+twelve distinct payloads at the default p4 and under -zerolatency,
+and two binaries built separately from the same shipped bytes
+produce the identical file (sha256 5782876ae2c6...), so the
+placement is a property of this patch, not of one build.
+
+A ten-times-longer window and a much longer GOP were measured
+after that paragraph: 120 pictures of a 4K 24 fps HDR10 subject
+(not redistributed here) through hdr10plus into av1_nvenc, once
+with -g 240, once with -g 3000 and once with -bf 0. Each of the
+three streams carries exactly one block in each of its 120
+temporal units, and the same window with the producer taken out of
+the graph carries 0 blocks in all 120 units, so the blocks are
+attributed to this branch. On that footage the payload moves on
+almost every picture (117 distinct values over 120), so agreeing
+with a scene cut on WHICH frame changed cannot grade placement
+there - a series that changes everywhere matches any shift. What
+does grade it is rank agreement against an independently measured
+per-picture luminance series: aligned +0.770, the same payload
+series shifted by one picture +0.747 late and +0.703 early.
+A five-times-longer window was measured after that paragraph too:
+600 pictures of the same 4K subject at -g 240, on three legs (the
+producer's hold default, hold=150, hold=400). Each leg carries
+exactly one block in each of its 600 temporal units, no unit is
+bare, and an unpatched build decodes 600 pictures whose payloads
+join those units one for one. Rank agreement against the
+independently measured per-picture luminance series holds at that
+length - aligned +0.9813 against +0.9743 and +0.9758 for the same
+series shifted by one picture - and it is not a saturated score
+there either: displaced by a whole second the same comparison
+scores +0.8813.
+Verified here, then, up to a 600-picture window with B-frames and
+long GOP, and also on real Dolby Vision footage: a 100-picture
+whole-clip pass and a 48-picture 3840x2160 window through this
+branch, each with exactly one block in every temporal unit and
+zero bare units, against an unpatched build that writes none.
+What those windows had to be measured against is worth stating,
+because it changed a claim rather than confirming it: in the
+streams this encoder returns, the presentation time attached to a
+frame is a per-packet counter (0, 1, 2 ... monotonic, verified on
+two different subjects), so it carries no reordering information
+and cannot be used on its own to decide WHICH picture a block
+belongs to. The order there was re-derived from the pictures
+themselves - per-frame mean luma, one fitted coding-bias offset,
+identity residual 0.071 against 0.663 for the best whole-window
+shift and a 0.742 frame-to-frame step - and the attribution
+results quoted above are stated on that basis. A scene-cut-heavy
+subject was also measured: one 12-picture and one 24-picture window
+with a detected cut strictly inside, plus a cut-free control window
+on the same stream, and the cut changes nothing about placement.
+Driver revisions are deliberately not part of the scope here: the
+maintainer's ruling on this platform is that revisions that do not
+support the current FFmpeg release are not worth a matrix, so this
+reports what NVENC 13.1 on this box does. Nothing here touches the
+H.264 or HEVC paths. The walk assumes NVENC emits
+obu_has_size_field, which every sample on this box did but which
+the SDK does not promise.
+
+Reading the frame is first-match on purpose. A frame from a stream that
+already carries HDR10+ - an HEVC decoder attaches the authored block as the
+same side-data type, and it survives the format conversions in a normal
+graph - therefore travels through this patch untouched, which is what makes
+an AV1 re-encode of an HDR10+ master possible without computing anything.
+Measured on a studio-authored 4K clip: with no producer in the graph, 12 of
+12 units carry one block and it is byte-identical to the authored one; with
+the producer in the graph the block is the producer's own (49 B against the
+master's 64 B), because patch 0002 replaces the entry rather than appending
+a second one - were it to append, the authored entry would stay first and
+every first-match reader, this one included, would publish the master's
+numbers. Both readings are gated together by six assertions over an
+elementary-stream fixture that carries 259 authored blocks.
+
+This patch and 0009 must not both be applied: they carry the same
+side data into the same file by different routes, and measured with one
+fixture on one box, applying both writes 17 blocks for 12 pictures
+(per-unit {1:9, 2:1, 3:2}) because this patch deliberately leaves
+whatever the driver already placed alone. Apply one of the two: this one
+gives every unit exactly one block ({1:12}), while the payload-array
+alternative leaves the five re-display units bare
+({0:5, 1:4, 2:1, 3:2}). Both counts are in
+p5probe/nvenc-h2h-sig-per-packet-20261003.log.
+
+Signed-off-by: REPLACE-ME <REPLACE-ME>
+
+---
+ The tree this diff was generated against: FFmpeg 8.0.git HEAD 8864fd0aecf2, with the seven
+ edits applied by zero-eight/routeA_edit.py (its anchor list is the single source of
+ the added C). Applied --check and then applied for real against a pristine copy of
+ the same commit in the verify mode of this generator; the result is byte-identical
+ to the nvenc.c/nvenc.h that cl compiled and that the 38-assertion acceptance run
+ measured.
+ Payload bytes: 6 identity (0xB5 / 0x003C / 0x0001 / 0x04) + av_dynamic_hdr_plus_to_
+ t35() body, wrapped as 0x2A, uleb128 size, metadata_type 4, payload, 0x80.
+
+ libavcodec/nvenc.c | +247/-1, 6 hunks
+ libavcodec/nvenc.h | +2/-0, 1 hunk
+diff --git a/libavcodec/nvenc.c b/libavcodec/nvenc.c
+--- a/libavcodec/nvenc.c
++++ b/libavcodec/nvenc.c
+@@ -26,6 +26,8 @@
+ #include "hevc/sei.h"
+ #if CONFIG_AV1_NVENC_ENCODER
+ #include "av1.h"
++#include "av1_parse.h"
++#include "libavutil/hdr_dynamic_metadata.h"
+ #endif
+ 
+ #include "libavutil/hwcontext_cuda.h"
+@@ -2055,8 +2057,10 @@ av_cold int ff_nvenc_encode_close(AVCodecContext *avctx)
+     av_fifo_freep2(&ctx->unused_surface_queue);
+ 
+     if (ctx->frame_data_array) {
+-        for (i = 0; i < ctx->frame_data_array_nb; i++)
++        for (i = 0; i < ctx->frame_data_array_nb; i++) {
+             av_buffer_unref(&ctx->frame_data_array[i].frame_opaque_ref);
++            av_buffer_unref(&ctx->frame_data_array[i].hdr10plus_obu);
++        }
+         av_freep(&ctx->frame_data_array);
+     }
+ 
+@@ -2564,6 +2568,219 @@ static int nvenc_set_timestamp(AVCodecContext *avctx,
+     return 0;
+ }
+ 
++#if CONFIG_AV1_NVENC_ENCODER
++/* HDR10+ (SMPTE ST 2094-40) reaches an AV1 elementary stream as an OBU_METADATA of
++ * AV1_METADATA_TYPE_ITUT_T35. The six identity bytes in front of the ST 2094-40 body come from
++ * "HDR10+ AV1 Metadata Handling Specification" v1.0.1, section 2.1; av_dynamic_hdr_plus_to_t35()
++ * serialises the body only, so the carrier writes the identity itself - the same split upstream's
++ * own libaom wrapper makes. Written as plain stores rather than bytestream_put_byte()/put_be16():
++ * this header has a fixed length with no bounds logic to gain, and each macro's unchecked pointer
++ * arithmetic is separately diagnosed under /W3 by MSVC. */
++#define HDR10PLUS_T35_HEADER_SIZE 6
++
++/* Build the whole metadata OBU for one picture: header byte, LEB128 size, metadata_type, the six
++ * identity bytes, the ST 2094-40 body and obu_trailing_bits. *out stays NULL when the frame carries
++ * no HDR10+ side data, which is the normal case and costs nothing. */
++static int nvenc_av1_hdr10plus_obu(AVCodecContext *avctx, const AVFrame *frame,
++                                   AVBufferRef **out)
++{
++    AVFrameSideData *sd = av_frame_get_side_data(frame, AV_FRAME_DATA_DYNAMIC_HDR_PLUS);
++    AVDynamicHDRPlus *hdr_plus;
++    AVBufferRef *buf;
++    uint8_t *data, *body, *dst;
++    size_t payload_size = 0, t35_size, payload_len, size_len, obu_size;
++    int ret;
++
++    *out = NULL;
++    if (!sd)
++        return 0;
++    if (sd->size < sizeof(*hdr_plus)) {
++        av_log(avctx, AV_LOG_WARNING, "HDR10+ side data is %d bytes, an AVDynamicHDRPlus is %u, "
++               "skipping\n", sd->size, (unsigned)sizeof(*hdr_plus));
++        return 0;
++    }
++    hdr_plus = (AVDynamicHDRPlus *)sd->data;
++
++    ret = av_dynamic_hdr_plus_to_t35(hdr_plus, NULL, &payload_size);
++    if (ret < 0) {
++        av_log(avctx, AV_LOG_ERROR, "Error finding the size of HDR10+\n");
++        return ret;
++    }
++
++    /* metadata_type + identity + body + obu_trailing_bits, then the header around it. */
++    t35_size    = HDR10PLUS_T35_HEADER_SIZE + payload_size;
++    payload_len = 1 + t35_size + 1;
++    size_len    = payload_len < 0x80 ? 1 : 2;
++    obu_size    = 1 + size_len + payload_len;
++
++    buf = av_buffer_alloc(obu_size);
++    if (!buf)
++        return AVERROR(ENOMEM);
++    data = buf->data;
++    data[0] = (AV1_OBU_METADATA << 3) | 0x02;  /* obu_type, obu_has_size_field = 1 */
++    if (size_len == 2) {
++        data[1] = (payload_len & 0x7F) | 0x80;
++        data[2] = payload_len >> 7;
++        body    = data + 3;
++    } else {
++        data[1] = payload_len;
++        body    = data + 2;
++    }
++    body[0] = AV1_METADATA_TYPE_ITUT_T35;
++    body[1] = 0xB5;  /* itu_t_t35_country_code: US                          */
++    body[2] = 0x00;  /* itu_t_t35_provider_code: Samsung 0x003C             */
++    body[3] = 0x3C;
++    body[4] = 0x00;  /* provider_oriented_code: 1                           */
++    body[5] = 0x01;
++    body[6] = 0x04;  /* application_identifier                              */
++
++    dst = body + 1 + HDR10PLUS_T35_HEADER_SIZE;
++    ret = av_dynamic_hdr_plus_to_t35(hdr_plus, &dst, &payload_size);
++    if (ret < 0) {
++        av_buffer_unref(&buf);
++        av_log(avctx, AV_LOG_ERROR, "Error encoding HDR10+ from side data\n");
++        return ret;
++    }
++    data[obu_size - 1] = 0x80;  /* obu_trailing_bits: one 1-bit, then zero padding */
++
++    *out = buf;
++    return 0;
++}
++
++static int nvenc_av1_record_insert(int **offsets, int *nb, int *cap, int offset)
++{
++    int *tmp;
++
++    if (*nb == *cap) {
++        tmp = av_realloc_array(*offsets, *cap + 8, sizeof(**offsets));
++        if (!tmp)
++            return AVERROR(ENOMEM);
++        *offsets = tmp;
++        *cap    += 8;
++    }
++    (*offsets)[(*nb)++] = offset;
++    return 0;
++}
++
++/* Insert the picture's metadata OBU into every temporal unit of this packet that does not already
++ * carry an itu_t_t35 one. Placement is directly in front of the unit's LAST picture OBU, which is
++ * the picture the unit displays: that is where libaom, SVT-AV1 and NVENC's own native blocks all
++ * put it, and putting it in front of the first picture instead was measured wrong on 3/12 and 2/12
++ * units of streams that hold several pictures per unit.
++ *
++ * The walk is per temporal unit, not per packet: nothing in the SDK documents that one returned
++ * buffer holds exactly one unit. Anything the walk cannot settle - an OBU without a size field in
++ * the middle of a unit, a unit with no picture OBU - is left byte-for-byte untouched and counted,
++ * because a metadata block at a guessed position is worse than none. */
++static int nvenc_av1_insert_hdr10plus(AVCodecContext *avctx, AVPacket *pkt,
++                                      const AVBufferRef *obu)
++{
++    const uint8_t *buf = pkt->data;
++    const int size = pkt->size;
++    int *offsets = NULL, nb_offsets = 0, offsets_cap = 0;
++    int unit_pic_start = -1, unit_has_t35 = 0, unit_seen = 0;
++    int pos = 0, i, ret, nb_unusable = 0;
++    AVBufferRef *new_buf;
++    uint8_t *dst;
++
++    for (;;) {
++        int type = 0, start_pos = 0, temporal_id = 0, spatial_id = 0, raw;
++        int64_t payload_size = 0;
++
++        if (pos >= size) {
++            if (unit_seen && unit_pic_start < 0)
++                nb_unusable++;
++            if (unit_seen && unit_pic_start >= 0 && !unit_has_t35) {
++                ret = nvenc_av1_record_insert(&offsets, &nb_offsets, &offsets_cap,
++                                              unit_pic_start);
++                if (ret < 0)
++                    goto end;
++            }
++            break;
++        }
++
++        raw = parse_obu_header(buf + pos, size - pos, &payload_size, &start_pos,
++                               &type, &temporal_id, &spatial_id);
++        if (raw < 0 || raw == 0) {
++            av_log(avctx, AV_LOG_VERBOSE, "AV1 output could not be walked at byte %d of %d, "
++                   "leaving this packet's metadata alone\n", pos, size);
++            ret = 0;
++            goto end;
++        }
++
++        if (type == AV1_OBU_TEMPORAL_DELIMITER) {
++            if (unit_seen && unit_pic_start < 0)
++                nb_unusable++;
++            if (unit_seen && unit_pic_start >= 0 && !unit_has_t35) {
++                ret = nvenc_av1_record_insert(&offsets, &nb_offsets, &offsets_cap,
++                                              unit_pic_start);
++                if (ret < 0)
++                    goto end;
++            }
++            unit_pic_start = -1;
++            unit_has_t35   = 0;
++            unit_seen      = 0;
++            pos           += raw;
++            continue;
++        }
++
++        unit_seen = 1;
++        switch (type) {
++        case AV1_OBU_FRAME:
++        case AV1_OBU_FRAME_HEADER:
++            /* last one wins: this is the anchor the OBU goes in front of */
++            unit_pic_start = pos;
++            break;
++        case AV1_OBU_METADATA:
++            if (payload_size >= 1) {
++                /* Every metadata_type the AV1 spec registers is below 128, so the first byte of
++                 * the payload is the whole uleb128 value. */
++                if (buf[pos + start_pos] == AV1_METADATA_TYPE_ITUT_T35)
++                    unit_has_t35 = 1;
++            }
++            break;
++        default:
++            break;
++        }
++        pos += raw;
++    }
++
++    if (!nb_offsets) {
++        if (nb_unusable)
++            av_log(avctx, AV_LOG_VERBOSE, "%d temporal unit(s) in this packet carried no picture "
++                   "OBU to anchor HDR10+ to\n", nb_unusable);
++        ret = 0;
++        goto end;
++    }
++
++    new_buf = av_buffer_alloc(size + nb_offsets * (int)obu->size);
++    if (!new_buf) {
++        ret = AVERROR(ENOMEM);
++        goto end;
++    }
++    dst    = new_buf->data;
++    pos    = 0;
++    for (i = 0; i < nb_offsets; i++) {
++        memcpy(dst, buf + pos, offsets[i] - pos);
++        dst += offsets[i] - pos;
++        memcpy(dst, obu->data, obu->size);
++        dst += obu->size;
++        pos  = offsets[i];
++    }
++    memcpy(dst, buf + pos, size - pos);
++
++    av_buffer_unref(&pkt->buf);
++    pkt->buf  = new_buf;
++    pkt->data = new_buf->data;
++    pkt->size = size + nb_offsets * (int)obu->size;
++    ret = 0;
++
++end:
++    av_freep(&offsets);
++    return ret;
++}
++#endif /* CONFIG_AV1_NVENC_ENCODER */
++
+ static int nvenc_store_frame_data(AVCodecContext *avctx, NV_ENC_PIC_PARAMS *pic_params, const AVFrame *frame)
+ {
+     NvencContext *ctx = avctx->priv_data;
+@@ -2574,6 +2791,15 @@ static int nvenc_store_frame_data(AVCodecContext *avctx, NV_ENC_PIC_PARAMS *pic_
+ 
+     // in case the encoder got reconfigured, there might be leftovers
+     av_buffer_unref(&frame_data->frame_opaque_ref);
++    av_buffer_unref(&frame_data->hdr10plus_obu);
++
++#if CONFIG_AV1_NVENC_ENCODER
++    if (avctx->codec->id == AV_CODEC_ID_AV1) {
++        res = nvenc_av1_hdr10plus_obu(avctx, frame, &frame_data->hdr10plus_obu);
++        if (res < 0)
++            return res;
++    }
++#endif
+ 
+     if (frame->opaque_ref && avctx->flags & AV_CODEC_FLAG_COPY_OPAQUE) {
+         frame_data->frame_opaque_ref = av_buffer_ref(frame->opaque_ref);
+@@ -2607,6 +2833,7 @@ static int nvenc_retrieve_frame_data(AVCodecContext *avctx, NV_ENC_LOCK_BITSTREA
+     }
+ 
+     av_buffer_unref(&frame_data->frame_opaque_ref);
++    av_buffer_unref(&frame_data->hdr10plus_obu);
+ 
+     return res;
+ }
+@@ -2649,6 +2876,25 @@ static int process_output_surface(AVCodecContext *avctx, AVPacket *pkt, NvencSur
+         goto error;
+     }
+ 
++#if CONFIG_AV1_NVENC_ENCODER
++    /* The SDK reports which submitted picture this packet came from; that is the picture the
++     * temporal unit displays, so its own metadata is the one to insert. Frames without HDR10+
++     * side data have a NULL here and the packet is returned untouched. */
++    {
++        int fd_idx = (int)lock_params.outputDuration;
++
++        if (fd_idx >= 0 && fd_idx < ctx->frame_data_array_nb) {
++            AVBufferRef *obu = ctx->frame_data_array[fd_idx].hdr10plus_obu;
++
++            if (obu) {
++                res = nvenc_av1_insert_hdr10plus(avctx, pkt, obu);
++                if (res < 0)
++                    goto error;
++            }
++        }
++    }
++#endif
++
+ 
+     if (IS_HWACCEL(avctx->pix_fmt)) {
+         ctx->registered_frames[tmpoutsurf->reg_idx].mapped -= 1;
+diff --git a/libavcodec/nvenc.h b/libavcodec/nvenc.h
+--- a/libavcodec/nvenc.h
++++ b/libavcodec/nvenc.h
+@@ -100,6 +100,8 @@ typedef struct NvencFrameData
+ 
+     void        *frame_opaque;
+     AVBufferRef *frame_opaque_ref;
++    /* Pre-built HDR10+ metadata OBU for this picture, NULL when the frame carries none. */
++    AVBufferRef *hdr10plus_obu;
+ } NvencFrameData;
+ 
+ typedef struct NvencDynLoadFunctions
+
+-- 
+2.0.0 (generator: upstream-kit/make_0008.py)

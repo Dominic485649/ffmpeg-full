@@ -13,6 +13,11 @@
 - CUDA 环境提供仅接收 CUDA 帧的 `libvmaf_cuda`，实测支持默认 `vmaf_v0.6.1`；VMAF v1 模型包含尚无 CUDA 实现的 CAMBI/Speed 特征，需使用 CPU `libvmaf`。
 - 默认针对 x86-64-v3 处理器优化。
 
+- 编译 HDR10+ `hdr10plus` 逐帧画面分析滤镜与 HEVC HDR Vivid T.35 解码元数据路径；滤镜通过合成 PQ 帧冒烟，真实内容逐帧元数据往返仍未验收。
+- 包含原生 AVS1 `avs`/`cavs` 解码，不含外部 AVS2/3 解码器、AVS 编码器或 Audio Vivid/AV3A。
+- Full 支持 IAMF v2 polar、Cartesian 8/16-bit 单/双对象位置参数的写入、`ffprobe` 读取和重封装保留。
+- P7 FEL 参考画面对比与 Dolby Vision 到 HDR10+ 的完整场景级链路仍未通过样片验收。
+
 ## 构建
 
 ```bash
