@@ -56,10 +56,6 @@ TOOLCHAIN_EXTRA_LIBS="${TOOLCHAIN_EXTRA_LIBS:-}"
 JOBS="${JOBS:-$(nproc)}"
 FFMPEG_JOBS="${FFMPEG_JOBS:-$JOBS}"
 FFMPEG_REF="${FFMPEG_REF:-master}"
-AUDIO_TOOLBOX_WRAPPER_REPO="${AUDIO_TOOLBOX_WRAPPER_REPO:-https://github.com/dantmnf/AudioToolboxWrapper.git}"
-APPLE_ITUNES_URL="${APPLE_ITUNES_URL:-https://www.apple.com/itunes/download/win64/}"
-APPLE_ITUNES_INSTALLER="${APPLE_ITUNES_INSTALLER:-$ROOT/toolchains/source-archives/iTunes64Setup.exe}"
-APPLE_AUDIO_RUNTIME_DIR="${APPLE_AUDIO_RUNTIME_DIR:-$ROOT/toolchains/apple-application-support}"
 SOURCE_FETCH_TIMEOUT="${SOURCE_FETCH_TIMEOUT:-30}"
 SOURCE_DOWNLOAD_TIMEOUT="${SOURCE_DOWNLOAD_TIMEOUT:-600}"
 INCREMENTAL_BUILD="${INCREMENTAL_BUILD:-1}"
@@ -121,7 +117,6 @@ declare -A URLS=(
   [libogg]="https://github.com/xiph/ogg.git"
   [libvorbis]="https://github.com/xiph/vorbis.git"
   [libsoxr]="https://github.com/chirlu/soxr.git"
-  [fdk-aac]="https://github.com/mstorsjo/fdk-aac.git"
   [libaom]="http://aomedia.googlesource.com/aom"
   [libvpx]="http://chromium.googlesource.com/webm/libvpx"
   [libopenjpeg]="https://github.com/uclouvain/openjpeg.git"
@@ -156,7 +151,6 @@ declare -A URLS=(
   [libgsm]="https://github.com/timothytylee/libgsm.git"
   [opencore-amr]="https://github.com/BelledonneCommunications/opencore-amr.git"
   [vo-amrwbenc]="https://github.com/mstorsjo/vo-amrwbenc.git"
-  [AudioToolboxWrapper]="$AUDIO_TOOLBOX_WRAPPER_REPO"
 )
 
 # Git 源码版本 Tag 匹配正则
@@ -195,7 +189,6 @@ declare -A TAG_REGEX=(
   [libogg]='^v?[0-9]+(\.[0-9]+)*$'
   [libvorbis]='^v?[0-9]+(\.[0-9]+)*$'
   [libsoxr]='^v?[0-9]+(\.[0-9]+)*$'
-  [fdk-aac]='^v?[0-9]+(\.[0-9]+)*$'
   [libaom]='^v[0-9]+(\.[0-9]+)*$'
   [libvpx]='^v[0-9]+(\.[0-9]+)*$'
   [libopenjpeg]='^v[0-9]+(\.[0-9]+)*$'
@@ -230,7 +223,6 @@ declare -A TAG_REGEX=(
   [libgsm]='master'
   [opencore-amr]='^v?[0-9]+(\.[0-9]+)+$'
   [vo-amrwbenc]='^v?[0-9]+(\.[0-9]+)+$'
-  [AudioToolboxWrapper]='master'
 )
 
 # 编译依赖阶段列表
@@ -247,7 +239,6 @@ STAGES=(
   "libogg"
   "libvorbis"
   "libsoxr"
-  "fdk-aac"
   "libaom"
   "libvpx"
   "libopenjpeg"
@@ -300,7 +291,6 @@ STAGES=(
   "vmaf"
   "vvenc"
   "vvdec"
-  "AudioToolboxWrapper"
   "sdl2"
   "amf"
   "avisynth"
@@ -1303,7 +1293,6 @@ run_update() {
     vmaf
     vvenc
     vvdec
-    AudioToolboxWrapper
     sdl2
     zlib
     bzip2
@@ -1316,7 +1305,6 @@ run_update() {
     libogg
     libvorbis
     libsoxr
-    fdk-aac
     libaom
     libvpx
     libopenjpeg
@@ -1391,7 +1379,6 @@ normalize_stage() {
     libogg|ogg) echo "libogg" ;;
     libvorbis|vorbis) echo "libvorbis" ;;
     libsoxr|soxr) echo "libsoxr" ;;
-    fdk-aac|fdkaac|libfdk-aac|libfdk_aac|libfdk) echo "fdk-aac" ;;
     libaom|aom) echo "libaom" ;;
     libvpx|vpx) echo "libvpx" ;;
     libopenjpeg|openjpeg) echo "libopenjpeg" ;;
@@ -1444,7 +1431,6 @@ normalize_stage() {
     vmaf) echo "vmaf" ;;
     vvenc) echo "vvenc" ;;
     vvdec) echo "vvdec" ;;
-    audiotoolboxwrapper|audiotoolbox|atw) echo "AudioToolboxWrapper" ;;
     sdl2) echo "sdl2" ;;
     amf) echo "amf" ;;
     avisynth) echo "avisynth" ;;
@@ -2010,95 +1996,13 @@ require_wsl_tool() {
   esac
 }
 
-download_apple_installer() {
-  local url="$1" installer="$2"
-  [[ -s "$installer" ]] && 7z t "$installer" >/dev/null 2>&1 && return 0
-  rm -f -- "$installer"
-  download_file_retry "$installer" "$url"
-  7z t "$installer" >/dev/null
-}
-
-extract_apple_audio_runtime() {
-  local installer="$1" tmp msi core file dll_name target
-  tmp="$(mktemp -d)"
-  if ! 7z x -y "-o$tmp/itunes" "$installer" >/dev/null; then
-    rm -rf -- "$tmp"
-    return 1
-  fi
-  while IFS= read -r -d '' msi; do
-    rm -rf -- "$tmp/apple"
-    mkdir -p "$tmp/apple"
-    7z x -y "-o$tmp/apple" "$msi" >/dev/null || continue
-    while IFS= read -r -d '' file; do
-      if ! llvm-objdump -f "$file" 2>/dev/null | grep 'file format coff-x86-64' >/dev/null; then
-        continue
-      fi
-      dll_name="$(llvm-objdump -p "$file" 2>/dev/null | sed -n 's/^[[:space:]]*DLL name: //p' || true)"
-      [[ "$dll_name" =~ ^[A-Za-z0-9._-]+\.dll$ ]] || continue
-      target="$(dirname "$file")/$dll_name"
-      [[ "$target" == "$file" ]] && continue
-      if [[ -e "$target" ]]; then
-        # ponytail: 7z exposes duplicate MSI streams without component paths; keep the first x64 DLL and let the AAC smoke test reject an incompatible duplicate.
-        cmp -s "$file" "$target" || echo "保留首个 x64 Apple DLL: $dll_name" >&2
-        rm -f -- "$file"
-      else
-        mv -f -- "$file" "$target"
-      fi
-    done < <(find "$tmp/apple" -type f -name 'fil*' -print0)
-    core="$(find "$tmp/apple" -type f -iname 'CoreAudioToolbox.dll' -print -quit)"
-    [[ -n "$core" ]] || continue
-    rm -rf -- "$APPLE_AUDIO_RUNTIME_DIR"
-    mkdir -p "$APPLE_AUDIO_RUNTIME_DIR"
-    find "$tmp/apple" -type f -iname '*.dll' -exec cp -a {} "$APPLE_AUDIO_RUNTIME_DIR/" \;
-    rm -rf -- "$tmp"
-    return 0
-  done < <(find "$tmp/itunes" -type f \( -iname 'AppleApplicationSupport*.msi' -o -iname 'iTunes*.msi' \) -print0)
-  rm -rf -- "$tmp"
-  return 1
-}
-
-prepare_apple_audio_runtime() {
-  [[ "$APPLE_AUDIO_RUNTIME_DIR" == "$ROOT/toolchains/"* ]] || {
-    echo "APPLE_AUDIO_RUNTIME_DIR 必须位于 $ROOT/toolchains" >&2
-    exit 1
-  }
-  if find "$APPLE_AUDIO_RUNTIME_DIR" -type f -iname 'CoreAudioToolbox.dll' -print -quit 2>/dev/null | grep -q .; then
-    return
-  fi
-
-  require_wsl_tool curl
-  require_wsl_tool 7z
-  mkdir -p "$(dirname "$APPLE_ITUNES_INSTALLER")"
-  download_apple_installer "$APPLE_ITUNES_URL" "$APPLE_ITUNES_INSTALLER"
-  extract_apple_audio_runtime "$APPLE_ITUNES_INSTALLER" || {
-    echo "Apple Application Support 中未找到 CoreAudioToolbox.dll" >&2
-    exit 1
-  }
-}
-
-seed_apple_audio_runtime() {
-  local core
-  prepare_apple_audio_runtime
-  core="$(find "$APPLE_AUDIO_RUNTIME_DIR" -type f -iname 'CoreAudioToolbox.dll' -print -quit)"
-  [[ -n "$core" ]] || { echo "缺少 CoreAudioToolbox.dll" >&2; exit 1; }
-  cp -f -- "$core" "$ROOT/full/"
-}
-
-is_apple_audio_runtime_dll() {
-  [[ "$1" == "$APPLE_AUDIO_RUNTIME_DIR/"* ]]
-}
-
 find_runtime_dll() {
   local dll="$1" dir found
   for dir in \
-    "$ROOT/full" "$APPLE_AUDIO_RUNTIME_DIR" "$PREFIX/bin" \
+    "$ROOT/full" "$PREFIX/bin" \
     "$LLVM_MINGW_ROOT/bin" "$LLVM_MINGW_ROOT/$TARGET/bin" "$(dirname "$CC")"; do
     [[ -d "$dir" ]] || continue
-    if [[ "$dir" == "$APPLE_AUDIO_RUNTIME_DIR" ]]; then
-      found="$(find "$dir" -type f -iname "$dll" -print -quit 2>/dev/null || true)"
-    else
-      found="$(find "$dir" -maxdepth 1 -type f -iname "$dll" -print -quit 2>/dev/null || true)"
-    fi
+    found="$(find "$dir" -maxdepth 1 -type f -iname "$dll" -print -quit 2>/dev/null || true)"
     if [[ -n "$found" ]]; then
       printf '%s\n' "$found"
       return 0
@@ -2132,7 +2036,7 @@ copy_runtime_dll_closure() {
       src="$(find_runtime_dll "$dll" || true)"
       if [[ -n "$src" ]]; then
         cp -f "$src" "$dst/"
-        is_apple_audio_runtime_dll "$src" || "$STRIP" "$dst/$(basename "$src")" 2>/dev/null || true
+        "$STRIP" "$dst/$(basename "$src")" 2>/dev/null || true
         changed=1
       else
         printf '%s\n' "$dll" >> "$tmp/missing"
@@ -2282,8 +2186,8 @@ replace_once("configure",
     '                             require_pkg_config libjxl_threads "libjxl_threads >= 0.7.0" jxl/thread_parallel_runner.h JxlThreadParallelRunner\\n'
     'enabled libjxr            && require_pkg_config libjxr libjxr JXRGlue.h PKCreateCodecFactory\\n')
 replace_once("libavcodec/codec_id.h",
-    "    AV_CODEC_ID_ASTC,\\n\\n    /* various PCM \"codecs\" */\\n    AV_CODEC_ID_FIRST_AUDIO = 0x10000,     ///< A dummy id pointing at the start of audio codecs",
-    "    AV_CODEC_ID_ASTC,\\n    AV_CODEC_ID_JPEGXR = 0x7F00,\\n\\n"
+    "    AV_CODEC_ID_RW2,\\n\\n    /* various PCM \"codecs\" */\\n    AV_CODEC_ID_FIRST_AUDIO = 0x10000,     ///< A dummy id pointing at the start of audio codecs",
+    "    AV_CODEC_ID_RW2,\\n    AV_CODEC_ID_JPEGXR = 0x7F00,\\n\\n"
     "    /* various PCM \"codecs\" */\\n    AV_CODEC_ID_FIRST_AUDIO = 0x10000,     ///< A dummy id pointing at the start of audio codecs")
 replace_once("libavcodec/codec_desc.c",
     '    /* various PCM "codecs" */\\n',
@@ -2633,125 +2537,7 @@ patch_ffmpeg_cxx_runtime() {
   sed -i 's/-lstdc++/-lc++/g' "$ff_stage/configure"
 }
 
-patch_ffmpeg_nvenc_hdr10plus() {
-  local ff_stage="$1"
-  local nvenc_c="$ff_stage/libavcodec/nvenc.c"
 
-  if grep -q 'nvenc_alloc_hdr10_plus_payload' "$nvenc_c"; then
-    echo "FFmpeg NVENC HDR10+ passthrough patch already applied"
-    return 0
-  fi
-
-  echo "== Patch FFmpeg NVENC HDR10+ passthrough =="
-  git -C "$ff_stage" apply --recount --whitespace=nowarn <<'PATCH_NVENC_HDR10PLUS'
-diff --git a/libavcodec/nvenc.c b/libavcodec/nvenc.c
-index 5ea094e095..0b138e1ccd 100644
---- a/libavcodec/nvenc.c
-+++ b/libavcodec/nvenc.c
-@@ -31,6 +31,7 @@
- #include "libavutil/hwcontext_cuda.h"
- #include "libavutil/hwcontext.h"
- #include "libavutil/cuda_check.h"
-+#include "libavutil/hdr_dynamic_metadata.h"
- #include "libavutil/imgutils.h"
- #include "libavutil/mem.h"
- #include "libavutil/pixdesc.h"
-@@ -40,9 +41,11 @@
- #include "libavutil/stereo3d.h"
- #include "libavutil/tdrdi.h"
- #include "atsc_a53.h"
-+#include "bytestream.h"
- #include "codec_desc.h"
- #include "encode.h"
- #include "internal.h"
-+#include "itut35.h"
- 
- #define CHECK_CU(x) FF_CUDA_CHECK_DL(avctx, dl_fn->cuda_dl, x)
- 
-@@ -2723,6 +2726,47 @@ static int output_ready(AVCodecContext *avctx, int flush)
-     return (nb_ready > 0) && (nb_ready + nb_pending >= ctx->async_depth);
- }
- 
-+static int nvenc_alloc_hdr10_plus_payload(const AVFrame *frame, uint8_t **data, size_t *size)
-+{
-+    const AVFrameSideData *side_data =
-+        av_frame_get_side_data(frame, AV_FRAME_DATA_DYNAMIC_HDR_PLUS);
-+    const AVDynamicHDRPlus *hdr_plus;
-+    uint8_t *payload;
-+    size_t payload_size;
-+    int ret;
-+
-+    if (!side_data) {
-+        *data = NULL;
-+        *size = 0;
-+        return 0;
-+    }
-+
-+    hdr_plus = (const AVDynamicHDRPlus *)side_data->data;
-+    ret = av_dynamic_hdr_plus_to_t35(hdr_plus, NULL, &payload_size);
-+    if (ret < 0)
-+        return ret;
-+
-+    *size = payload_size + 6;
-+    *data = av_malloc(*size);
-+    if (!*data)
-+        return AVERROR(ENOMEM);
-+
-+    payload = *data;
-+    bytestream_put_byte(&payload, ITU_T_T35_COUNTRY_CODE_US);
-+    bytestream_put_be16(&payload, ITU_T_T35_PROVIDER_CODE_SAMSUNG);
-+    bytestream_put_be16(&payload, 0x0001);
-+    bytestream_put_byte(&payload, 0x04);
-+
-+    ret = av_dynamic_hdr_plus_to_t35(hdr_plus, &payload, &payload_size);
-+    if (ret < 0) {
-+        av_freep(data);
-+        *size = 0;
-+        return ret;
-+    }
-+
-+    return 1;
-+}
-+
- static int prepare_sei_data_array(AVCodecContext *avctx, const AVFrame *frame)
- {
-     NvencContext *ctx = avctx->priv_data;
-@@ -2797,6 +2841,43 @@ static int prepare_sei_data_array(AVCodecContext *avctx, const AVFrame *frame)
-         }
-     }
- 
-+    if (avctx->codec->id == AV_CODEC_ID_HEVC) {
-+        uint8_t *hdr_plus_data = NULL;
-+        size_t hdr_plus_size = 0;
-+
-+        res = nvenc_alloc_hdr10_plus_payload(frame, &hdr_plus_data, &hdr_plus_size);
-+        if (res < 0) {
-+            av_log(ctx, AV_LOG_ERROR, "Error serializing HDR10+ metadata\n");
-+            goto error;
-+        }
-+
-+        if (res > 0) {
-+            void *tmp = av_fast_realloc(ctx->sei_data,
-+                                        &ctx->sei_data_size,
-+                                        (sei_count + 1) * sizeof(*ctx->sei_data));
-+            if (!tmp) {
-+                av_free(hdr_plus_data);
-+                res = AVERROR(ENOMEM);
-+                goto error;
-+            }
-+
-+            ctx->sei_data = tmp;
-+            ctx->sei_data[sei_count].payloadSize = (uint32_t)hdr_plus_size;
-+            ctx->sei_data[sei_count].payload = hdr_plus_data;
-+            ctx->sei_data[sei_count].payloadType = SEI_TYPE_USER_DATA_REGISTERED_ITU_T_T35;
-+            sei_count++;
-+        }
-+    }
-+
-     if (!ctx->udu_sei)
-         return sei_count;
-PATCH_NVENC_HDR10PLUS
-}
 
 patch_ffmpeg_nvenc_dovi_p8_p10() {
   local ff_stage="$1"
@@ -2909,263 +2695,9 @@ replace_once(
 PYDOVINVENC
 }
 
-patch_ffmpeg_libx265_hdr10plus() {
-  local ff_stage="$1"
-  local x265_c="$ff_stage/libavcodec/libx265.c"
 
-  if grep -q 'libx265_add_hdr10_plus' "$x265_c"; then
-    echo "FFmpeg libx265 HDR10+ passthrough patch already applied"
-    return 0
-  fi
-  if grep -q 'AV_FRAME_DATA_DYNAMIC_HDR_PLUS' "$x265_c"; then
-    echo "FFmpeg libx265 already contains HDR10+ side-data handling; skip local patch"
-    return 0
-  fi
 
-  echo "== Patch FFmpeg libx265 HDR10+ passthrough =="
-  git -C "$ff_stage" apply --recount --whitespace=nowarn <<'PATCH_LIBX265_HDR10PLUS'
-diff --git a/libavcodec/libx265.c b/libavcodec/libx265.c
-index c5e6b8c150..913927e7e1 100644
---- a/libavcodec/libx265.c
-+++ b/libavcodec/libx265.c
-@@ -29,17 +29,20 @@
- 
- #include "libavutil/avassert.h"
- #include "libavutil/buffer.h"
-+#include "libavutil/hdr_dynamic_metadata.h"
- #include "libavutil/internal.h"
- #include "libavutil/mastering_display_metadata.h"
- #include "libavutil/mem.h"
- #include "libavutil/opt.h"
- #include "libavutil/pixdesc.h"
- #include "avcodec.h"
-+#include "bytestream.h"
- #include "codec_internal.h"
- #include "dovi_rpu.h"
- #include "encode.h"
- #include "atsc_a53.h"
- #include "sei.h"
-+#include "itut35.h"
- 
- #if defined(X265_ENABLE_ALPHA) && MAX_LAYERS > 2
- #define FF_X265_MAX_LAYERS MAX_LAYERS
-@@ -698,6 +701,71 @@ static av_cold int libx265_encode_set_roi(libx265Context *ctx, const AVFrame *fr
-     return 0;
- }
- 
-+static int libx265_add_hdr10_plus(AVCodecContext *avctx, const AVFrame *frame,
-+                                  x265_picture *pic)
-+{
-+    libx265Context *ctx = avctx->priv_data;
-+    const AVFrameSideData *side_data;
-+    const AVDynamicHDRPlus *hdr_plus;
-+    x265_sei *sei = &pic->userSEI;
-+    x265_sei_payload *sei_payload;
-+    uint8_t *hdr_plus_buf, *payload;
-+    size_t payload_size, hdr_plus_size;
-+    void *tmp;
-+    int ret;
-+
-+    /* An explicit x265 JSON source takes precedence over frame side data. */
-+    if (av_dict_get(ctx->x265_opts, "dhdr10-info", NULL, 0))
-+        return 0;
-+
-+    side_data = av_frame_get_side_data(frame, AV_FRAME_DATA_DYNAMIC_HDR_PLUS);
-+    if (!side_data)
-+        return 0;
-+
-+    hdr_plus = (const AVDynamicHDRPlus *)side_data->data;
-+    ret = av_dynamic_hdr_plus_to_t35(hdr_plus, NULL, &payload_size);
-+    if (ret < 0) {
-+        av_log(avctx, AV_LOG_ERROR, "Error finding the size of HDR10+ metadata\n");
-+        return ret;
-+    }
-+
-+    hdr_plus_size = payload_size + 6;
-+    hdr_plus_buf = av_malloc(hdr_plus_size);
-+    if (!hdr_plus_buf)
-+        return AVERROR(ENOMEM);
-+
-+    payload = hdr_plus_buf;
-+    bytestream_put_byte(&payload, ITU_T_T35_COUNTRY_CODE_US);
-+    bytestream_put_be16(&payload, ITU_T_T35_PROVIDER_CODE_SAMSUNG);
-+    bytestream_put_be16(&payload, 0x0001);
-+    bytestream_put_byte(&payload, 0x04);
-+
-+    ret = av_dynamic_hdr_plus_to_t35(hdr_plus, &payload, &payload_size);
-+    if (ret < 0) {
-+        av_free(hdr_plus_buf);
-+        av_log(avctx, AV_LOG_ERROR, "Error serializing HDR10+ metadata\n");
-+        return ret;
-+    }
-+
-+    tmp = av_fast_realloc(ctx->sei_data, &ctx->sei_data_size,
-+                          (sei->numPayloads + 1) * sizeof(*sei_payload));
-+    if (!tmp) {
-+        av_free(hdr_plus_buf);
-+        return AVERROR(ENOMEM);
-+    }
-+
-+    ctx->sei_data = tmp;
-+    sei->payloads = ctx->sei_data;
-+    sei_payload = &sei->payloads[sei->numPayloads];
-+    sei_payload->payload = hdr_plus_buf;
-+    sei_payload->payloadSize = (int)hdr_plus_size;
-+    sei_payload->payloadType =
-+        (SEIPayloadType)SEI_TYPE_USER_DATA_REGISTERED_ITU_T_T35;
-+    sei->numPayloads++;
-+
-+    return 0;
-+}
-+
- static void free_picture(libx265Context *ctx, x265_picture *pic)
- {
-     x265_sei *sei = &pic->userSEI;
-@@ -813,6 +881,12 @@ static int libx265_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
-             }
-         }
- 
-+        ret = libx265_add_hdr10_plus(avctx, pic, &x265pic);
-+        if (ret < 0) {
-+            free_picture(ctx, &x265pic);
-+            return ret;
-+        }
-+
-         if (ctx->udu_sei) {
-             for (i = 0; i < pic->nb_side_data; i++) {
-                 AVFrameSideData *side_data = pic->side_data[i];
-PATCH_LIBX265_HDR10PLUS
-}
 
-patch_ffmpeg_svtav1_hdr10plus() {
-  local ff_stage="$1"
-  local svt_c="$ff_stage/libavcodec/libsvtav1.c"
-
-  if grep -q 'add_hdr_plus' "$svt_c"; then
-    echo "FFmpeg libsvtav1 HDR10+ passthrough patch already applied"
-    return 0
-  fi
-
-  echo "== Patch FFmpeg libsvtav1 HDR10+ passthrough =="
-  git -C "$ff_stage" apply --recount --whitespace=nowarn <<'PATCH_SVTAV1_HDR10PLUS'
---- a/libavcodec/libsvtav1.c
-+++ b/libavcodec/libsvtav1.c
-@@ -42,6 +42,7 @@
- #include "dovi_rpu.h"
- #include "encode.h"
- #include "avcodec.h"
-+#include "bytestream.h"
- #include "profiles.h"
- 
- typedef enum eos_status {
-@@ -146,6 +147,15 @@
- 
- }
- 
-+
-+/* HDR10+ dynamic metadata (SMPTE ST 2094-40) carried in an AV1 T35 metadata
-+ * OBU, per "HDR10+ AV1 Metadata Handling Specification" v1.0.1, section 2.1. */
-+#define ITU_T_T35_COUNTRY_CODE_US        0xB5
-+#define ITU_T_T35_PROVIDER_CODE_SAMSUNG  0x003C
-+#define HDR10PLUS_PROVIDER_ORIENTED_CODE  0x0001
-+#define HDR10PLUS_APPLICATION_IDENTIFIER  0x04
-+#define HDR10PLUS_T35_HEADER_SIZE         6
-+
- static void handle_mdcv(struct EbSvtAv1MasteringDisplayInfo *dst,
-                         const AVMasteringDisplayMetadata *mdcv)
- {
-@@ -182,6 +192,59 @@
-                 av_rescale_q(1, mdcv->min_luminance,
-                              (AVRational){ 1, (1 << 14) }));
-     }
-+}
-+
-+
-+static int add_hdr_plus(AVCodecContext *avctx, EbBufferHeaderType *headerPtr,
-+                        const AVFrame *frame)
-+{
-+    const AVFrameSideData *sd = av_frame_get_side_data(frame,
-+                                                       AV_FRAME_DATA_DYNAMIC_HDR_PLUS);
-+    const AVDynamicHDRPlus *hdr_plus;
-+    uint8_t *buf, *payload;
-+    size_t payload_size;
-+    int ret;
-+
-+    if (!sd)
-+        return 0;
-+
-+    hdr_plus = (const AVDynamicHDRPlus *)sd->data;
-+
-+    /* First call with data == NULL only queries the serialized size. */
-+    ret = av_dynamic_hdr_plus_to_t35(hdr_plus, NULL, &payload_size);
-+    if (ret < 0) {
-+        av_log(avctx, AV_LOG_ERROR, "Error finding the size of HDR10+\n");
-+        return ret;
-+    }
-+
-+    buf = av_malloc(payload_size + HDR10PLUS_T35_HEADER_SIZE);
-+    if (!buf)
-+        return AVERROR(ENOMEM);
-+
-+    payload = buf;
-+    bytestream_put_byte(&payload, ITU_T_T35_COUNTRY_CODE_US);
-+    bytestream_put_be16(&payload, ITU_T_T35_PROVIDER_CODE_SAMSUNG);
-+    bytestream_put_be16(&payload, HDR10PLUS_PROVIDER_ORIENTED_CODE);
-+    bytestream_put_byte(&payload, HDR10PLUS_APPLICATION_IDENTIFIER);
-+
-+    /* With *data non-NULL to_t35 writes in place; size is in/out and must
-+     * already hold the capacity. */
-+    ret = av_dynamic_hdr_plus_to_t35(hdr_plus, &payload, &payload_size);
-+    if (ret < 0) {
-+        av_free(buf);
-+        av_log(avctx, AV_LOG_ERROR, "Error encoding HDR10+ from side data\n");
-+        return ret;
-+    }
-+
-+    ret = svt_add_metadata(headerPtr, EB_AV1_METADATA_TYPE_ITUT_T35, buf,
-+                           payload_size + HDR10PLUS_T35_HEADER_SIZE);
-+    av_free(buf);
-+    if (ret < 0) {
-+        av_log(avctx, AV_LOG_ERROR, "Error adding HDR10+ to SVT-AV1 buffer\n");
-+        return AVERROR(ENOMEM);
-+    }
-+
-+    return 0;
- }
- 
- static void handle_side_data(AVCodecContext *avctx,
-@@ -594,6 +657,11 @@
- 
-     if (avctx->gop_size == 1)
-         headerPtr->pic_type = EB_AV1_KEY_PICTURE;
-+
-+    ret = add_hdr_plus(avctx, headerPtr, frame);
-+    if (ret < 0)
-+        return ret;
-+
- 
-     sd = av_frame_get_side_data(frame, AV_FRAME_DATA_DOVI_METADATA);
-     if (svt_enc->dovi.cfg.dv_profile && sd) {
-PATCH_SVTAV1_HDR10PLUS
-
-  # The patch's new code needs AVDynamicHDRPlus / av_dynamic_hdr_plus_to_t35.
-  # libaomenc.c includes this header explicitly and no libavcodec header pulls it
-  # in transitively, so the patch as shipped does not compile without it.
-  python3 - "$svt_c" <<'PYSVTINC'
-from pathlib import Path
-import sys
-p = Path(sys.argv[1])
-s = p.read_text()
-old = '#include "libavutil/mastering_display_metadata.h"\n'
-new = old + '#include "libavutil/hdr_dynamic_metadata.h"\n'
-if s.count(new) == 1:
-    pass
-elif s.count(old) == 1:
-    p.write_text(s.replace(old, new, 1))
-else:
-    raise SystemExit(f"{p}: unexpected mastering_display include state")
-PYSVTINC
-}
 
 patch_ffmpeg_libaom_hdr_static() {
   local ff_stage="$1"
@@ -3258,265 +2790,6 @@ p.write_text(s)
 PYAOMSTATIC
 }
 
-patch_ffmpeg_nvenc_hdr_static() {
-  local ff_stage="$1"
-  local nvenc_c="$ff_stage/libavcodec/nvenc.c"
-
-  if grep -q 'nvenc_alloc_hdr_static_payload' "$nvenc_c"; then
-    echo "FFmpeg NVENC static HDR10 (MDCV/CLL) patch already applied"
-    return 0
-  fi
-
-  echo "== Patch FFmpeg NVENC static HDR10 (MDCV/CLL) =="
-  python3 - "$nvenc_c" <<'PYNVENCSTATIC'
-from pathlib import Path
-import sys
-p = Path(sys.argv[1])
-s = p.read_text()
-
-helper = r"""/* Static HDR10 metadata for AV1. NVENC's AV1 encoder ignores
- * NV_ENC_CONFIG_AV1.outputMasteringDisplay / outputMaxCll - hevc_nvenc writes
- * MDCV/CLL, av1_nvenc does not - so push them through the AV1 OBU payload
- * array, which nvenc.c already feeds from ctx->sei_data. */
-static int nvenc_alloc_hdr_static_payload(const AVFrame *frame, int metadata_type,
-                                          uint8_t **data, size_t *size)
-{
-    const AVFrameSideData *sd_mdcv =
-        av_frame_get_side_data(frame, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA);
-    const AVFrameSideData *sd_cll =
-        av_frame_get_side_data(frame, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL);
-
-    *data = NULL;
-    *size = 0;
-
-    if (metadata_type == AV1_METADATA_TYPE_HDR_MDCV && sd_mdcv) {
-        const AVMasteringDisplayMetadata *mdm = (const AVMasteringDisplayMetadata *)sd_mdcv->data;
-        const int chroma_den = 1 << 16, max_luma_den = 1 << 8, min_luma_den = 1 << 14;
-        uint8_t *buf, *q;
-        int i;
-
-        if (!mdm->has_primaries || !mdm->has_luminance)
-            return 0;
-
-        buf = q = av_malloc(24);
-        if (!buf)
-            return AVERROR(ENOMEM);
-
-        for (i = 0; i < 3; i++) {
-            bytestream_put_be16(&q, av_rescale(mdm->display_primaries[i][0].num, chroma_den, mdm->display_primaries[i][0].den));
-            bytestream_put_be16(&q, av_rescale(mdm->display_primaries[i][1].num, chroma_den, mdm->display_primaries[i][1].den));
-        }
-        bytestream_put_be16(&q, av_rescale(mdm->white_point[0].num, chroma_den, mdm->white_point[0].den));
-        bytestream_put_be16(&q, av_rescale(mdm->white_point[1].num, chroma_den, mdm->white_point[1].den));
-        bytestream_put_be32(&q, av_rescale(mdm->max_luminance.num, max_luma_den, mdm->max_luminance.den));
-        bytestream_put_be32(&q, av_rescale(mdm->min_luminance.num, min_luma_den, mdm->min_luminance.den));
-
-        *data = buf;
-        *size = 24;
-        return 1;
-    }
-
-    if (metadata_type == AV1_METADATA_TYPE_HDR_CLL && sd_cll) {
-        const AVContentLightMetadata *cll = (const AVContentLightMetadata *)sd_cll->data;
-        uint8_t *buf, *q;
-
-        buf = q = av_malloc(4);
-        if (!buf)
-            return AVERROR(ENOMEM);
-
-        bytestream_put_be16(&q, cll->MaxCLL);
-        bytestream_put_be16(&q, cll->MaxFALL);
-
-        *data = buf;
-        *size = 4;
-        return 1;
-    }
-
-    return 0;
-}
-
-"""
-
-anchor = 'static int prepare_sei_data_array(AVCodecContext *avctx, const AVFrame *frame)'
-if s.count(anchor) != 1:
-    raise SystemExit(f"{p}: prepare_sei_data_array anchor not unique")
-s = s.replace(anchor, helper + anchor, 1)
-
-call_old = '    if (!ctx->udu_sei)\n        return sei_count;\n'
-call_new = r"""    if (avctx->codec->id == AV_CODEC_ID_AV1) {
-        static const int hdr_static_types[] = {
-            AV1_METADATA_TYPE_HDR_MDCV, AV1_METADATA_TYPE_HDR_CLL,
-        };
-        size_t t;
-
-        for (t = 0; t < FF_ARRAY_ELEMS(hdr_static_types); t++) {
-            uint8_t *payload_data = NULL;
-            size_t payload_size = 0;
-            void *tmp;
-
-            res = nvenc_alloc_hdr_static_payload(frame, hdr_static_types[t],
-                                                 &payload_data, &payload_size);
-            if (res < 0)
-                goto error;
-            if (res == 0)
-                continue;
-
-            tmp = av_fast_realloc(ctx->sei_data, &ctx->sei_data_size,
-                                  (sei_count + 1) * sizeof(*ctx->sei_data));
-            if (!tmp) {
-                av_free(payload_data);
-                res = AVERROR(ENOMEM);
-                goto error;
-            }
-
-            ctx->sei_data = tmp;
-            ctx->sei_data[sei_count].payloadSize = (uint32_t)payload_size;
-            ctx->sei_data[sei_count].payload = payload_data;
-            ctx->sei_data[sei_count].payloadType = hdr_static_types[t];
-            sei_count++;
-        }
-    }
-
-""" + call_old
-if s.count(call_old) != 1:
-    raise SystemExit(f"{p}: udu_sei anchor not unique")
-s = s.replace(call_old, call_new, 1)
-
-p.write_text(s)
-PYNVENCSTATIC
-}
-
-patch_ffmpeg_qsv_hdr10plus() {
-  local ff_stage="$1"
-  local qsv_c="$ff_stage/libavcodec/qsvenc.c"
-
-  if grep -q 'set_hdr10plus_payload' "$qsv_c"; then
-    echo "FFmpeg QSV HDR10+ payload patch already applied"
-    return 0
-  fi
-
-  echo "== Patch FFmpeg QSV HDR10+ payload =="
-  python3 - "$qsv_c" <<'PYQSVHDR10PLUS'
-from pathlib import Path
-import sys
-p = Path(sys.argv[1])
-s = p.read_text()
-
-inc_anchor = '#include "qsvenc.h"\n'
-inc_new = (inc_anchor +
-           '#include "libavutil/hdr_dynamic_metadata.h"\n'
-           '#include "bytestream.h"\n'
-           '#include "itut35.h"\n'
-           '#include "sei.h"\n')
-if '#include "itut35.h"' not in s:
-    if s.count(inc_anchor) != 1:
-        raise SystemExit(f"{p}: qsvenc.h include anchor not unique")
-    s = s.replace(inc_anchor, inc_new, 1)
-
-helper = r"""/* HDR10+ (SMPTE ST 2094-40) through the oneVPL per-frame payload channel.
- * mfxPayload's per-codec support table (mfxstructures.h) lists MPEG2/AVC/HEVC,
- * with HEVC accepting all payload types; AV1 has neither a payload channel nor
- * an AV1 metadata extension buffer, so av1_qsv cannot carry HDR10+. */
-static int set_hdr10plus_payload(AVCodecContext *avctx, const AVFrame *frame,
-                                 mfxEncodeCtrl *enc_ctrl)
-{
-    const AVFrameSideData *sd;
-    const AVDynamicHDRPlus *hdr_plus;
-    mfxPayload *payload;
-    uint8_t *buf, *q;
-    size_t payload_size, t35_len;
-    int ret;
-
-    if (avctx->codec_id != AV_CODEC_ID_HEVC)
-        return 0;
-    if (enc_ctrl->NumPayload >= QSV_MAX_ENC_PAYLOAD)
-        return 0;
-
-    sd = av_frame_get_side_data(frame, AV_FRAME_DATA_DYNAMIC_HDR_PLUS);
-    if (!sd)
-        return 0;
-    hdr_plus = (const AVDynamicHDRPlus *)sd->data;
-
-    ret = av_dynamic_hdr_plus_to_t35(hdr_plus, NULL, &payload_size);
-    if (ret < 0) {
-        av_log(avctx, AV_LOG_ERROR, "Error finding the size of HDR10+\n");
-        return ret;
-    }
-
-    t35_len = payload_size + 6;
-    if (t35_len > 255) {
-        av_log(avctx, AV_LOG_ERROR,
-               "HDR10+ T35 payload too large for the oneVPL SEI channel (%zu)\n", t35_len);
-        return 0;
-    }
-
-    /* oneVPL wants the SEI header inside Data: the payload type byte, then the
-     * payload size byte, then the payload. qsvenc_h264.c's A53 caption payload
-     * does the same, and without the header the runtime drops the payload. */
-    buf = av_mallocz(t35_len + 2);
-    if (!buf)
-        return AVERROR(ENOMEM);
-
-    q = buf;
-    bytestream_put_byte(&q, SEI_TYPE_USER_DATA_REGISTERED_ITU_T_T35);
-    bytestream_put_byte(&q, (uint8_t)t35_len);
-    bytestream_put_byte(&q, ITU_T_T35_COUNTRY_CODE_US);
-    bytestream_put_be16(&q, ITU_T_T35_PROVIDER_CODE_SAMSUNG);
-    bytestream_put_be16(&q, 0x0001);
-    bytestream_put_byte(&q, 0x04);
-
-    ret = av_dynamic_hdr_plus_to_t35(hdr_plus, &q, &payload_size);
-    if (ret < 0) {
-        av_free(buf);
-        av_log(avctx, AV_LOG_ERROR, "Error serializing HDR10+ metadata\n");
-        return ret;
-    }
-
-    payload = av_mallocz(sizeof(*payload));
-    if (!payload) {
-        av_free(buf);
-        return AVERROR(ENOMEM);
-    }
-    payload->Data    = buf;
-    payload->BufSize = t35_len + 2;
-    payload->NumBit  = payload->BufSize * 8;
-    payload->Type    = SEI_TYPE_USER_DATA_REGISTERED_ITU_T_T35;
-
-    /* Filled into QSVFrame.payloads; free_encoder_ctrl() releases it. */
-    enc_ctrl->Payload[enc_ctrl->NumPayload++] = payload;
-
-    return 0;
-}
-
-"""
-
-helper_anchor = 'static int set_roi_encode_ctrl(AVCodecContext *avctx, const AVFrame *frame,'
-if s.count(helper_anchor) != 1:
-    raise SystemExit(f"{p}: set_roi_encode_ctrl anchor not unique")
-s = s.replace(helper_anchor, helper + helper_anchor, 1)
-
-call_anchor = '        set_skip_frame_encode_ctrl(avctx, frame, enc_ctrl);\n'
-call_new = (call_anchor +
-            '\n'
-            '    if (enc_ctrl) {\n'
-            '        ret = set_hdr10plus_payload(avctx, frame, enc_ctrl);\n'
-            '        if (ret < 0)\n'
-            '            goto free;\n'
-            '    }\n')
-if s.count(call_anchor) != 1:
-    raise SystemExit(f"{p}: skip_frame call anchor not unique")
-s = s.replace(call_anchor, call_new, 1)
-
-p.write_text(s)
-PYQSVHDR10PLUS
-
-  grep -q 'set_hdr10plus_payload(avctx, frame, enc_ctrl)' "$qsv_c" || {
-    echo "FFmpeg QSV HDR10+ payload injection is missing"
-    exit 1
-  }
-}
-
-
 patch_ffmpeg_qsv_dovi_p8() {
   local ff_stage="$1"
   local qsv_c="$ff_stage/libavcodec/qsvenc.c"
@@ -3542,6 +2815,12 @@ def replace_once(text, old, new, label):
     if count != 1:
         raise SystemExit(f"{label}: patch anchor count={count}, expected 1")
     return text.replace(old, new, 1)
+
+for include in ('bytestream.h', 'sei.h'):
+    marker = '#include "' + include + '"'
+    if marker not in s:
+        s = replace_once(s, '#include "avcodec.h"\n',
+                         '#include "avcodec.h"\n' + marker + '\n', c_path)
 
 if '#include "dovi_rpu.h"' not in hs:
     hs = replace_once(hs, '#include "qsv_internal.h"\n',
@@ -3640,13 +2919,12 @@ close_anchor = '    av_freep(&q->extparam);\n\n    return 0;\n'
 s = replace_once(s, close_anchor,
                  '    av_freep(&q->extparam);\n    ff_dovi_ctx_unref(&q->dovi);\n\n    return 0;\n', c_path)
 
-call_anchor = ('        ret = set_hdr10plus_payload(avctx, frame, enc_ctrl);\n'
-               '        if (ret < 0)\n'
-               '            goto free;\n')
-call_code = (call_anchor +
-             '        ret = set_dovi_rpu_payload(avctx, frame, q, enc_ctrl);\n'
-             '        if (ret < 0)\n'
-             '            goto free;\n')
+call_anchor = "    pkt.sync = av_mallocz(sizeof(*pkt.sync));\n"
+call_code = ("    if (frame && enc_ctrl) {\n"
+             "        ret = set_dovi_rpu_payload(avctx, frame, q, enc_ctrl);\n"
+             "        if (ret < 0)\n"
+             "            goto free;\n"
+             "    }\n\n" + call_anchor)
 s = replace_once(s, call_anchor, call_code, c_path)
 
 c_path.write_text(s)
@@ -3736,12 +3014,12 @@ PATCH
 verify_full_ffmpeg_config() {
   local cfg="$1" ff_stage="$2" key
   local required=(
-    CONFIG_AAC_ENCODER CONFIG_AUDIOTOOLBOX CONFIG_AAC_AT_ENCODER CONFIG_LIBSOXR CONFIG_LIBSSH CONFIG_OPENCL CONFIG_D3D12VA
+    CONFIG_AAC_ENCODER CONFIG_LIBSOXR CONFIG_LIBSSH CONFIG_OPENCL CONFIG_D3D12VA
     CONFIG_OPENGL CONFIG_LIBSNAPPY CONFIG_LIBTHEORA CONFIG_LIBSPEEX CONFIG_LIBTWOLAME
     CONFIG_LIBMYSOFA CONFIG_LIBOPENMPT CONFIG_LIBDVDREAD CONFIG_LIBDVDNAV
     CONFIG_CHROMAPRINT CONFIG_LIBZMQ CONFIG_LIBZVBI CONFIG_LIBGSM
     CONFIG_LIBOPENCORE_AMRNB CONFIG_LIBOPENCORE_AMRWB CONFIG_LIBVO_AMRWBENC
-    CONFIG_ICONV CONFIG_LIBPLACEBO_FILTER CONFIG_HDR10PLUS_FILTER CONFIG_VULKAN
+    CONFIG_ICONV CONFIG_LIBPLACEBO_FILTER CONFIG_VULKAN
     CONFIG_LIBJXR CONFIG_LIBJXR_ENCODER CONFIG_LIBJXR_DECODER
     CONFIG_LIBVPL CONFIG_AV1_QSV_ENCODER CONFIG_HEVC_QSV_ENCODER
     CONFIG_LIBAOM_AV1_ENCODER CONFIG_LIBSVTAV1_ENCODER
@@ -3810,28 +3088,12 @@ verify_full_ffmpeg_config() {
     echo "FFmpeg source does not contain the NMR AAC speed option"
     exit 1
   }
-  grep -q 'AV_FRAME_DATA_DYNAMIC_HDR_PLUS' "$ff_stage/libavcodec/nvenc.c" || {
-    echo "FFmpeg NVENC HDR10+ passthrough is missing"
-    exit 1
-  }
-  grep -q 'AV_FRAME_DATA_DYNAMIC_HDR_PLUS' "$ff_stage/libavcodec/libx265.c" || {
-    echo "FFmpeg libx265 HDR10+ passthrough is missing"
-    exit 1
-  }
   grep -q 'AV_FRAME_DATA_DYNAMIC_HDR_PLUS' "$ff_stage/libavcodec/libaomenc.c" || {
     echo "FFmpeg libaom HDR10+ passthrough is missing"
     exit 1
   }
-  grep -q 'svt_add_metadata(headerPtr, EB_AV1_METADATA_TYPE_ITUT_T35' "$ff_stage/libavcodec/libsvtav1.c" || {
-    echo "FFmpeg libsvtav1 HDR10+ passthrough is missing"
-    exit 1
-  }
   grep -q 'add_hdr_static(avctx, rawimg, frame)' "$ff_stage/libavcodec/libaomenc.c" || {
     echo "FFmpeg libaom static HDR10 (MDCV/CLL) passthrough is missing"
-    exit 1
-  }
-  grep -q 'nvenc_alloc_hdr_static_payload' "$ff_stage/libavcodec/nvenc.c" || {
-    echo "FFmpeg NVENC static HDR10 (MDCV/CLL) injection is missing"
     exit 1
   }
 }
@@ -3943,10 +3205,6 @@ verify_dolby_vision_support() {
     exit 1
   }
 
-  grep -Eq "[[:space:]]hdr10plus([[:space:]]|$)" <<<"$filters" || { echo "HDR10+ producer filter is missing" >&2; exit 1; }
-  help="$($ffmpeg -hide_banner -h filter=hdr10plus 2>&1)"
-  grep -q 'peak' <<<"$help" || { echo "HDR10+ producer filter options are missing" >&2; exit 1; }
-  "$ffmpeg" -hide_banner -loglevel error -f lavfi -i 'color=c=gray:s=64x64:r=1,format=yuv420p10le,setparams=colorspace=bt2020nc:color_primaries=bt2020:color_trc=smpte2084' -vf hdr10plus -frames:v 1 -f null - || { echo "HDR10+ producer filter smoke test failed" >&2; exit 1; }
   for codec in avs cavs; do
     grep -Eq "[[:space:]]$codec([[:space:]]|$)" <<<"$decoders" || { echo "Native AVS1 decoder is missing: $codec" >&2; exit 1; }
   done
@@ -4007,19 +3265,6 @@ verify_dolby_vision_support() {
     done
   fi
   echo "Dolby Vision Profile 8/10 capability surfaces passed"
-}
-
-verify_aac_at() {
-  local ffmpeg="$1" encoders
-  [[ -f "$(dirname "$ffmpeg")/CoreAudioToolbox.dll" ]] || {
-    echo "CoreAudioToolbox.dll is missing beside ffmpeg.exe" >&2
-    exit 1
-  }
-  encoders="$("$ffmpeg" -hide_banner -encoders 2>/dev/null)"
-  grep -q 'aac_at' <<<"$encoders" || { echo "aac_at encoder is missing" >&2; exit 1; }
-  "$ffmpeg" -hide_banner -h encoder=aac_at >/dev/null
-  "$ffmpeg" -hide_banner -loglevel error -f lavfi -i 'sine=frequency=1000:sample_rate=48000' \
-    -t 0.25 -c:a aac_at -b:a 128k -f null - >/dev/null
 }
 
 verify_vmaf() {
@@ -4388,10 +3633,6 @@ Version: 0.1.3
 Libs: -L\${libdir} -lsoxr
 Cflags: -I\${includedir}
 EOF
-      ;;
-
-    fdk-aac)
-      build_autotools fdk-aac
       ;;
 
     libaom)
@@ -5407,19 +4648,6 @@ EOF
       echo "AviSynth Headers successfully copied to $PREFIX/include/avisynth/"
       ;;
 
-    AudioToolboxWrapper)
-      prepare_apple_audio_runtime
-      build_cmake AudioToolboxWrapper
-      [[ -f "$PREFIX/lib/libAudioToolboxWrapper.a" ]] || {
-        echo "缺少 AudioToolboxWrapper 静态库" >&2
-        exit 1
-      }
-      [[ -x "$PREFIX/bin/atw_ldwrapper" ]] || {
-        echo "缺少 atw_ldwrapper" >&2
-        exit 1
-      }
-      ;;
-
     ffmpeg)
       # 自动修复 srt.pc 和 haisrt.pc 中可能存在的 mbedtls 绝对路径导致 static 链接失败的 Bug
       if [[ -f "$PREFIX/lib/pkgconfig/srt.pc" ]]; then
@@ -5492,13 +4720,8 @@ EOF
       patch_ffmpeg_jxr "$ff_stage"
       patch_ffmpeg_libplacebo_vulkan_import "$ff_stage"
       patch_ffmpeg_cxx_runtime "$ff_stage"
-      patch_ffmpeg_nvenc_hdr10plus "$ff_stage"
       patch_ffmpeg_nvenc_dovi_p8_p10 "$ff_stage"
-      patch_ffmpeg_libx265_hdr10plus "$ff_stage"
-      patch_ffmpeg_svtav1_hdr10plus "$ff_stage"
       patch_ffmpeg_libaom_hdr_static "$ff_stage"
-      patch_ffmpeg_nvenc_hdr_static "$ff_stage"
-      patch_ffmpeg_qsv_hdr10plus "$ff_stage"
       patch_ffmpeg_qsv_dovi_p8 "$ff_stage"
       patch_ffmpeg_encoder_params "$ff_stage"
       pushd "$ff_stage" >/dev/null
@@ -5543,10 +4766,6 @@ EOF
       }
       PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" "$PKG_CONFIG" --exists soxr || {
         echo "缺少 soxr，请先编译 libsoxr 阶段"
-        exit 1
-      }
-      PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" "$PKG_CONFIG" --exists fdk-aac || {
-        echo "缺少 fdk-aac，请先编译 fdk-aac 阶段"
         exit 1
       }
       PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" "$PKG_CONFIG" --exists aom || {
@@ -5747,7 +4966,6 @@ EOF
         --enable-libmp3lame \
         --enable-libvorbis \
         --enable-libsoxr \
-        --enable-libfdk-aac \
         --enable-libaom \
         --enable-libvpx \
         --enable-libopenjpeg \
@@ -5775,7 +4993,6 @@ EOF
         --enable-libopencore-amrwb \
         --enable-libvo-amrwbenc \
         --enable-iconv \
-        --enable-audiotoolbox \
         "${lto_flags[@]}" \
         "${cuda_flags[@]}" \
         "${vs_flags[@]}" \
@@ -5791,11 +5008,9 @@ EOF
         --enable-encoder=libvvenc \
         --enable-encoder=libmp3lame \
         --enable-encoder=libvorbis \
-        --enable-encoder=libfdk_aac \
         --enable-encoder=libvpx_vp8 \
         --enable-encoder=libvpx_vp9 \
-        --enable-encoder=aac \
-        --enable-encoder=aac_at
+        --enable-encoder=aac
 
       verify_full_ffmpeg_config ffbuild/config.mak "$ff_stage"
       make -j"$FFMPEG_JOBS"
@@ -5827,14 +5042,12 @@ EOF
       cp -f "$PREFIX/bin/ffplay.exe" "$ROOT/full/ffplay.exe" 2>/dev/null || true
       find "$PREFIX/bin" -maxdepth 1 -type f -iname "*.dll" -exec cp -f {} "$ROOT/full/" \;
 
-      seed_apple_audio_runtime
       copy_runtime_dll_closure
       verify_encoder_params "$ROOT/full/ffmpeg.exe"
       verify_encoder_bitdepths "$ROOT/full/ffmpeg.exe"
       verify_dolby_vision_support "$ROOT/full/ffmpeg.exe"
       verify_vmaf "$ROOT/full/ffmpeg.exe"
       popd >/dev/null
-      verify_aac_at "$ROOT/full/ffmpeg.exe"
       verify_jxr_binary "$ROOT/full/ffmpeg.exe" "$BUILDROOT/jxr-validation"
       ;;
 
@@ -5868,6 +5081,7 @@ write_full_manifest() {
   done
 
   manifest_args+=(--validate "Requested Full build scope completed: ${BUILT_STAGES[*]}")
+  manifest_args+=(--skip "Power-bundle HDR10+ filter, NVENC, libx265, SVT-AV1, and QSV passthrough patches were removed; those paths were not built or validated")
   manifest_args+=(--validate "Native AVS1 decoders included; external AVS2/3 codecs and AVS encoders remain disabled; Audio Vivid/AV3A is unavailable")
   manifest_args+=(--validate "FFmpeg mainline HEVC decoding includes ITU-T T.35 HDR Vivid frame metadata parsing; HDR Vivid generation/encoding is unavailable")
   if [[ "$ffmpeg_built" == "1" ]]; then
@@ -5888,10 +5102,7 @@ write_full_manifest() {
     --validate "QSV HEVC Profile 8 per-frame Dolby Vision RPU injection patch is present in the compiled source; hardware round-trip remains unverified"
     --skip "QSV AV1 Profile 10 Dolby Vision RPU injection is not implemented: oneVPL has no AV1 payload channel, and a packet-PTS OBU path still needs Intel hardware round-trip validation"
     --skip "MPEG-TS Dolby Vision metadata descriptor output is not implemented; demux and decode input support remains enabled"
-    --skip "No changing-scene HDR10+ HEVC/AV1 bitstream round-trip was run; compile-time path presence does not prove per-frame metadata survived encoding"
     --skip "P7 FEL reconstruction is not integrated or validated against a trusted reference; no FEL sample/reference or reconstructor is available"
-    --validate "HDR10+ producer filter is compiled, exposes options, and passed a synthetic PQ-frame smoke test"
-    --skip "HDR10+ producer measures each frame as a one-frame scene; no scene-level real-content validation was run"
     --skip "Audio Vivid/AV3A integration is unavailable; external AVS2/3 decoders and AVS encoders remain excluded"
     --skip "Audio Vivid decoder-only integration is unavailable: UWA AV3A source, FFmpeg demux/decode patch, model.bin, and usage/distribution authorization are absent; AV3A encoding is out of scope"
     --skip "av1_qsv HDR10+ metadata injection is not implemented; QSV dynamic-metadata paths are not runtime-verified"
