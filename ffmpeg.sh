@@ -131,6 +131,7 @@ declare -A URLS=(
   [libplacebo]="https://github.com/haasn/libplacebo.git"
   [vulkan-headers]="https://github.com/KhronosGroup/Vulkan-Headers.git"
   [mbedtls]="https://github.com/Mbed-TLS/mbedtls.git"
+  [AudioToolboxWrapper]="https://github.com/dantmnf/AudioToolboxWrapper.git"
   [avisynth]="https://github.com/AviSynth/AviSynthPlus.git"
   [libssh]="https://git.libssh.org/projects/libssh.git"
   [opencl-headers]="https://github.com/KhronosGroup/OpenCL-Headers.git"
@@ -223,6 +224,7 @@ declare -A TAG_REGEX=(
   [libgsm]='master'
   [opencore-amr]='^v?[0-9]+(\.[0-9]+)+$'
   [vo-amrwbenc]='^v?[0-9]+(\.[0-9]+)+$'
+  [AudioToolboxWrapper]='master'
 )
 
 # 编译依赖阶段列表
@@ -291,6 +293,7 @@ STAGES=(
   "vmaf"
   "vvenc"
   "vvdec"
+  "AudioToolboxWrapper"
   "sdl2"
   "amf"
   "avisynth"
@@ -1431,6 +1434,7 @@ normalize_stage() {
     vmaf) echo "vmaf" ;;
     vvenc) echo "vvenc" ;;
     vvdec) echo "vvdec" ;;
+    audiotoolboxwrapper|atw) echo "AudioToolboxWrapper" ;;
     sdl2) echo "sdl2" ;;
     amf) echo "amf" ;;
     avisynth) echo "avisynth" ;;
@@ -4585,6 +4589,14 @@ EOF
         -DCMAKE_POLICY_VERSION_MINIMUM=3.5
       cmake --build "$bld" --parallel "$JOBS"
       cmake --install "$bld"
+      ;;
+
+    AudioToolboxWrapper)
+      build_cmake AudioToolboxWrapper
+      [[ -f "$PREFIX/lib/libAudioToolboxWrapper.a" && -x "$PREFIX/bin/atw_ldwrapper" ]] || {
+        echo "AudioToolboxWrapper linker support was not installed" >&2
+        exit 1
+      }
       ;;
 
     sdl2)
