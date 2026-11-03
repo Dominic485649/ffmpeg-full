@@ -1,0 +1,92 @@
+# Full CPU HDR metadata bridge for the upstream VmafPicture.color API.
+diff --git a/libavfilter/vf_libvmaf.c b/libavfilter/vf_libvmaf.c
+--- a/libavfilter/vf_libvmaf.c
++++ b/libavfilter/vf_libvmaf.c
+@@ -104,8 +104,61 @@
+     default:
+         return VMAF_PIX_FMT_UNKNOWN;
+     }
+ }
+
++/* FFmpeg and libvmaf color enums differ; leave unsupported values unknown. */
++static enum VmafColorRange color_range_map(enum AVColorRange range)
++{
++    switch (range) {
++    case AVCOL_RANGE_MPEG:
++        return VMAF_COLOR_RANGE_LIMITED;
++    case AVCOL_RANGE_JPEG:
++        return VMAF_COLOR_RANGE_FULL;
++    default:
++        return VMAF_COLOR_RANGE_UNKNOWN;
++    }
++}
++
++static enum VmafColorPrimaries color_primaries_map(enum AVColorPrimaries primaries)
++{
++    switch (primaries) {
++    case AVCOL_PRI_BT709:
++        return VMAF_COLOR_PRIMARIES_BT709;
++    case AVCOL_PRI_BT2020:
++        return VMAF_COLOR_PRIMARIES_BT2020;
++    case AVCOL_PRI_SMPTE432:
++        return VMAF_COLOR_PRIMARIES_SMPTE432;
++    default:
++        return VMAF_COLOR_PRIMARIES_UNKNOWN;
++    }
++}
++
++static enum VmafColorTransferCharacteristic color_trc_map(enum AVColorTransferCharacteristic trc)
++{
++    switch (trc) {
++    case AVCOL_TRC_BT709:
++        return VMAF_COLOR_TRC_BT709;
++    case AVCOL_TRC_SMPTE2084:
++        return VMAF_COLOR_TRC_SMPTE2084;
++    default:
++        return VMAF_COLOR_TRC_UNKNOWN;
++    }
++}
++
++static enum VmafColorMatrixCoefficients color_matrix_map(enum AVColorSpace matrix)
++{
++    switch (matrix) {
++    case AVCOL_SPC_BT709:
++        return VMAF_COLOR_MATRIX_BT709;
++    case AVCOL_SPC_BT2020_NCL:
++        return VMAF_COLOR_MATRIX_BT2020_NCL;
++    case AVCOL_SPC_ICTCP:
++        return VMAF_COLOR_MATRIX_ICTCP;
++    default:
++        return VMAF_COLOR_MATRIX_UNKNOWN;
++    }
++}
++
+ #if HAVE_LIBVMAF_PICTURE_WRAP
+ static int release_frame(VmafPicture *pic, void *cookie)
+ {
+@@ -163,11 +216,23 @@
+
+ static int get_picture(AVFrame *src, VmafPicture *dst, unsigned bpc)
+ {
++    int err;
+ #if HAVE_LIBVMAF_PICTURE_WRAP
+-    return wrap_picture_data(src, dst, bpc);
++    err = wrap_picture_data(src, dst, bpc);
+ #else
+-    return copy_picture_data(src, dst, bpc);
++    err = copy_picture_data(src, dst, bpc);
+ #endif
++    if (err)
++        return err;
++
++    /* Allocation clears the picture, so attach each frame's tags afterward. */
++    dst->color = (VmafColor) {
++        .range = color_range_map(src->color_range),
++        .primaries = color_primaries_map(src->color_primaries),
++        .trc = color_trc_map(src->color_trc),
++        .matrix = color_matrix_map(src->colorspace),
++    };
++    return 0;
+ }
+
+ static int do_vmaf(FFFrameSync *fs)

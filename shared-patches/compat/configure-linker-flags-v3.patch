@@ -1,0 +1,54 @@
+diff --git a/configure b/configure
+index f542d4e0d6..9153807340 100755
+--- a/configure
++++ b/configure
+@@ -6175,20 +6175,38 @@ case $target_os in
+         dlltool="${cross_prefix}dlltool"
+         ranlib=:
+         enable dos_paths
+-        check_ldflags -Wl,--nxcompat,--dynamicbase
+-        # Lets work around some stupidity in binutils.
+-        # ld will strip relocations from executables even though we need them
+-        # for dynamicbase (ASLR).  Using -pie does retain the reloc section
+-        # however ld then forgets what the entry point should be (oops) so we
+-        # have to manually (re)set it.
++        # Probe protections separately: one unsupported flag must not suppress the others.
++        check_ldflags -Wl,--nxcompat
++        check_ldflags -Wl,--dynamicbase
++        # Keep the CRT entry point; use the BFD PIC workaround only when accepted by this linker.
+         if enabled x86_32; then
+-            disabled debug && add_ldexeflags -Wl,--pic-executable,-e,_mainCRTStartup
++            if disabled debug; then
++                if test_ldflags -Wl,-e,_mainCRTStartup; then
++                    if test_ldflags -Wl,--pic-executable; then
++                        add_ldexeflags -Wl,--pic-executable,-e,_mainCRTStartup
++                    else
++                        add_ldexeflags -Wl,-e,_mainCRTStartup
++                    fi
++                fi
++            fi
+         elif enabled x86_64; then
+-            disabled debug && add_ldexeflags -Wl,--pic-executable,-e,mainCRTStartup
++            if disabled debug; then
++                if test_ldflags -Wl,-e,mainCRTStartup; then
++                    if test_ldflags -Wl,--pic-executable; then
++                        add_ldexeflags -Wl,--pic-executable,-e,mainCRTStartup
++                    else
++                        add_ldexeflags -Wl,-e,mainCRTStartup
++                    fi
++                fi
++            fi
+             check_ldflags -Wl,--high-entropy-va # binutils 2.25
+-            # Set image base >4GB for extra entropy with HEASLR
+-            add_ldexeflags -Wl,--image-base,0x140000000
+-            append SHFLAGS -Wl,--image-base,0x180000000
++            # Set image base >4GB for extra entropy with HEASLR when supported.
++            if test_ldflags -Wl,--image-base,0x140000000; then
++                add_ldexeflags -Wl,--image-base,0x140000000
++            fi
++            if test_ldflags -Wl,--image-base,0x180000000; then
++                append SHFLAGS -Wl,--image-base,0x180000000
++            fi
+         fi
+         ;;
+     win32|win64)
