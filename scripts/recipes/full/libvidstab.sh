@@ -13,6 +13,7 @@
         -DCMAKE_BUILD_TYPE=Release
         -DCMAKE_INSTALL_PREFIX="$PREFIX"
         -DBUILD_SHARED_LIBS=OFF
+        -DUSE_OMP=OFF
         -DCMAKE_POLICY_VERSION_MINIMUM=3.5
       )
       local bld

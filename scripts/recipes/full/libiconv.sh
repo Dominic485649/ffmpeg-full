@@ -294,5 +294,10 @@ PYICONVSOURCE
         printf '%s\n' "$iconv_config_key" > "$iconv_config_tmp"
         mv -f -- "$iconv_config_tmp" "$iconv_config_stamp"
       fi
-      make -C "$iconv_bld" -j"$JOBS"
-      make -C "$iconv_bld" install
+      # The top-level all/install targets also build the iconv command and tests.
+      make -C "$iconv_bld" -j"$JOBS" lib/localcharset.h
+      make -C "$iconv_bld/lib" -j"$JOBS"
+      make -C "$iconv_bld/lib" install-lib libdir="$PREFIX/lib" includedir="$PREFIX/include"
+      make -C "$iconv_bld/libcharset" install-lib libdir="$PREFIX/lib" includedir="$PREFIX/include"
+      mkdir -p "$PREFIX/include"
+      install -m644 "$iconv_bld/include/iconv.h.inst" "$PREFIX/include/iconv.h"

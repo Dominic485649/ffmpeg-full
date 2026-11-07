@@ -25,9 +25,19 @@ REMOVED_LIBRARIES = (
     'LIBARIBCAPTION', 'LIBOPENMPT', 'LIBSPEEX', 'LIBTWOLAME', 'LIBZVBI',
     'LIBGSM', 'LIBOPENCORE_AMRNB', 'LIBOPENCORE_AMRWB', 'LIBVO_AMRWBENC',
     'VAPOURSYNTH', 'OPENCL', 'DXVA2', 'SWSCALE_VULKAN',
+    'LIBVORBIS', 'LIBTHEORA', 'LIBVVENC',
 )
-REMOVED_ENCODERS = ('mp2', 'mp2fixed')
-REMOVED_DECODERS = ('mp2', 'mp2float', 'speex', 'gsm', 'gsm_ms', 'amrnb', 'amrwb')
+REMOVED_ENCODERS = (
+    'mp2', 'mp2fixed', 'h264_amf', 'libvpx_vp8', 'libvpx_vp9', 'vp9_qsv',
+    'libvvenc', 'vorbis', 'libvorbis', 'libtheora', 'libjxl', 'libjxl_anim',
+)
+REMOVED_DECODERS = (
+    'mp2', 'mp2float', 'speex', 'gsm', 'gsm_ms', 'amrnb', 'amrwb',
+    'vorbis', 'libvorbis', 'theora', 'libaom_av1',
+)
+REMOVED_FILTERS = (
+    'bm3d', 'libvmaf_cuda', 'vpp_amf', 'sr_amf', 'frc_amf', 'vqe_amf', 'amf_capture',
+)
 
 
 def regular(path):
@@ -55,7 +65,7 @@ def replace_file(path, text):
 def configure_flags(source):
     configure = regular(Path(source) / 'configure')
     flags = ['--disable-' + name.lower().replace('_', '-') for name in REMOVED_LIBRARIES]
-    flags += ['--disable-filter=bm3d', '--disable-filter=libvmaf_cuda']
+    flags += [f'--disable-filter={name}' for name in REMOVED_FILTERS]
     flags += [f'--disable-encoder={name}' for name in REMOVED_ENCODERS]
     flags += [f'--disable-decoder={name}' for name in REMOVED_DECODERS]
     for category, option in (('encoders', 'encoder'), ('hwaccels', 'hwaccel'), ('filters', 'filter')):
@@ -63,7 +73,10 @@ def configure_flags(source):
                                 capture_output=True, text=True)
         for name in result.stdout.split():
             if (name.endswith('_vulkan') or 'bm3d' in name.lower() or
-                    (category == 'filters' and name.endswith(('_d3d11', '_d3d12')))):
+                    (category == 'filters' and
+                     (name.endswith(('_d3d11', '_d3d12', '_amf')) or name.startswith('amf_'))) or
+                    (category == 'encoders' and
+                     re.search(r'(?:^|_)(?:vp[3-9]|vvc|h266)(?:_|$)', name))):
                 flags.append(f'--disable-{option}={name}')
     print('\n'.join(dict.fromkeys(flags)))
 
@@ -79,9 +92,13 @@ def check_config(path):
                   'CONFIG_LIBOPENMPT_DEMUXER', 'CONFIG_VAPOURSYNTH_DEMUXER'}
     forbidden |= {f'CONFIG_{name.upper()}_ENCODER' for name in REMOVED_ENCODERS}
     forbidden |= {f'CONFIG_{name.upper()}_DECODER' for name in REMOVED_DECODERS}
+    forbidden |= {f'CONFIG_{name.upper()}_FILTER' for name in REMOVED_FILTERS}
     forbidden |= {name for name in enabled if 'BM3D' in name or name.endswith('_OPENCL_FILTER') or
                   re.fullmatch(r'CONFIG_.+_VULKAN_(?:ENCODER|DECODER|HWACCEL|FILTER)', name) or
-                  name.endswith(('_DXVA2_HWACCEL', '_D3D11_FILTER', '_D3D12_FILTER'))}
+                  name.endswith(('_DXVA2_HWACCEL', '_D3D11_FILTER', '_D3D12_FILTER', '_AMF_FILTER')) or
+                  (name.startswith('CONFIG_AMF_') and name.endswith('_FILTER')) or
+                  (name.endswith('_ENCODER') and
+                   re.search(r'(?:^|_)(?:VP[3-9]|VVC|H266)(?:_|$)', name))}
     active = sorted(enabled & forbidden)
     if active:
         raise ValueError('pruned FFmpeg features unexpectedly enabled: ' + ', '.join(active))
@@ -134,6 +151,27 @@ def patch_x264_formats(source):
         body = body.replace('    AV_PIX_FMT_' + name + ',\n', '')
     replace_file(path, text[:block.start(1)] + body + text[block.end(1):])
     print('Verified x264 8-bit-only capability table, including gray/NV21 formats')
+
+
+def patch_x265_formats(source):
+    path = regular(Path(source) / 'libavcodec/libx265.c')
+    text = path.read_text()
+    blocks = list(re.finditer(r'static const enum AVPixelFormat x265_csp_ten\[\] = \{\n(.*?)\n\};', text, re.S))
+    if len(blocks) != 1:
+        raise ValueError('unknown FFmpeg x265 pixel-format declaration; source left unchanged')
+    block = blocks[0]
+    body = block[1]
+    formats = re.findall(r'AV_PIX_FMT_([A-Z0-9_]+)', body)
+    retained = {'YUV420P10', 'YUV422P10', 'YUV444P10', 'GBRP10', 'GRAY10', 'YUVA420P10', 'NONE'}
+    removed = {'YUV420P', 'YUVJ420P', 'YUV422P', 'YUVJ422P', 'YUV444P', 'YUVJ444P',
+               'GBRP', 'GRAY8', 'YUVA420P'}
+    if len(formats) != len(set(formats)) or set(formats) not in (retained, retained | removed):
+        raise ValueError('changed FFmpeg x265 formats require review; source left unchanged')
+    # This profile uses only the Main10 implementation; FFmpeg converts input as needed.
+    for name in removed:
+        body = body.replace('    AV_PIX_FMT_' + name + ',\n', '')
+    replace_file(path, text[:block.start(1)] + body + text[block.end(1):])
+    print('Verified x265 10-bit-only capability table, including gray/GBR/alpha formats')
 
 
 def patch_amf(source):
@@ -210,12 +248,107 @@ def prune_vmaf(source):
     print(f'VMAF model policy: default v0 + 16 v1 models; removed {len(removed)} staged legacy files')
 
 
+def patch_source_files(source, label, changes, required, forbidden):
+    """Validate every hunk before changing any staged build definition."""
+    source = Path(source)
+    marker = '# ffbuild: ' + label
+    prepared = []
+    for relative, edits in changes.items():
+        path = regular(source / relative)
+        text = path.read_text()
+        patched = marker in text
+        if patched and text.count(marker) != 1:
+            raise ValueError(f'{label}: duplicate policy marker in {relative}')
+        for old, new, count in edits:
+            if patched:
+                if old in text or (new and text.count(new) < count):
+                    raise ValueError(f'{label}: partial or changed patch in {relative}')
+            else:
+                if text.count(old) != count:
+                    raise ValueError(f'{label}: unknown upstream layout in {relative}')
+                text = text.replace(old, new)
+        if not patched:
+            text = marker + '\n' + text
+        if any(token not in text for token in required.get(relative, ())):
+            raise ValueError(f'{label}: required decoder support missing in {relative}')
+        if any(token in text for token in forbidden.get(relative, ())):
+            raise ValueError(f'{label}: encoder dependency remains in {relative}')
+        prepared.append((path, text))
+    for path, text in prepared:
+        replace_file(path, text)
+    print('Verified staged ' + label)
+
+
+def patch_brotli(source):
+    path = 'CMakeLists.txt'
+    changes = {path: (
+        ('brotlienc brotlidec brotlicommon', 'brotlidec brotlicommon', 3),
+        ('brotlienc-static brotlidec-static brotlicommon-static',
+         'brotlidec-static brotlicommon-static', 1),
+        ('file(GLOB_RECURSE BROTLI_ENC_SOURCES RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} c/enc/*.c)\n', '', 1),
+        ('add_library(brotlienc ${BROTLI_ENC_SOURCES})\n', '', 1),
+        ('  add_library(brotlienc-static STATIC ${BROTLI_ENC_SOURCES})\n', '', 1),
+        ('target_link_libraries(brotlienc brotlicommon)\n', '', 1),
+        ('transform_pc_file("scripts/libbrotlienc.pc.in" "${CMAKE_CURRENT_BINARY_DIR}/libbrotlienc.pc" "${BROTLI_VERSION}")\n', '', 1),
+        ('  install(FILES "${CMAKE_CURRENT_BINARY_DIR}/libbrotlienc.pc"\n'
+         '    DESTINATION "${CMAKE_INSTALL_LIBDIR}/pkgconfig")\n', '', 1),
+    )}
+    patch_source_files(source, 'Brotli decoder/common only', changes,
+                       {path: ('add_library(brotlidec ', 'add_library(brotlicommon ')},
+                       {path: ('brotlienc', 'BROTLI_ENC_SOURCES')})
+
+
+def patch_jxl(source):
+    library = 'lib/jxl.cmake'
+    finder = 'cmake/FindBrotli.cmake'
+    changes = {
+        library: (
+            ('  brotlienc\n', '', 1),
+            ('# Object library. This is used to hold the set of objects and properties.\n'
+             'add_library(jxl_enc-obj OBJECT ${JPEGXL_INTERNAL_ENC_SOURCES})\n'
+             'target_compile_options(jxl_enc-obj PRIVATE ${JPEGXL_INTERNAL_FLAGS})\n'
+             'target_compile_options(jxl_enc-obj PUBLIC ${JPEGXL_COVERAGE_FLAGS})\n'
+             'set_property(TARGET jxl_enc-obj PROPERTY POSITION_INDEPENDENT_CODE ON)\n'
+             'target_include_directories(jxl_enc-obj BEFORE PUBLIC\n'
+             '  ${PROJECT_SOURCE_DIR}\n'
+             '  ${JXL_HWY_INCLUDE_DIRS}\n'
+             '  $<TARGET_PROPERTY:brotlicommon,INTERFACE_INCLUDE_DIRECTORIES>\n'
+             ')\n'
+             'target_compile_definitions(jxl_enc-obj PUBLIC\n'
+             '  ${OBJ_COMPILE_DEFINITIONS}\n'
+             ')\n'
+             'target_link_libraries(jxl_enc-obj PUBLIC jxl_base)\n', '', 1),
+            ('set_target_properties(jxl_enc-obj PROPERTIES\n'
+             '  CXX_VISIBILITY_PRESET hidden\n'
+             '  VISIBILITY_INLINES_HIDDEN 1\n'
+             '  DEFINE_SYMBOL JXL_INTERNAL_LIBRARY_BUILD\n'
+             ')\n', '', 1),
+            ('  $<TARGET_OBJECTS:jxl_enc-obj>\n', '', 1),
+            ('"libhwy libbrotlienc libbrotlidec libjxl_cms"',
+             '"libhwy libbrotlidec libjxl_cms"', 1),
+        ),
+        finder: (
+            ('set(brlibs brotlicommon brotlienc brotlidec)',
+             'set(brlibs brotlicommon brotlidec)', 1),
+            ('if (BROTLICOMMON_FOUND AND BROTLIENC_FOUND AND BROTLIDEC_FOUND)',
+             'if (BROTLICOMMON_FOUND AND BROTLIDEC_FOUND)', 1),
+            ('    BROTLIENC_LIBRARY\n', '', 1),
+            ('  BROTLIENC_LIBRARY\n', '', 1),
+            ('${BROTLICOMMON_LIBRARY} ${BROTLIENC_LIBRARY} ${BROTLIDEC_LIBRARY}',
+             '${BROTLICOMMON_LIBRARY} ${BROTLIDEC_LIBRARY}', 1),
+        ),
+    }
+    patch_source_files(source, 'JPEG XL decoder only', changes,
+                       {library: ('add_library(jxl_dec-obj ', 'target_link_libraries(jxl PUBLIC jxl_cms)')},
+                       {library: ('jxl_enc-obj', 'brotlienc'), finder: ('BROTLIENC', 'brotlienc')})
+
+
 def main():
     if sys.argv[1:] == ['models']:
         print(json.dumps(MODELS))
         return
     if len(sys.argv) != 3:
-        raise ValueError('usage: feature_policy.py {ffmpeg-flags|ffmpeg-source|check-config|x264|amf|vmaf} PATH; or models')
+        raise ValueError('usage: feature_policy.py {ffmpeg-flags|ffmpeg-source|check-config|x264|x265|amf|vmaf|brotli|jxl} PATH; or models')
     mode, path = sys.argv[1:]
     if mode == 'ffmpeg-flags':
         configure_flags(path)
@@ -225,10 +358,16 @@ def main():
         prune_ffmpeg_source(path)
     elif mode == 'x264':
         patch_x264_formats(path)
+    elif mode == 'x265':
+        patch_x265_formats(path)
     elif mode == 'amf':
         patch_amf(path)
     elif mode == 'vmaf':
         prune_vmaf(path)
+    elif mode == 'brotli':
+        patch_brotli(path)
+    elif mode == 'jxl':
+        patch_jxl(path)
     else:
         raise ValueError('unknown feature policy command: ' + mode)
 

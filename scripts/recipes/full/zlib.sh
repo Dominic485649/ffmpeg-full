@@ -25,6 +25,7 @@
         -DBUILD_SHARED_LIBS=OFF
         -DZLIB_BUILD_SHARED=OFF
         -DZLIB_BUILD_STATIC=ON
+        -DZLIB_BUILD_TESTING=OFF
         -DCMAKE_POLICY_VERSION_MINIMUM=3.5
       )
       local bld

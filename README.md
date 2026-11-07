@@ -18,15 +18,15 @@
 
 | 类别 | 提供的能力 |
 |---|---|
-| 软件视频编码 | x264 **8-bit**、x265 **8/10-bit**、libaom、SVT-AV1、libvpx、VVenC 等 |
-| 视频解码 | FFmpeg 原生常用解码器，包含原生 VVC、`avs` / `cavs`（AVS1） |
-| NVIDIA | NVENC/NVDEC、CUDA；`scale_cuda`、`yadif_cuda`、`bwdif_cuda`、`overlay_cuda` 等滤镜 |
-| Intel | oneVPL/QSV；`vpp_qsv`、`scale_qsv`、去隔行、叠加与拼接滤镜 |
-| AMD / Windows 图形接口 | AMF 编码与滤镜；现代 D3D11/D3D12 设备和硬解路径 |
-| 图像与色彩 | PNG/APNG、WebP、JPEG XL、JPEG 2000；libplacebo、Vulkan、zimg、LCMS/ICC |
+| 软件视频编码 | x264 **8-bit**、x265 **10-bit**、libaom AV1 **8/10/12-bit**、SVT-AV1 **8/10-bit** |
+| 视频解码 | FFmpeg 原生常用解码器，包含原生 VVC、VP3/VP4、VP8/VP9、`avs` / `cavs`（AVS1）；libvpx 支持透明 WebM 与高位深 VP9 解码 |
+| NVIDIA | H.264/HEVC/AV1 NVENC、NVDEC、CUDA；`scale_cuda`、`yadif_cuda`、`bwdif_cuda`、`overlay_cuda` 等滤镜 |
+| Intel | oneVPL/QSV 编解码；`vpp_qsv`、`scale_qsv`、去隔行、叠加与拼接滤镜 |
+| AMD / Windows 图形接口 | HEVC/AV1 AMF 编码、AMF 解码；现代 D3D11/D3D12 设备和硬解路径 |
+| 图像与色彩 | PNG/APNG、有损/无损/透明/动画 WebP、AVIF、JPEG XL 静态/动画解码、JPEG 2000；libplacebo、Vulkan、zimg、LCMS/ICC |
 | 字体与字幕 | libass、FreeType、HarfBuzz、FriBidi、Fontconfig；`subtitles`、`drawtext` |
 | 画质评估 | CPU `libvmaf`，内置 **17 个官方模型**；PSNR、SSIM、XPSNR 等 |
-| 音频 | 原生 AAC（含 NMR 参数）、libopus、MP3、Vorbis、FLAC；SoXR 重采样、Rubber Band 变速变调 |
+| 音频 | 原生 AAC（含 NMR 参数）、libopus、MP3、FLAC、Ogg/Opus；SoXR 重采样、Rubber Band 变速变调 |
 | 空间音频处理 | libmysofa / `sofalizer`，读取 SOFA HRTF 并用于双耳渲染 |
 | 输入与网络 | AviSynth、常用封装；HTTP(S)、RTMP(S)、SRT、RIST、SFTP、ZMQ 等协议 |
 | 元数据与比特流处理 | HEVC HDR Vivid T.35 元数据解析、上游 Dolby Vision 相关解析、`dovi_rpu` / `dovi_split` |
@@ -41,7 +41,7 @@
 4. Full 使用动态链接，运行与升级时请保持整套 EXE/DLL 的版本一致；建议使用独立目录存放每个版本。
 5. PATH 设置完成后，重新打开终端。
 
-运行环境为 **64 位 Windows**，CPU 须满足 **x86-64-v3（含 AVX2 等指令）**。硬件加速需要相应 GPU 与驱动，libplacebo 需要可用的 Vulkan 驱动。
+运行环境为 **64 位 Windows**，CPU 须满足 **x86-64-v3（含 AVX2 等指令）**。硬件加速需要相应 GPU 与驱动，libplacebo 需要可用的 Vulkan 驱动；Vulkan loader 使用系统/显卡驱动提供的 `vulkan-1.dll`。
 
 以下示例假定 `ffmpeg.exe` 已加入 PATH，也可使用完整路径。
 
@@ -152,8 +152,10 @@ ffmpeg.exe -i distorted-hdr10.mkv -i reference-hdr10.mkv -filter_complex "[0:v]f
 使用现有源码构建：
 
 ```bash
-./ffmpeg.sh build
+JOBS=2 FFMPEG_JOBS=2 NVCC_THREADS=1 ./ffmpeg.sh build
 ```
+
+目标 C/C++ 组件与 FFmpeg 默认采用 **ThinLTO**。可通过 `JOBS`、`FFMPEG_JOBS` 与 `NVCC_THREADS` 调整构建并发；上例使用两个编译作业。
 
 工具链已就绪时，`TOOLCHAIN_REFRESH=0` 可用于在 `tool` 阶段复用现有工具。不带参数或使用 `all` 的完整流程为 `tool → update → build`。
 
@@ -178,14 +180,18 @@ ffmpeg.exe -i distorted-hdr10.mkv -i reference-hdr10.mkv -filter_complex "[0:v]f
 
 ## 实测与许可证
 
-2026-11-03 的本地产物已通过隔离运行和 DLL 依赖检查，并完成以下实测：
+2026-11-07 的本地产物已通过隔离运行、DLL 依赖、PE64/CFG、实际 ThinLTO 产物核验与完整离线回归，并完成以下实测：
 
 - RTX 4060 Laptop：CUDA 缩放、HEVC/AV1 NVENC 编码。
-- Intel Arc：QSV VPP、HEVC/AV1 编码。
-- 现代 D3D11/D3D12 HEVC 硬解、硬件帧下载和 libplacebo/Vulkan 处理。
-- PNG/APNG、SOFA HRTF、VVenC 编码与原生 VVC 解码。
-- x264 8-bit、x265 8/10-bit、SoXR、Opus 与 AAC。
-- 全部 17 个 VMAF 模型；HDR-VMAF 与独立官方 CLI 交叉评分。
+- Intel Arc：HEVC/AV1 QSV 直接编码，以及显式重建固定帧率时间戳的 VPP 缩放；逐项核对实际输出帧数。使用条件见 [QSV Lite 说明](https://github.com/Dominic485649/ffmpeg-qsv-lite#qsv-vpp-缩放与-hevc-编码)。
+- 现代 D3D11/D3D12 HEVC 硬解、硬件帧下载和 libplacebo/Vulkan 实际处理。
+- JPEG XL 的 RGBA/动画/RGB16 解码、透明 WebM、高位深 VP9、8-bit HEVC 与原生 VVC 解码。
+- x264 8-bit；x265 4:2:0/4:2:2/4:4:4 10-bit；AOM 8/10/12-bit、SVT 8/10-bit 与 12-bit AVIF 编码。
+- PNG/APNG、有损/无损/透明/动画 WebP、8-bit HEVC 转 WebP、SOFA HRTF 与实际 ASS 字幕渲染。
+- SoXR、NMR AAC、Opus 编解码往返与原生 Ogg/Opus 解码。
+- 全部 17 个 CPU VMAF 模型实际评分，以及 22 项 HDR10/PQ 与色彩标签验收。
+
+AMF 已核验配置与组件注册；本机没有 AMD GPU，未进行 AMF 硬件实测。SVT-AV1 包含按运行 CPU 分派的 AVX-512 优化，未进行 AVX-512 真机性能测试。`ffplay.exe` 已核验启动及运行依赖。
 
 各版本的程序身份、文件体积与验证信息见对应 Release。
 

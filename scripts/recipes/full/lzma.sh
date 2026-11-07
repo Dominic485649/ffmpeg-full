@@ -14,6 +14,11 @@
         -DBUILD_SHARED_LIBS=OFF
         -DENABLE_NLS=OFF
         -DENABLE_THREADS=ON
+        -DXZ_TOOL_XZ=OFF
+        -DXZ_TOOL_XZDEC=OFF
+        -DXZ_TOOL_LZMADEC=OFF
+        -DXZ_TOOL_LZMAINFO=OFF
+        -DBUILD_TESTING=OFF
         -DCMAKE_POLICY_VERSION_MINIMUM=3.5
       )
       local bld

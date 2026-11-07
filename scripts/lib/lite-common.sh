@@ -888,6 +888,22 @@ verify_managed_toolchain() {
     echo "managed llvm-mingw missing; run $FFBUILD_CODE_ROOT/full/ffmpeg.sh tool" >&2
     return 1
   }
+  if [[ "${TOOLCHAIN_REFRESH:-1}" == 0 ]]; then
+    installed="$(<"$marker")" || return 1
+    [[ -n "$installed" ]] || { echo 'managed llvm-mingw asset identity is empty' >&2; return 1; }
+    local tool
+    for tool in "$TARGET-clang" "$TARGET-clang++" llvm-ar llvm-ranlib llvm-strip; do
+      [[ -x "$LLVM_MINGW_ROOT/bin/$tool" ]] || {
+        echo "managed llvm-mingw tool missing: $tool" >&2
+        return 1
+      }
+    done
+    [[ -x "$LLVM_MINGW_ROOT/bin/$TARGET-windres" || -x "$LLVM_MINGW_ROOT/bin/llvm-windres" ]] || return 1
+    [[ -x "$LLVM_MINGW_ROOT/bin/$TARGET-dlltool" || -x "$LLVM_MINGW_ROOT/bin/llvm-dlltool" ]] || return 1
+    lite_verify_managed_build_tool_markers || return 1
+    echo 'Reuse installed llvm-mingw by request (TOOLCHAIN_REFRESH=0); latest-release check skipped.'
+    return 0
+  fi
   expected="$(lite_latest_mingw_asset_url)" || {
     echo 'Unable to verify the latest llvm-mingw release; toolchain age is unknown, refusing to continue' >&2
     return 1
@@ -1114,8 +1130,8 @@ meson_quote_array() {
   printf ']'
 }
 write_meson_cross() {
-  local meson_lto=false cross="$BUILDROOT/mingw-cross.txt" pending
-  [[ "$LTO_ENABLE" == "1" ]] && meson_lto=true
+  local meson_lto=false meson_lto_mode=default cross="$BUILDROOT/mingw-cross.txt" pending
+  if [[ "$LTO_ENABLE" == "1" ]]; then meson_lto=true; meson_lto_mode=thin; fi
   lite_assert_generated_file "$cross" || return 1
   lite_assert_generated_directory "$(lite_cache_root)" || return 1
   mkdir -p "$(lite_cache_root)" || return 1
@@ -1136,6 +1152,7 @@ c_link_args = $(meson_quote_array "$LDFLAGS -L$PREFIX/lib")
 cpp_link_args = $(meson_quote_array "$LDFLAGS -L$PREFIX/lib")
 optimization = '3'
 b_lto = $meson_lto
+b_lto_mode = '$meson_lto_mode'
 
 [host_machine]
 system = 'windows'

@@ -63,6 +63,8 @@
         return 1
       fi
 
+      python3 -I "$SCRIPT_DIR/../lib/feature_policy.py" jxl "$jxl_stage" || return 1
+
       local cmake_args=(
         -G Ninja
         -DCMAKE_SYSTEM_NAME=Windows
@@ -99,7 +101,7 @@
       )
       bld="$(full_build_directory "$BUILDROOT/libjxl" "$jxl_stage" cmake "${cmake_args[@]}")" || return 1
       cmake -S "$jxl_stage" -B "$bld" "${cmake_args[@]}"
-      cmake --build "$bld" --parallel "$JOBS"
+      cmake --build "$bld" --target jxl jxl_threads --parallel "$JOBS"
       cmake --install "$bld"
       if [[ -f "$PREFIX/lib/pkgconfig/libjxl_threads.pc" ]] &&
          grep -q '^Libs.private: -lm$' "$PREFIX/lib/pkgconfig/libjxl_threads.pc"; then

@@ -9,6 +9,7 @@
       python3 -I "$SCRIPT_DIR/../lib/feature_policy.py" amf "$ff_stage" || return 1
       python3 -I "$SCRIPT_DIR/../lib/feature_policy.py" ffmpeg-source "$ff_stage" || return 1
       python3 -I "$SCRIPT_DIR/../lib/feature_policy.py" x264 "$ff_stage" || return 1
+      python3 -I "$SCRIPT_DIR/../lib/feature_policy.py" x265 "$ff_stage" || return 1
       # Keep the Full-only color opt-in independent of Lite cache identities.
       python3 -I - "$ff_stage/libavfilter/vf_libvmaf.c" <<'PYVMAFCOLORNEGOTIATION'
 import os
@@ -139,20 +140,12 @@ PYVMAFCOLORNEGOTIATION
           echo "Full HDR-VMAF requires rebuilding the vmaf stage with the upstream color API and zimg" >&2
           exit 1
         }
-      PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" "$PKG_CONFIG" --exists libvvenc || {
-        echo "缺少 vvenc，请先编译 vvenc 阶段"
-        exit 1
-      }
       PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" "$PKG_CONFIG" --exists sdl2 || {
         echo "缺少 sdl2，请先编译 sdl2 阶段"
         exit 1
       }
       PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" "$PKG_CONFIG" --exists libxml-2.0 || {
         echo "缺少 libxml2，请先编译 libxml2 阶段"
-        exit 1
-      }
-      PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" "$PKG_CONFIG" --exists ogg vorbis || {
-        echo "缺少 ogg/vorbis，请先编译 libvorbis 阶段"
         exit 1
       }
       PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" "$PKG_CONFIG" --exists soxr || {
@@ -209,7 +202,7 @@ PYVMAFCOLORNEGOTIATION
       }
       local required_pc
       for required_pc in \
-        libssh theoraenc libmysofa dvdread dvdnav libchromaprint libzmq; do
+        libssh libmysofa dvdread dvdnav libchromaprint libzmq; do
         PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" "$PKG_CONFIG" --exists "$required_pc" || {
           echo "缺少 pkg-config 依赖: $required_pc"
           exit 1
@@ -260,7 +253,7 @@ PYVMAFCOLORNEGOTIATION
 
       local lto_flags=()
       if [[ "$LTO_ENABLE" == "1" ]]; then
-        lto_flags=(--enable-lto=auto)
+        lto_flags=(--enable-lto=thin)
       fi
 
       local policy_flags_text
@@ -328,7 +321,6 @@ PYVMAFCOLORNEGOTIATION
         --enable-libx264 \
         --enable-libx265 \
         --enable-libvmaf \
-        --enable-libvvenc \
         --enable-schannel \
         --enable-d3d11va \
         --enable-d3d12va \
@@ -344,7 +336,6 @@ PYVMAFCOLORNEGOTIATION
         --enable-lzma \
         --enable-libxml2 \
         --enable-libmp3lame \
-        --enable-libvorbis \
         --enable-libsoxr \
         --enable-libaom \
         --enable-libvpx \
@@ -357,7 +348,6 @@ PYVMAFCOLORNEGOTIATION
         --enable-libvidstab \
         --enable-libssh \
         --enable-libsnappy \
-        --enable-libtheora \
         --enable-libmysofa \
         --enable-libdvdread \
         --enable-libdvdnav \
@@ -366,7 +356,6 @@ PYVMAFCOLORNEGOTIATION
         --enable-iconv \
         "${lto_flags[@]}" \
         "${cuda_flags[@]}" \
-        "${policy_flags[@]}" \
         --enable-encoder=wrapped_avframe \
         --enable-encoder=h264_nvenc \
         --enable-encoder=hevc_nvenc \
@@ -376,12 +365,9 @@ PYVMAFCOLORNEGOTIATION
         --enable-encoder=h264_qsv \
         --enable-encoder=libx264 \
         --enable-encoder=libx265 \
-        --enable-encoder=libvvenc \
         --enable-encoder=libmp3lame \
-        --enable-encoder=libvorbis \
-        --enable-encoder=libvpx_vp8 \
-        --enable-encoder=libvpx_vp9 \
-        --enable-encoder=aac
+        --enable-encoder=aac \
+        "${policy_flags[@]}"
 
       verify_full_ffmpeg_config ffbuild/config.mak "$ff_stage"
       make -j"$FFMPEG_JOBS"
@@ -416,7 +402,8 @@ PYVMAFCOLORNEGOTIATION
         "$STRIP" "$payload/$executable" || true
       done
       copy_runtime_dll_closure "$payload"
-      verify_encoder_bitdepths "$payload/ffmpeg.exe"
+      # Windows capability lists end in CRLF, including the last pixel format.
+      IFS=$' \t\r\n' verify_encoder_bitdepths "$payload/ffmpeg.exe"
       verify_dolby_vision_support "$payload/ffmpeg.exe"
       verify_vmaf "$payload/ffmpeg.exe"
 

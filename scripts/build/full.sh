@@ -59,9 +59,9 @@ OPT_CFLAGS_BASE="${OPT_CFLAGS_BASE:--O3 -pipe -DNDEBUG -funwind-tables -fexcepti
 INLINE_ENABLE="${INLINE_ENABLE:-1}"
 INLINE_FLAGS="${INLINE_FLAGS:--finline-functions}"
 SECTION_GC_ENABLE="${SECTION_GC_ENABLE:-1}"
-LTO_ENABLE="${LTO_ENABLE:-0}"
+LTO_ENABLE="${LTO_ENABLE:-1}"
 CFG_ENABLE="${CFG_ENABLE:-1}"
-LTO_FLAGS="${LTO_FLAGS:--flto=auto}"
+LTO_FLAGS="${LTO_FLAGS:--flto=thin}"
 CPU_FLAGS="${CPU_FLAGS:--march=x86-64-v3 -mtune=generic}"
 
 # CUDA/NVENC 配置
@@ -96,7 +96,6 @@ declare -A URLS=(
   [x264]="https://github.com/mirror/x264.git"
   [x265]="https://bitbucket.org/multicoreware/x265_git.git"
   [vmaf]="https://github.com/Netflix/vmaf.git"
-  [vvenc]="https://github.com/fraunhoferhhi/vvenc.git"
   [sdl2]="https://github.com/libsdl-org/SDL.git"
   [zlib]="https://github.com/madler/zlib.git"
   [bzip2]="https://github.com/libarchive/bzip2.git"
@@ -104,8 +103,6 @@ declare -A URLS=(
 
   [libxml2]="https://github.com/GNOME/libxml2.git"
   [libmp3lame]="https://github.com/TimothyGu/lame.git"
-  [libogg]="https://github.com/xiph/ogg.git"
-  [libvorbis]="https://github.com/xiph/vorbis.git"
   [libsoxr]="https://github.com/chirlu/soxr.git"
   [libaom]="https://aomedia.googlesource.com/aom"
   [libvpx]="https://chromium.googlesource.com/webm/libvpx"
@@ -125,7 +122,6 @@ declare -A URLS=(
   [libiconv]="https://github.com/winlibs/libiconv.git"
   [libpng]="https://github.com/pnggroup/libpng.git"
   [libsnappy]="https://github.com/google/snappy.git"
-  [libtheora]="https://gitlab.xiph.org/xiph/theora.git"
   [libmysofa]="https://github.com/hoene/libmysofa.git"
   [libdvdread]="https://code.videolan.org/videolan/libdvdread.git"
   [libdvdnav]="https://code.videolan.org/videolan/libdvdnav.git"
@@ -155,7 +151,6 @@ declare -A TAG_REGEX=(
   [x264]='stable|master'
   [x265]='^[0-9]+\.[0-9]+(\.[0-9]+)*$|^v[0-9]+\.[0-9]+(\.[0-9]+)*$'
   [vmaf]='^v[0-9]+(\.[0-9]+)*$'
-  [vvenc]='^v[0-9]+(\.[0-9]+)*$'
   [sdl2]='^release-2\.[0-9]+(\.[0-9]+)*$'
   [zlib]='^v[0-9]+(\.[0-9]+)*$'
   [bzip2]='^bzip2-[0-9]+(\.[0-9]+)*$'
@@ -163,8 +158,6 @@ declare -A TAG_REGEX=(
 
   [libxml2]='^v[0-9]+(\.[0-9]+)*$'
   [libmp3lame]='master'
-  [libogg]='^v?[0-9]+(\.[0-9]+)*$'
-  [libvorbis]='^v?[0-9]+(\.[0-9]+)*$'
   [libsoxr]='^v?[0-9]+(\.[0-9]+)*$'
   [libaom]='^v[0-9]+(\.[0-9]+)*$'
   [libvpx]='^v[0-9]+(\.[0-9]+)*$'
@@ -184,7 +177,6 @@ declare -A TAG_REGEX=(
   [libiconv]='^libiconv-[0-9]+(\.[0-9]+)+$'
   [libpng]='^v?1\.[0-9]+\.[0-9]+$'
   [libsnappy]='^[0-9]+(\.[0-9]+)+$'
-  [libtheora]='^v?[0-9]+(\.[0-9]+)+$'
   [libmysofa]='^v?[0-9]+(\.[0-9]+)+$'
   [libdvdread]='^v?[0-9]+(\.[0-9]+)+$'
   [libdvdnav]='^v?[0-9]+(\.[0-9]+)+$'
@@ -203,8 +195,6 @@ STAGES=(
 
   "libxml2"
   "libmp3lame"
-  "libogg"
-  "libvorbis"
   "libsoxr"
   "libaom"
   "libvpx"
@@ -212,7 +202,6 @@ STAGES=(
   "mbedtls"
   "libssh"
   "libsnappy"
-  "libtheora"
   "libmysofa"
   "libdvdread"
   "libdvdnav"
@@ -244,7 +233,6 @@ STAGES=(
   "x264"
   "x265"
   "vmaf"
-  "vvenc"
   "sdl2"
   "amf"
   "avisynth"
@@ -1357,7 +1345,6 @@ run_update() {
     x264
     x265
     vmaf
-    vvenc
     sdl2
     zlib
     bzip2
@@ -1367,8 +1354,6 @@ run_update() {
 
     libxml2
     libmp3lame
-    libogg
-    libvorbis
     libsoxr
     libaom
     libvpx
@@ -1376,7 +1361,6 @@ run_update() {
     mbedtls
     libssh
     libsnappy
-    libtheora
     libmysofa
     libdvdread
     libdvdnav
@@ -1438,8 +1422,6 @@ normalize_stage() {
 
     libxml2|xml2) echo "libxml2" ;;
     libmp3lame|lame|mp3lame) echo "libmp3lame" ;;
-    libogg|ogg) echo "libogg" ;;
-    libvorbis|vorbis) echo "libvorbis" ;;
     libsoxr|soxr) echo "libsoxr" ;;
     libaom|aom) echo "libaom" ;;
     libvpx|vpx) echo "libvpx" ;;
@@ -1447,7 +1429,6 @@ normalize_stage() {
     mbedtls) echo "mbedtls" ;;
     libssh|ssh) echo "libssh" ;;
     libsnappy|snappy) echo "libsnappy" ;;
-    libtheora|theora) echo "libtheora" ;;
     libmysofa|mysofa) echo "libmysofa" ;;
     libdvdread|dvdread) echo "libdvdread" ;;
     libdvdnav|dvdnav) echo "libdvdnav" ;;
@@ -1479,7 +1460,6 @@ normalize_stage() {
     x264) echo "x264" ;;
     x265) echo "x265" ;;
     vmaf) echo "vmaf" ;;
-    vvenc) echo "vvenc" ;;
     sdl2) echo "sdl2" ;;
     amf) echo "amf" ;;
     avisynth) echo "avisynth" ;;
@@ -1723,9 +1703,9 @@ meson_quote_array() {
 }
 
 write_meson_cross() {
-  local meson_lto=false
+  local meson_lto=false meson_lto_mode=default
   local meson_cuda=""
-  [[ "$LTO_ENABLE" == "1" ]] && meson_lto=true
+  if [[ "$LTO_ENABLE" == "1" ]]; then meson_lto=true; meson_lto_mode=thin; fi
   if [[ "$CUDA_ENABLE" == "1" ]]; then
     setup_cuda
     meson_cuda="cuda = '$NVCC'"
@@ -1749,6 +1729,7 @@ c_link_args = $(meson_quote_array "$LDFLAGS -L$PREFIX/lib")
 cpp_link_args = $(meson_quote_array "$LDFLAGS -L$PREFIX/lib")
 optimization = '3'
 b_lto = $meson_lto
+b_lto_mode = '$meson_lto_mode'
 
 [host_machine]
 system = 'windows'
@@ -2091,15 +2072,21 @@ verify_full_ffmpeg_config() {
   local cfg="$1" ff_stage="$2" key
   local required=(
     CONFIG_AAC_ENCODER CONFIG_LIBSOXR CONFIG_LIBSSH  CONFIG_D3D11VA CONFIG_D3D12VA
-    CONFIG_LIBSNAPPY CONFIG_LIBTHEORA  
+    CONFIG_LIBSNAPPY
     CONFIG_PNG_ENCODER CONFIG_PNG_DECODER CONFIG_APNG_ENCODER CONFIG_APNG_DECODER CONFIG_LIBMYSOFA  CONFIG_LIBDVDREAD CONFIG_LIBDVDNAV
     CONFIG_CHROMAPRINT CONFIG_LIBZMQ  
       
     CONFIG_ICONV CONFIG_LIBPLACEBO_FILTER CONFIG_VULKAN
     CONFIG_LIBVPL CONFIG_AV1_QSV_ENCODER CONFIG_HEVC_QSV_ENCODER
     CONFIG_LIBAOM_AV1_ENCODER CONFIG_LIBSVTAV1_ENCODER
-    CONFIG_LIBX264_ENCODER CONFIG_LIBX265_ENCODER CONFIG_LIBVVENC_ENCODER
-    CONFIG_LIBVMAF_FILTER
+    CONFIG_LIBX264_ENCODER CONFIG_LIBX264RGB_ENCODER CONFIG_LIBX265_ENCODER
+    CONFIG_LIBVMAF_FILTER CONFIG_LIBJXL_DECODER CONFIG_LIBJXL_ANIM_DECODER
+    CONFIG_LIBVPX_VP8_DECODER CONFIG_LIBVPX_VP9_DECODER
+    CONFIG_AMF CONFIG_HEVC_AMF_ENCODER CONFIG_AV1_AMF_ENCODER CONFIG_H264_AMF_DECODER
+    CONFIG_H264_QSV_ENCODER CONFIG_H264_MF_ENCODER CONFIG_H264_D3D12VA_ENCODER
+    CONFIG_VVC_DECODER CONFIG_VVC_QSV_DECODER CONFIG_VP3_DECODER CONFIG_VP4_DECODER
+    CONFIG_WEBP_DECODER CONFIG_LIBWEBP_ENCODER CONFIG_LIBWEBP_ANIM_ENCODER
+    CONFIG_OGG_DEMUXER CONFIG_OGG_MUXER CONFIG_LIBOPUS_ENCODER
     CONFIG_AVS_DECODER CONFIG_CAVS_DECODER
     CONFIG_HEVC_DECODER CONFIG_AV1_DECODER CONFIG_LIBDAV1D_DECODER
     CONFIG_DOVI_RPUDEC CONFIG_DOVI_RPUENC CONFIG_DOVI_RPU_BSF CONFIG_DOVI_SPLIT_BSF
@@ -2193,7 +2180,12 @@ verify_encoder_bitdepths() {
   capabilities="$("$ffmpeg" -hide_banner -h encoder=libx264 2>&1)"
   ! grep -Eq 'Supported pixel formats:.*(10(le|be)|p010|p210|nv20)' <<<"$capabilities" || { echo "x264 still advertises 10-bit output" >&2; return 1; }
   capabilities="$("$ffmpeg" -hide_banner -h encoder=libx265 2>&1)"
-  ! grep -Eq 'Supported pixel formats:.*12(le|be)' <<<"$capabilities" || { echo "x265 still advertises 12-bit output" >&2; return 1; }
+  local formats
+  formats="$(grep 'Supported pixel formats:' <<<"$capabilities")" || { echo "x265 pixel formats missing" >&2; return 1; }
+  local format
+  for format in ${formats#*:}; do
+    [[ "$format" =~ 10(le|be)?$ ]] || { echo "x265 advertises a non-10-bit format: $format" >&2; return 1; }
+  done
   encoder_bitdepth_smoke "$ffmpeg" libx264 yuv420p
   encoder_bitdepth_smoke "$ffmpeg" libx264 yuv422p
   encoder_bitdepth_smoke "$ffmpeg" libx264 yuv444p
@@ -2202,12 +2194,11 @@ verify_encoder_bitdepths() {
   encoder_bitdepth_smoke "$ffmpeg" libx265 yuv422p10le
   encoder_bitdepth_smoke "$ffmpeg" libx265 yuv444p10le
 
-  encoder_bitdepth_smoke "$ffmpeg" libvpx-vp9 yuv420p10le
-  encoder_bitdepth_smoke "$ffmpeg" libvpx-vp9 yuv420p12le
+  encoder_bitdepth_smoke "$ffmpeg" libaom-av1 yuv420p
   encoder_bitdepth_smoke "$ffmpeg" libaom-av1 yuv420p10le
   encoder_bitdepth_smoke "$ffmpeg" libaom-av1 yuv420p12le
+  encoder_bitdepth_smoke "$ffmpeg" libsvtav1 yuv420p
   encoder_bitdepth_smoke "$ffmpeg" libsvtav1 yuv420p10le
-  encoder_bitdepth_smoke "$ffmpeg" libvvenc yuv420p10le
 }
 
 verify_dolby_vision_support() {
@@ -2435,9 +2426,7 @@ full_stage_dependencies() {
   case "$1" in
     libpng) printf '%s\n' zlib ;;
     libxml2) printf '%s\n' zlib ;;
-    libvorbis) printf '%s\n' libogg ;;
     libssh) printf '%s\n' mbedtls zlib ;;
-    libtheora) printf '%s\n' libogg ;;
     libmysofa) printf '%s\n' zlib ;;
     libdvdnav) printf '%s\n' libdvdread ;;
     libsrt|librist) printf '%s\n' mbedtls ;;
@@ -2470,8 +2459,6 @@ full_stage_outputs() (
     libpng) lib=png16; pc=libpng; header=libpng16; optional+=("$PREFIX/lib/libpng.a" "$PREFIX/lib/pkgconfig/libpng16.pc" "$PREFIX/include/png.h" "$PREFIX/include/pngconf.h" "$PREFIX/include/pnglibconf.h") ;;
     libxml2) lib=xml2; pc=libxml-2.0; header=libxml2 ;;
     libmp3lame) lib=mp3lame; header=lame ;;
-    libogg) lib=ogg; pc=ogg; header=ogg ;;
-    libvorbis) lib=vorbis; pc=vorbis; header=vorbis; outputs+=("$PREFIX/lib/libvorbisenc.a" "$PREFIX/lib/libvorbisfile.a" "$PREFIX/lib/pkgconfig/vorbisenc.pc" "$PREFIX/lib/pkgconfig/vorbisfile.pc") ;;
     libsoxr) lib=soxr; pc=soxr; header=soxr.h; optional+=("$PREFIX/lib/libsoxr-lsr.a" "$PREFIX/include/soxr-lsr.h") ;;
     libaom) lib=aom; pc=aom; header=aom ;;
     libvpx) lib=vpx; pc=vpx; header=vpx ;;
@@ -2479,7 +2466,6 @@ full_stage_outputs() (
     mbedtls) lib=mbedtls; pc=mbedtls; header=mbedtls; outputs+=("$PREFIX/lib/libmbedx509.a" "$PREFIX/lib/libmbedcrypto.a" "$PREFIX/lib/pkgconfig/mbedcrypto.pc" "$PREFIX/lib/pkgconfig/mbedx509.pc" "$PREFIX/include/psa") ;;
     libssh) lib=ssh; pc=libssh; header=libssh ;;
     libsnappy) lib=snappy; header=snappy.h; optional+=("$PREFIX/include/"snappy*.h) ;;
-    libtheora) lib=theoraenc; pc=theoraenc; header=theora; optional+=("$PREFIX/lib/"libtheora*.a "$PREFIX/lib/pkgconfig/"theora*.pc) ;;
     libmysofa) lib=mysofa; pc=libmysofa; header=mysofa.h; optional+=("$PREFIX/include/mysofa_export.h") ;;
     libdvdread) lib=dvdread; pc=dvdread; header=dvdread ;;
     libdvdnav) lib=dvdnav; pc=dvdnav; header=dvdnav ;;
@@ -2503,15 +2489,14 @@ full_stage_outputs() (
     fontconfig) lib=fontconfig; pc=fontconfig; header=fontconfig ;;
     libass) lib=ass; pc=libass; header=ass ;;
     libwebp) lib=webp; pc=libwebp; header=webp; optional+=("$PREFIX/lib/"libwebp*.a "$PREFIX/lib/"libsharpyuv.a "$PREFIX/lib/pkgconfig/"libwebp*.pc "$PREFIX/lib/pkgconfig/libsharpyuv.pc") ;;
-    brotli) lib=brotlidec; pc=libbrotlidec; header=brotli; outputs+=("$PREFIX/lib/libbrotlicommon.a" "$PREFIX/lib/libbrotlienc.a" "$PREFIX/lib/pkgconfig/libbrotlicommon.pc" "$PREFIX/lib/pkgconfig/libbrotlienc.pc") ;;
+    brotli) lib=brotlidec; pc=libbrotlidec; header=brotli; outputs+=("$PREFIX/lib/libbrotlicommon.a" "$PREFIX/lib/pkgconfig/libbrotlicommon.pc") ;;
     libjxl) lib=jxl; pc=libjxl; header=jxl; outputs+=("$PREFIX/lib/libjxl_threads.a" "$PREFIX/lib/pkgconfig/libjxl_threads.pc"); optional+=("$PREFIX/lib/"libjxl*.a "$PREFIX/lib/libhwy.a" "$PREFIX/include/hwy" "$PREFIX/lib/pkgconfig/"libjxl*.pc "$PREFIX/lib/pkgconfig/libhwy.pc") ;;
     dav1d) lib=dav1d; pc=dav1d; header=dav1d ;;
     svtav1) lib=SvtAv1Enc; pc=SvtAv1Enc; header=svt-av1 ;;
     libvpl) lib=vpl; pc=vpl; header=vpl ;;
     x264) lib=x264; pc=x264; header=x264.h; outputs+=("$PREFIX/include/x264_config.h") ;;
     x265) lib=x265; pc=x265; header=x265.h; outputs+=("$PREFIX/include/x265_config.h") ;;
-    vmaf) lib=vmaf; pc=libvmaf; header=libvmaf; outputs+=("$PREFIX/bin/vmaf.exe") ;;
-    vvenc) lib=vvenc; pc=libvvenc; header=vvenc ;;
+    vmaf) lib=vmaf; pc=libvmaf; header=libvmaf ;;
     sdl2) lib=SDL2; pc=sdl2; header=SDL2; outputs+=("$PREFIX/lib/libSDL2main.a") ;;
     amf) header=AMF ;;
     avisynth) header=avisynth ;;
@@ -2609,7 +2594,7 @@ full_source_recipe() {
 
 full_stage_external_key() {
   case "$1" in
-    vmaf) ffbuild_cache_tree_key "$SCRIPT_DIR/../lib/feature_policy.py" ;;
+    vmaf|brotli|libjxl) ffbuild_cache_tree_key "$SCRIPT_DIR/../lib/feature_policy.py" ;;
     libiconv)
       local source version
       source="$(ffbuild_source_dir libiconv)" || return 1

@@ -41,7 +41,7 @@
         -Dbuilt_in_models=true
         -Denable_zimg=true
         -Denable_float=true
-        -Denable_tools=true
+        -Denable_tools=false
         -Denable_tests=false
         -Denable_asm=true
         -Denable_cuda=false
@@ -58,19 +58,21 @@
       # Check the effective options, not just the command line or a stale stamp.
       local configured_opts required_option
       configured_opts="$(meson configure "$bld")"
-      for required_option in enable_float enable_zimg built_in_models enable_tools; do
+      for required_option in enable_float enable_zimg built_in_models; do
         grep -Eq "^[[:space:]]+$required_option[[:space:]]+true([[:space:]]|$)" <<< "$configured_opts" || {
           echo "libvmaf required option is not enabled: $required_option" >&2
           exit 1
         }
       done
-      grep -Eq '^[[:space:]]+enable_cuda[[:space:]]+false([[:space:]]|$)' <<< "$configured_opts" || {
-        echo "libvmaf must remain CPU-only, independently of FFmpeg CUDA support" >&2
-        exit 1
-      }
+      for required_option in enable_cuda enable_tools enable_tests; do
+        grep -Eq "^[[:space:]]+$required_option[[:space:]]+false([[:space:]]|$)" <<< "$configured_opts" || {
+          echo "libvmaf optional target must remain disabled: $required_option" >&2
+          exit 1
+        }
+      done
       meson compile -C "$bld" -j "$JOBS"
       meson install --no-rebuild -C "$bld"
-      [[ -f "$PREFIX/bin/vmaf.exe" ]] || {
-        echo "Standalone upstream vmaf.exe was not installed; required for CPU HDR cross-checks" >&2
+      [[ ! -e "$PREFIX/bin/vmaf.exe" ]] || {
+        echo "Unexpected standalone vmaf.exe; only the library/filter may be installed" >&2
         exit 1
       }

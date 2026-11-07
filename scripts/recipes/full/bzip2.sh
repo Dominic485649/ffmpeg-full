@@ -3,7 +3,9 @@
       local stage
       stage="$(stage_src "bzip2")"
       pushd "$stage" >/dev/null
-      "$CC" -O3 -c blocksort.c huffman.c crctable.c randtable.c compress.c decompress.c bzlib.c
+      local -a bzip2_flags
+      read -r -a bzip2_flags <<< "$CFLAGS"
+      "$CC" "${bzip2_flags[@]}" -c blocksort.c huffman.c crctable.c randtable.c compress.c decompress.c bzlib.c
       "$AR" rcs libbz2.a blocksort.o huffman.o crctable.o randtable.o compress.o decompress.o bzlib.o
       "$RANLIB" libbz2.a
       mkdir -p "$PREFIX/include" "$PREFIX/lib"
