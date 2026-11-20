@@ -23,7 +23,7 @@
 | NVIDIA | H.264/HEVC/AV1 NVENC、NVDEC、CUDA；`scale_cuda`、`yadif_cuda`、`bwdif_cuda`、`overlay_cuda` 等滤镜 |
 | Intel | oneVPL/QSV 编解码；`vpp_qsv`、`scale_qsv`、去隔行、叠加与拼接滤镜 |
 | AMD / Windows 图形接口 | HEVC/AV1 AMF 编码、AMF 解码；现代 D3D11/D3D12 设备和硬解路径 |
-| 图像与色彩 | PNG/APNG、有损/无损/透明/动画 WebP、AVIF、JPEG XL 静态/动画解码、JPEG 2000；libplacebo、Vulkan、zimg、LCMS/ICC |
+| 图像与色彩 | PNG/APNG、有损/无损/透明/动画 WebP、AVIF、JPEG XL 静态/动画解码、JPEG 2000、JPEG XR 解码（`.jxr`、`.wdp`、`.hdp`）；libplacebo、Vulkan、zimg、LCMS/ICC |
 | 字体与字幕 | libass、FreeType、HarfBuzz、FriBidi、Fontconfig；`subtitles`、`drawtext` |
 | 画质评估 | CPU `libvmaf`，内置 **17 个官方模型**；PSNR、SSIM、XPSNR 等 |
 | 音频 | 原生 AAC（含 NMR 参数）、libopus、MP3、FLAC、Ogg/Opus；SoXR 重采样、Rubber Band 变速变调 |
@@ -178,21 +178,8 @@ JOBS=2 FFMPEG_JOBS=2 NVCC_THREADS=1 ./ffmpeg.sh build
 
 若 Release 附带 JSON，可作为 [FFmpegFreeUI](https://github.com/Lake1059/FFmpegFreeUI) v6 用户预设放入 `Preset_v6\User`。预设作为可选独立附件提供，使用前请确认编码器、滤镜与本机路径匹配。
 
-## 实测与许可证
+## 验证与许可证
 
-2026-11-07 的本地产物已通过隔离运行、DLL 依赖、PE64/CFG、实际 ThinLTO 产物核验与完整离线回归，并完成以下实测：
+程序版本、SHA-256、文件体积与实际通过的用例列在[对应 Release](https://github.com/Dominic485649/ffmpeg-full/releases) 中。
 
-- RTX 4060 Laptop：CUDA 缩放、HEVC/AV1 NVENC 编码。
-- Intel Arc：HEVC/AV1 QSV 直接编码，以及显式重建固定帧率时间戳的 VPP 缩放；逐项核对实际输出帧数。使用条件见 [QSV Lite 说明](https://github.com/Dominic485649/ffmpeg-qsv-lite#qsv-vpp-缩放与-hevc-编码)。
-- 现代 D3D11/D3D12 HEVC 硬解、硬件帧下载和 libplacebo/Vulkan 实际处理。
-- JPEG XL 的 RGBA/动画/RGB16 解码、透明 WebM、高位深 VP9、8-bit HEVC 与原生 VVC 解码。
-- x264 8-bit；x265 4:2:0/4:2:2/4:4:4 10-bit；AOM 8/10/12-bit、SVT 8/10-bit 与 12-bit AVIF 编码。
-- PNG/APNG、有损/无损/透明/动画 WebP、8-bit HEVC 转 WebP、SOFA HRTF 与实际 ASS 字幕渲染。
-- SoXR、NMR AAC、Opus 编解码往返与原生 Ogg/Opus 解码。
-- 全部 17 个 CPU VMAF 模型实际评分，以及 22 项 HDR10/PQ 与色彩标签验收。
-
-AMF 已核验配置与组件注册；本机没有 AMD GPU，未进行 AMF 硬件实测。SVT-AV1 包含按运行 CPU 分派的 AVX-512 优化，未进行 AVX-512 真机性能测试。`ffplay.exe` 已核验启动及运行依赖。
-
-各版本的程序身份、文件体积与验证信息见对应 Release。
-
-自有脚本与文档采用 [MIT License](https://github.com/Dominic485649/ffmpeg-full/blob/main/LICENSE)。本配置的 FFmpeg 许可证标识为 **`nonfree and unredistributable`**；FFmpeg、外部库、驱动与安装器组件适用各自许可证，使用与分发须满足相应许可要求。
+自有脚本与文档采用 [MIT License](https://github.com/Dominic485649/ffmpeg-full/blob/main/LICENSE)。本配置的 FFmpeg 许可证标识为 **`nonfree and unredistributable`**；FFmpeg、外部库、驱动与安装器组件适用各自许可证，使用与分发须满足相应许可要求。JPEG XR 参考库的许可及版权见 [第三方声明](THIRD_PARTY_NOTICES.md)。

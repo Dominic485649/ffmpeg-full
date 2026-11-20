@@ -4,12 +4,24 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/build-cache.sh"
 declare -a LITE_EVENT_ROWS=() LITE_BUILT_STAGES=()
 declare -A LITE_VALIDATED_STAGE=()
 LITE_FFMPEG_BUILT=0
+LITE_SHARED_ROOT=''
 
-# Cache state is private to a profile, and native tools have a separate domain.
-# Legacy, unrecorded staging/build trees are inputs to preserve, not to clean.
+# Backend-specific products remain private. Common libraries may use a separate
+# dependency prefix; never import another backend's objects or prefix.
 lite_cache_root() { printf '%s/.lite-cache/%s-lite\n' "$BUILDROOT" "$BACKEND"; }
-lite_cache_state() { printf '%s/%s.state.json\n' "$(lite_cache_root)" "$1"; }
-lite_cache_record() { printf '%s/%s.success.json\n' "$(lite_cache_root)" "$1"; }
+lite_cache_stage_root() {
+  if [[ -n "$LITE_SHARED_ROOT" ]] && lite_common_recipe_name "$1" >/dev/null; then
+    printf '%s/build/.lite-cache/lite-deps-lite\n' "$LITE_SHARED_ROOT"
+  else
+    lite_cache_root
+  fi
+}
+lite_cache_state() { printf '%s/%s.state.json\n' "$(lite_cache_stage_root "$1")" "$1"; }
+lite_cache_record() { printf '%s/%s.success.json\n' "$(lite_cache_stage_root "$1")" "$1"; }
+lite_dependency_prefix() {
+  if [[ -n "$LITE_SHARED_ROOT" ]]; then printf '%s/prefix\n' "$LITE_SHARED_ROOT"
+  else printf '%s\n' "$PREFIX"; fi
+}
 
 lite_cache_python() {
   python3 -I - "$@" <<'PYLITECACHE'
@@ -411,6 +423,94 @@ lite_cache_lock() {
   ffbuild_cache_lock "$lock" lite_with_cache_lock "$@"
 }
 
+# Common dependencies build under a canonical prefix, not under either target's
+# prefix. The caller holds the same lock until linking finishes, so a concurrent
+# build cannot change the installed files while they're being consumed.
+lite_common_path() {
+  local part result='' parts=()
+  IFS=: read -r -a parts <<< "$PATH"
+  for part in "${parts[@]}"; do
+    [[ -n "$part" && "$part" != "$PREFIX/bin" ]] || continue
+    result+="${result:+:}$part"
+  done
+  printf '%s\n' "$result"
+}
+
+lite_unset_cuda_inputs() {
+  unset CUDA_HOME CUDA_REDIST_ROOT NVCC NVCC_GENCODE_FLAGS NVCC_OPTFLAGS
+  unset NVCC_PTXAS_FLAGS NVCC_FAST_MATH NVCC_THREADS
+  CUDA_ENABLE=0
+}
+
+lite_shared_toolchain_key() (
+  export PATH="$1" PKG_CONFIG_PATH='' PKG_CONFIG_LIBDIR=''
+  BACKEND=lite-deps
+  PREFIX='' BUILDROOT='' HOST_TOOLS=''
+  lite_unset_cuda_inputs
+  local toolchain
+  toolchain="$(ffbuild_cache_toolchain_key)" || return 1
+  ffbuild_cache_hash lite-dependency-pool-v1 "$toolchain" "$PATH" "${LIBS-}"
+)
+
+lite_populate_shared_dependencies() (
+  local base="$1" stage dir
+  for dir in build prefix host-tools metadata; do
+    [[ "$(realpath -m -- "$base/$dir")" == "$base/$dir" ]] || {
+      echo "refusing a redirected shared dependency directory: $base/$dir" >&2; return 1;
+    }
+  done
+  export PATH="$2"
+  BACKEND=lite-deps
+  PREFIX="$base/prefix"
+  BUILDROOT="$base/build"
+  HOST_TOOLS="$base/host-tools"
+  HOST_GLSLC="$HOST_TOOLS/bin/glslc"
+  OUTPUT_DIR="$base/metadata"
+  LITE_SHARED_ROOT=''
+  LITE_CACHE_LOCKED=1
+  LITE_EVENT_ROWS=(); LITE_BUILT_STAGES=(); LITE_VALIDATED_STAGE=()
+  LITE_TARGET_TOOLCHAIN_KEY=''; LITE_HOST_TOOLCHAIN_KEY=''
+  lite_unset_cuda_inputs
+  lite_cache_claim_profile || return 1
+  setup_build_env || return 1
+  for stage in "${COMMON_STAGES[@]}"; do
+    need_repo "$stage" || return 1
+    run_stage "$stage" || return 1
+  done
+)
+
+lite_use_locked_dependencies() {
+  local base="$1" shared_path="$2"
+  shift 2
+  lite_populate_shared_dependencies "$base" "$shared_path" || return 1
+  local LITE_SHARED_ROOT="$base" HOST_GLSLC="$HOST_GLSLC"
+  if [[ "$HOST_GLSLC" == "$HOST_TOOLS/bin/glslc" ]]; then
+    HOST_GLSLC="$base/host-tools/bin/glslc"
+  fi
+  local PKG_CONFIG_PATH="$base/prefix/lib/pkgconfig:$PREFIX/lib/pkgconfig"
+  local PKG_CONFIG_LIBDIR="$PKG_CONFIG_PATH"
+  export PKG_CONFIG_PATH PKG_CONFIG_LIBDIR
+  "$@"
+}
+
+lite_with_shared_dependencies() {
+  case "${FFBUILD_LITE_SHARED_DEPS:-1}" in
+    0) "$@"; return $? ;;
+    1) ;;
+    *) echo 'FFBUILD_LITE_SHARED_DEPS must be 0 or 1' >&2; return 1 ;;
+  esac
+  local shared_path key base
+  shared_path="$(lite_common_path)" || return 1
+  key="$(lite_shared_toolchain_key "$shared_path")" || return 1
+  [[ "$key" =~ ^[0-9a-f]{64}$ ]] || return 1
+  base="$ROOT/build_shared_deps/$key"
+  [[ "$(realpath -m -- "$base")" == "$base" ]] || {
+    echo "refusing a redirected Lite dependency pool: $base" >&2; return 1;
+  }
+  lite_assert_generated_directory "$base" || return 1
+  ffbuild_cache_lock "$base/.shared-deps.lock" lite_use_locked_dependencies "$base" "$shared_path" "$@"
+}
+
 lite_stage_source_key() {
   local path="$1" name="$2" key version
   local extras=()
@@ -431,6 +531,7 @@ lite_stage_outputs() {
     libvpl) printf '%s\n' "$PREFIX/lib/libvpl.a" "$PREFIX/include/vpl" "$PREFIX/lib/pkgconfig/vpl.pc" ;;
     libsoxr) printf '%s\n' "$PREFIX/lib/libsoxr.a" "$PREFIX/include/soxr.h" "$PREFIX/lib/pkgconfig/soxr.pc" ;;
     libshaderc) printf '%s\n' "$PREFIX/lib/libshaderc_combined.a" "$PREFIX/include/shaderc" "$PREFIX/include/spirv" "$PREFIX/lib/pkgconfig/shaderc.pc" ;;
+    lcms2) printf '%s\n' "$PREFIX/lib/liblcms2.a" "$PREFIX/include/lcms2.h" "$PREFIX/include/lcms2_plugin.h" "$PREFIX/lib/pkgconfig/lcms2.pc" ;;
     vulkan-headers) printf '%s\n' "$PREFIX/include/vulkan" "$PREFIX/include/vk_video" "$PREFIX/lib/vulkan-1.def" \
       "$PREFIX/lib/libvulkan-1.dll.a" "$PREFIX/lib/libvulkan.dll.a" "$PREFIX/lib/libvulkan-1.a" "$PREFIX/lib/libvulkan.a" "$PREFIX/lib/pkgconfig/vulkan.pc" ;;
     libplacebo) printf '%s\n' "$PREFIX/lib/libplacebo.a" "$PREFIX/include/libplacebo" "$PREFIX/lib/pkgconfig/libplacebo.pc" ;;
@@ -456,7 +557,7 @@ lite_write_delivery_certificate() {
 
 lite_stage_dependencies() {
   case "$1" in
-    libplacebo) printf '%s\n' libshaderc vulkan-headers ;;
+    libplacebo) printf '%s\n' libshaderc vulkan-headers lcms2 ;;
     ffmpeg)
       local stage
       for stage in "${STAGES[@]}"; do [[ "$stage" == ffmpeg ]] || printf '%s\n' "$stage"; done
@@ -519,8 +620,12 @@ lite_run_stage_cached() {
   tree="${keys%%$'\n'*}"; abi="${keys#*$'\n'}"
   source_key="$(lite_stage_source_key "$source" "$name")" || return 1
   deps="$(lite_dependency_key "$name")" || return 1
-  recipe="$(ffbuild_cache_tree_key "$LITE_RECIPE_SCRIPT" "$LITE_SCRIPT_DIR/../lib/lite-common.sh" \
-    "$LITE_SCRIPT_DIR/../lib/workspace.sh" "$LITE_SCRIPT_DIR/../lib/build-cache.sh" "$LITE_SCRIPT_DIR/../lib/feature_policy.py" "$FFBUILD_CODE_ROOT/shared-patches")" || return 1
+  if lite_common_recipe_name "$name" >/dev/null; then
+    recipe="$(lite_common_recipe_key "$name")" || return 1
+  else
+    recipe="$(ffbuild_cache_tree_key "$LITE_RECIPE_SCRIPT" "$LITE_SCRIPT_DIR/../lib/lite-common.sh" \
+      "$LITE_SCRIPT_DIR/../lib/workspace.sh" "$LITE_SCRIPT_DIR/../lib/build-cache.sh" "$LITE_SCRIPT_DIR/../lib/feature_policy.py" "$FFBUILD_CODE_ROOT/shared-patches")" || return 1
+  fi
   if [[ "$domain" == host ]]; then
     toolchain="${LITE_HOST_TOOLCHAIN_KEY:-}"
     [[ -n "$toolchain" ]] || toolchain="$(lite_host_toolchain_key)" || return 1
@@ -564,7 +669,7 @@ lite_run_stage_cached() {
   # Header/config/layout/dependency changes, failures and corrupted outputs all
   # get new siblings; no unrecorded directory is modified or deleted.
   case "$name" in
-    libvpl|libsoxr|libplacebo|ffmpeg)
+    libvpl|libsoxr|lcms2|libplacebo|ffmpeg)
       if (( previous_valid )) && [[ "$config" == "$(lite_state_get "$name" config)" \
           && "$abi" == "$(lite_state_get "$name" abi)" ]]; then
         old_build="$(lite_state_get "$name" build)" || return 1
@@ -579,7 +684,7 @@ lite_run_stage_cached() {
   compat="$(ffbuild_cache_hash "$config" "$abi" "$path")" || return 1
   if (( ! reuse )); then compat="$(ffbuild_cache_hash "$compat" "$pending")" || return 1; fi
   case "$name" in
-    libvpl|libsoxr|libshaderc|libplacebo|ffmpeg|host-glslc)
+    libvpl|libsoxr|libshaderc|lcms2|libplacebo|ffmpeg|host-glslc)
       if (( reuse )); then
         lite_assert_generated_directory "$old_build" || return 1
         [[ "$(realpath -m -- "$old_build")" == "$(realpath -m -- "$BUILDROOT")/"* ]] || return 1
@@ -649,6 +754,18 @@ run_stage() {
   fi
   local stage="$1"
   CURRENT_STAGE="$stage"
+  if [[ -n "$LITE_SHARED_ROOT" ]] && lite_common_recipe_name "$stage" >/dev/null; then
+    local key source staged path build
+    key="$(lite_state_get "$stage" input)" || return 1
+    ffbuild_cache_hit "$(lite_cache_record "$stage")" "$key" || return 1
+    source="$(lite_state_get "$stage" source)" || return 1
+    staged="$(lite_state_get "$stage" staged)" || return 1
+    path="$(lite_state_get "$stage" stage)" || return 1
+    build="$(lite_state_get "$stage" build)" || return 1
+    printf '===> %s (verified shared dependency: %s)\n' "$stage" "$LITE_SHARED_ROOT"
+    lite_record_event "$stage" reused "$key" "$source" "$staged" "$path" "$build"
+    return 0
+  fi
   # Resolve host/CUDA inputs before calculating the FFmpeg cache identity.
   if [[ "$stage" == ffmpeg ]]; then
     [[ "$BACKEND" != nvenc ]] || setup_cuda || return 1
@@ -1526,8 +1643,105 @@ build_shaderc_from_source() {
   cp -a "$stage/third_party/spirv-headers/include/spirv" "$PREFIX/include/" || return 1
   write_shaderc_pc
 }
+build_lite_soxr() {
+  build_cmake libsoxr -Wno-dev --no-warn-unused-cli -DBUILD_TESTS=OFF -DBUILD_EXAMPLES=OFF \
+    -DWITH_OPENMP=OFF -DWITH_LSR_BINDINGS=OFF -DCMAKE_POLICY_VERSION_MINIMUM=3.10 || return 1
+  write_soxr_pc
+}
+
+build_lite_lcms2() {
+  build_cmake lcms2 -DLCMS2_BUILD_SHARED=OFF -DLCMS2_BUILD_STATIC=ON \
+    -DLCMS2_BUILD_TOOLS=OFF -DLCMS2_BUILD_TESTS=OFF -DCMAKE_POLICY_VERSION_MINIMUM=3.5 || return 1
+  "$PKG_CONFIG" --static --exists 'lcms2 >= 2.13' || return 1
+  [[ "$("$PKG_CONFIG" --variable=prefix lcms2)" == "$PREFIX" ]]
+}
+
+build_lite_vulkan_headers() {
+  local s vk_version
+  s="$(stage_src vulkan-headers)" || return 1
+  vk_version="$(git -C "$s" describe --tags --always | sed 's/^v//;s/-.*//')" || return 1
+  mkdir -p "$PREFIX/include" "$PREFIX/lib/pkgconfig" || return 1
+  cp -rf "$s/include/"* "$PREFIX/include/" || return 1
+  printf '%s\n' 'LIBRARY vulkan-1.dll' 'EXPORTS' 'vkGetInstanceProcAddr' > "$PREFIX/lib/vulkan-1.def" || return 1
+  "$DLLTOOL" -d "$PREFIX/lib/vulkan-1.def" -l "$PREFIX/lib/libvulkan-1.dll.a" -D vulkan-1.dll || return 1
+  cp -f "$PREFIX/lib/libvulkan-1.dll.a" "$PREFIX/lib/libvulkan.dll.a" || return 1
+  cp -f "$PREFIX/lib/libvulkan-1.dll.a" "$PREFIX/lib/libvulkan-1.a" || return 1
+  cp -f "$PREFIX/lib/libvulkan.dll.a" "$PREFIX/lib/libvulkan.a" || return 1
+  cat > "$PREFIX/lib/pkgconfig/vulkan.pc" <<EOF
+prefix=$PREFIX
+exec_prefix=\${prefix}
+libdir=\${exec_prefix}/lib
+includedir=\${prefix}/include
+
+Name: Vulkan-Loader
+Description: Windows Vulkan loader import library
+Version: $vk_version
+Libs: -L\${libdir} -lvulkan-1
+Cflags: -I\${includedir}
+EOF
+}
+
+build_lite_libplacebo() {
+  "$PKG_CONFIG" --static --exists shaderc vulkan lcms2 || return 1
+  local s b meson_setup=(setup)
+  s="$(stage_src libplacebo)" || return 1
+  b="$(lite_build_directory libplacebo)" || return 1
+  [[ "${LITE_REUSE_OBJECTS:-0}" != 1 ]] || meson_setup+=(--reconfigure)
+  meson "${meson_setup[@]}" "$b" "$s" \
+    --cross-file "$BUILDROOT/mingw-cross.txt" --prefix "$PREFIX" \
+    --buildtype release --default-library=static -Ddemos=false -Dtests=false \
+    -Dvulkan=enabled -Dshaderc=enabled -Dopengl=disabled -Dlcms=enabled \
+    -Ddovi=enabled -Dlibdovi=disabled -Dxxhash=disabled || return 1
+  meson compile -C "$b" -j "$JOBS" || return 1
+  meson install --no-rebuild -C "$b" || return 1
+  lite_assert_installed_copy "$b/src/libplacebo.a" "$PREFIX/lib/libplacebo.a" || return 1
+  lite_assert_installed_copy "$b/src/include/libplacebo/config.h" "$PREFIX/include/libplacebo/config.h" || return 1
+  grep -qx '#define PL_HAVE_DOVI 1' "$PREFIX/include/libplacebo/config.h" || return 1
+  grep -qx '#define PL_HAVE_LCMS 1' "$PREFIX/include/libplacebo/config.h" || return 1
+  grep -q '^pl_has_vk_proc_addr=1' "$PREFIX/lib/pkgconfig/libplacebo.pc"
+}
+
+lite_common_recipe_name() {
+  case "$1" in
+    opus) printf '%s\n' build_opus ;;
+    libsoxr) printf '%s\n' build_lite_soxr ;;
+    libshaderc) printf '%s\n' build_shaderc_from_source ;;
+    vulkan-headers) printf '%s\n' build_lite_vulkan_headers ;;
+    lcms2) printf '%s\n' build_lite_lcms2 ;;
+    libplacebo) printf '%s\n' build_lite_libplacebo ;;
+    host-glslc) printf '%s\n' build_host_glslc_from_source ;;
+    *) return 1 ;;
+  esac
+}
+
+run_lite_common_recipe() {
+  local fn
+  fn="$(lite_common_recipe_name "$1")" || { echo "unknown Lite stage: $1" >&2; return 1; }
+  "$fn"
+}
+
+lite_common_recipe_key() {
+  local name="$1" fn data policy
+  local -a inputs=(lite_run_stage_cached lite_stage_outputs lite_stage_dependencies lite_cache_python
+    setup_build_env canonical_tool stage_src lite_build_directory lite_assert_installed_copy)
+  fn="$(lite_common_recipe_name "$name")" || return 1
+  inputs+=("$fn")
+  case "$name" in
+    libsoxr) inputs+=(build_cmake write_soxr_pc) ;;
+    lcms2) inputs+=(build_cmake) ;;
+    libshaderc|host-glslc)
+      inputs+=(prepare_shaderc_dependencies shaderc_dependencies_ready ffbuild_lite_shaderc_deps_key)
+      if [[ "$name" == libshaderc ]]; then inputs+=(write_shaderc_pc)
+      else inputs+=(host_glslc_version lite_host_toolchain_key host_glslc_source_stamp); fi ;;
+  esac
+  data="$(declare -f "${inputs[@]}")" || return 1
+  policy="$(ffbuild_cache_tree_key "$LITE_SCRIPT_DIR/../lib/workspace.sh" "$LITE_SCRIPT_DIR/../lib/build-cache.sh")" || return 1
+  ffbuild_cache_hash lite-library-recipe-v1 "$data" "$policy"
+}
+
 patch_ffmpeg_libplacebo_vulkan_import() {
-  local ff_stage="$1" cfg="$PREFIX/include/libplacebo/config.h" api
+  local ff_stage="$1" cfg api
+  cfg="$(lite_dependency_prefix)/include/libplacebo/config.h"
   sed -i 's/-lstdc++/-lc++/g' "$ff_stage/configure"
   [[ -f "$cfg" ]] || return 0
   api="$(sed -n 's/^#define PL_API_VER[[:space:]]\+\([0-9]\+\).*/\1/p' "$cfg" | head -n1)"
@@ -1539,7 +1753,8 @@ patch_ffmpeg_libplacebo_vulkan_import() {
     "$ff_stage/libavutil/vulkan_loader.h"
 }
 validate_config() {
-  local config_mak="$1" config_h="$2" ff_stage="${3:-.}" unexpected allowed filter_line filter_name filter_lower f found feature
+  local config_mak="$1" config_h="$2" ff_stage="${3:-.}" unexpected allowed filter_line filter_name filter_lower f found feature dep_prefix
+  dep_prefix="$(lite_dependency_prefix)" || return 1
   python3 -I "$FFBUILD_CODE_ROOT/scripts/lib/feature_policy.py" check-config "$config_mak" || return 1
   local allowed_filters=("${COMMON_FILTERS[@]}")
   if [[ "$BACKEND" == "nvenc" ]]; then
@@ -1555,6 +1770,9 @@ validate_config() {
   grep -q '^CONFIG_LIBSOXR=yes$' "$config_mak" || { echo "libsoxr disabled"; exit 1; }
   grep -q '^CONFIG_ARESAMPLE_FILTER=yes$' "$config_mak" || { echo "aresample filter disabled"; exit 1; }
   grep -q '^CONFIG_LIBPLACEBO_FILTER=yes$' "$config_mak" || { echo "libplacebo filter disabled"; exit 1; }
+  for feature in CONFIG_LCMS2 CONFIG_ICCDETECT_FILTER CONFIG_ICCGEN_FILTER; do
+    grep -qx "$feature=yes" "$config_mak" || { echo "LCMS build option disabled: $feature" >&2; return 1; }
+  done
   grep -q "^CONFIG_AVS_DECODER=yes$" "$config_mak" || { echo "native AVS decoder disabled"; exit 1; }
   grep -q "^CONFIG_CAVS_DECODER=yes$" "$config_mak" || { echo "native CAVS decoder disabled"; exit 1; }
   grep -q "^CONFIG_CAVSVIDEO_PARSER=yes$" "$config_mak" || { echo "native CAVS parser disabled"; exit 1; }
@@ -1567,8 +1785,8 @@ validate_config() {
   done
   grep -q 'ff_parse_itu_t_t35_to_dynamic_hdr_vivid' "$ff_stage/libavcodec/itut35.c" || { echo "FFmpeg mainline HDR Vivid T.35 parser is missing" >&2; exit 1; }
   grep -q 'AV_FRAME_DATA_DYNAMIC_HDR_VIVID' "$ff_stage/libavcodec/hevc/hevcdec.c" || { echo "FFmpeg HEVC HDR Vivid frame metadata path is missing" >&2; exit 1; }
-  [[ -s "$PREFIX/lib/libshaderc_combined.a" && -d "$PREFIX/include/shaderc" ]] || { echo "libshaderc static library or headers missing"; exit 1; }
-  PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" "$PKG_CONFIG" --exists shaderc || { echo "shaderc.pc is not usable"; exit 1; }
+  [[ -s "$dep_prefix/lib/libshaderc_combined.a" && -d "$dep_prefix/include/shaderc" ]] || { echo "libshaderc static library or headers missing"; exit 1; }
+  "$PKG_CONFIG" --static --exists shaderc lcms2 || { echo "shaderc/lcms2 pkg-config unavailable"; exit 1; }
 
   if [[ "$BACKEND" == "nvenc" ]]; then
     grep -q '^CONFIG_AV1_NVENC_ENCODER=yes$' "$config_mak" || { echo "av1_nvenc disabled"; exit 1; }
@@ -1715,7 +1933,7 @@ run_build() {
 }
 
 lite_run_build_locked() {
-  local s start="${1:-}" start_seen=0 found=0
+  local s start="${1:-}" found=0
   LITE_BUILD_MODE=full
   LITE_EVENT_ROWS=(); LITE_BUILT_STAGES=(); LITE_VALIDATED_STAGE=()
   LITE_FFMPEG_BUILT=0
@@ -1731,6 +1949,11 @@ lite_run_build_locked() {
   lite_assert_generated_file "$OUTPUT_DIR/.ffbuild-current.json" || return 1
   lite_cache_python retire "$OUTPUT_DIR/.ffbuild-current.json" "$(lite_cache_root)/retained-products" || return 1
   setup_build_env || return 1
+  lite_with_shared_dependencies lite_run_configured_build "$start"
+}
+
+lite_run_configured_build() {
+  local s start="$1" start_seen=0
   [[ "$BACKEND" != nvenc ]] || setup_cuda || return 1
   LITE_TARGET_TOOLCHAIN_KEY="$(ffbuild_cache_toolchain_key)" || return 1
   need_repo ffmpeg-source || return 1

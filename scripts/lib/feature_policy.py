@@ -115,7 +115,8 @@ def prune_ffmpeg_source(source):
     # Upstream auto-detects this internal backend but does not expose its switch.
     # Expose just that switch; global Vulkan and unstable CPU scaling stay intact.
     blocks = list(re.finditer(r'^CMDLINE_SELECT="\n(.*?)^"\n', text, re.M | re.S))
-    if len(blocks) != 1 or text.count('swscale_vulkan_deps="vulkan"') != 1:
+    dependencies = re.findall(r'^swscale_vulkan_deps="([^"\n]*)"$', text, re.M)
+    if len(blocks) != 1 or dependencies not in (['vulkan'], ['vulkan unstable']):
         raise ValueError('unknown FFmpeg swscale Vulkan configuration; source left unchanged')
     block = blocks[0]
     options = block[1]
@@ -131,6 +132,23 @@ def prune_ffmpeg_source(source):
     for path in existing:
         path.unlink()
     print(f'Verified swscale Vulkan policy switch; removed {len(existing)} standalone BM3D staged files')
+
+
+def patch_restricted_cli(source):
+    configure = regular(Path(source) / 'configure')
+    text = configure.read_text()
+    # Upstream now selects xstack for HEIF tile grids. The restricted profiles
+    # did not enable that filter; keep the opt-in and leave Full untouched.
+    if not re.search(r'\bxstack_filter\b', text):
+        return
+    matches = list(re.finditer(r'^ffmpeg_select="([^"]*)"$', text, re.M))
+    if len(matches) != 1 or matches[0][1].split().count('xstack_filter') > 1:
+        raise ValueError('unknown FFmpeg CLI selector; source left unchanged')
+    match = matches[0]
+    deps = re.sub(r'(?:^|\s+)xstack_filter(?=\s|$)', '', match[1])
+    replace_file(configure, text[:match.start(1)] + deps + text[match.end(1):])
+    if deps != match[1]:
+        print('Kept xstack outside the restricted FFmpeg CLI filter profile')
 
 
 def patch_x264_formats(source):
@@ -348,7 +366,7 @@ def main():
         print(json.dumps(MODELS))
         return
     if len(sys.argv) != 3:
-        raise ValueError('usage: feature_policy.py {ffmpeg-flags|ffmpeg-source|check-config|x264|x265|amf|vmaf|brotli|jxl} PATH; or models')
+        raise ValueError('usage: feature_policy.py {ffmpeg-flags|ffmpeg-source|ffmpeg-restricted-cli|check-config|x264|x265|amf|vmaf|brotli|jxl} PATH; or models')
     mode, path = sys.argv[1:]
     if mode == 'ffmpeg-flags':
         configure_flags(path)
@@ -356,6 +374,8 @@ def main():
         check_config(path)
     elif mode == 'ffmpeg-source':
         prune_ffmpeg_source(path)
+    elif mode == 'ffmpeg-restricted-cli':
+        patch_restricted_cli(path)
     elif mode == 'x264':
         patch_x264_formats(path)
     elif mode == 'x265':

@@ -5,7 +5,24 @@
 
       local ff_stage
       ff_stage="$(stage_src "ffmpeg-source")"
-      "$ROOT/shared-patches/apply-ffmpeg-patches.sh" "$ff_stage" full
+      local native_vmaf_color=0
+      if grep -Fq 'dst->color = color_map(src);' "$ff_stage/libavfilter/vf_libvmaf.c"; then
+        # Current upstream already bridges VmafPicture.color. Keep using the
+        # common linker compatibility patch, not a second metadata bridge.
+        native_vmaf_color=1
+        "$ROOT/shared-patches/apply-ffmpeg-patches.sh" "$ff_stage" lite
+      else
+        "$ROOT/shared-patches/apply-ffmpeg-patches.sh" "$ff_stage" full
+      fi
+      local jxr_patch="$FULL_RECIPES_DIR/libjxr-decoder.patch" jxr_decoder="$ff_stage/libavcodec/libjxrdec.c"
+      if ! git -C "$ff_stage" apply --reverse --check "$jxr_patch" 2>/dev/null; then
+        git -C "$ff_stage" apply --check "$jxr_patch"
+        git -C "$ff_stage" apply "$jxr_patch"
+      fi
+      [[ ! -L "$jxr_decoder" ]] || { echo "Refusing a symlink JPEG XR decoder" >&2; return 1; }
+      if ! cmp -s "$FULL_RECIPES_DIR/libjxrdec.c" "$jxr_decoder"; then
+        cp -- "$FULL_RECIPES_DIR/libjxrdec.c" "$jxr_decoder"
+      fi
       python3 -I "$SCRIPT_DIR/../lib/feature_policy.py" amf "$ff_stage" || return 1
       python3 -I "$SCRIPT_DIR/../lib/feature_policy.py" ffmpeg-source "$ff_stage" || return 1
       python3 -I "$SCRIPT_DIR/../lib/feature_policy.py" x264 "$ff_stage" || return 1
@@ -151,6 +168,10 @@ PYVMAFCOLORNEGOTIATION
       PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" "$PKG_CONFIG" --exists soxr || {
         echo "缺少 soxr，请先编译 libsoxr 阶段"
         exit 1
+      }
+      "$PKG_CONFIG" --static --exists libjxr || {
+        echo "缺少 libjxr，请先编译 jxrlib 阶段" >&2
+        return 1
       }
       PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" "$PKG_CONFIG" --exists aom || {
         echo "缺少 aom，请先编译 libaom 阶段"
@@ -315,6 +336,8 @@ PYVMAFCOLORNEGOTIATION
         --enable-libzimg \
         --enable-libwebp \
         --enable-libjxl \
+        --enable-libjxr \
+        --enable-decoder=libjxr \
         --enable-libdav1d \
         --enable-libsvtav1 \
         --enable-libvpl \
@@ -370,6 +393,10 @@ PYVMAFCOLORNEGOTIATION
         "${policy_flags[@]}"
 
       verify_full_ffmpeg_config ffbuild/config.mak "$ff_stage"
+      if [[ "$native_vmaf_color" == 1 ]] && ! grep -qx 'HAVE_LIBVMAF_PICTURE_CONVERT=yes' ffbuild/config.mak; then
+        echo 'Upstream VMAF color support was not enabled; rebuild libvmaf with conversion support' >&2
+        return 1
+      fi
       make -j"$FFMPEG_JOBS"
       local avfilter_import_lib="$ff_stage/libavfilter/libavfilter.dll.a"
       [[ -f "$avfilter_import_lib" ]] || {
@@ -402,6 +429,14 @@ PYVMAFCOLORNEGOTIATION
         "$STRIP" "$payload/$executable" || true
       done
       copy_runtime_dll_closure "$payload"
+      local jxr_decoders jxr_encoders
+      jxr_decoders="$("$payload/ffmpeg.exe" -hide_banner -decoders)"
+      jxr_encoders="$("$payload/ffmpeg.exe" -hide_banner -encoders)"
+      if ! grep -Eq '[[:space:]]libjxr[[:space:]]' <<<"$jxr_decoders" ||
+          grep -Eq '[[:space:]](libjxr|jpegxr|jxr)[[:space:]]' <<<"$jxr_encoders"; then
+        echo 'JPEG XR decoder-only registration check failed' >&2
+        return 1
+      fi
       # Windows capability lists end in CRLF, including the last pixel format.
       IFS=$' \t\r\n' verify_encoder_bitdepths "$payload/ffmpeg.exe"
       verify_dolby_vision_support "$payload/ffmpeg.exe"

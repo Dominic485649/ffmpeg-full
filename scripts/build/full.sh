@@ -88,6 +88,7 @@ declare -A URLS=(
   [libass]="https://github.com/libass/libass.git"
   [fontconfig]="https://gitlab.freedesktop.org/fontconfig/fontconfig.git"
   [libjxl]="https://github.com/libjxl/libjxl.git"
+  [jxrlib]="https://github.com/scrubbbbs/jxrlib-kif.git"
   [expat]="https://github.com/libexpat/libexpat.git"
   [brotli]="https://github.com/google/brotli.git"
   [dav1d]="https://code.videolan.org/videolan/dav1d.git"
@@ -143,6 +144,7 @@ declare -A TAG_REGEX=(
   [libass]='^v?[0-9]+(\.[0-9]+)*$'
   [fontconfig]='^[0-9]+(\.[0-9]+)*$'
   [libjxl]='^v[0-9]+(\.[0-9]+)*$'
+  [jxrlib]='main'
   [expat]='^R_[0-9]+(_[0-9]+)+$'
   [brotli]='^v?[0-9]+(\.[0-9]+)*$'
   [dav1d]='^[0-9]+(\.[0-9]+)*$'
@@ -227,6 +229,7 @@ STAGES=(
   "libwebp"
   "brotli"
   "libjxl"
+  "jxrlib"
   "dav1d"
   "svtav1"
   "libvpl"
@@ -1337,6 +1340,7 @@ run_update() {
     libass
     fontconfig
     libjxl
+    jxrlib
     expat
     brotli
     dav1d
@@ -1454,6 +1458,7 @@ normalize_stage() {
     libwebp|webp) echo "libwebp" ;;
     brotli) echo "brotli" ;;
     libjxl|jxl) echo "libjxl" ;;
+    jxrlib|jxr|jpegxr) echo "jxrlib" ;;
     dav1d) echo "dav1d" ;;
     svtav1|svt-av1|svt) echo "svtav1" ;;
     libvpl|vpl) echo "libvpl" ;;
@@ -2081,6 +2086,7 @@ verify_full_ffmpeg_config() {
     CONFIG_LIBAOM_AV1_ENCODER CONFIG_LIBSVTAV1_ENCODER
     CONFIG_LIBX264_ENCODER CONFIG_LIBX264RGB_ENCODER CONFIG_LIBX265_ENCODER
     CONFIG_LIBVMAF_FILTER CONFIG_LIBJXL_DECODER CONFIG_LIBJXL_ANIM_DECODER
+    CONFIG_LIBJXR CONFIG_LIBJXR_DECODER CONFIG_IMAGE2_DEMUXER CONFIG_IMAGE_JPEGXR_PIPE_DEMUXER
     CONFIG_LIBVPX_VP8_DECODER CONFIG_LIBVPX_VP9_DECODER
     CONFIG_AMF CONFIG_HEVC_AMF_ENCODER CONFIG_AV1_AMF_ENCODER CONFIG_H264_AMF_DECODER
     CONFIG_H264_QSV_ENCODER CONFIG_H264_MF_ENCODER CONFIG_H264_D3D12VA_ENCODER
@@ -2117,6 +2123,10 @@ verify_full_ffmpeg_config() {
     echo "FFmpeg HEVC HDR Vivid frame metadata path is missing" >&2; exit 1;
   }
   python3 -I "$SCRIPT_DIR/../lib/feature_policy.py" check-config "$cfg" || return 1
+  if grep -qx 'CONFIG_LIBJXR_ENCODER=yes' "$cfg"; then
+    echo 'Full must register JPEG XR decoding only' >&2
+    return 1
+  fi
   for key in CONFIG_LIBDAVS2_DECODER CONFIG_LIBUAVS3D_DECODER CONFIG_LIBXAVS_ENCODER CONFIG_LIBXAVS2_ENCODER; do
     if grep -q "^$key=yes$" "$cfg"; then
       echo "External AVS2/3 decoder or AVS encoder unexpectedly enabled: $key"
@@ -2491,6 +2501,7 @@ full_stage_outputs() (
     libwebp) lib=webp; pc=libwebp; header=webp; optional+=("$PREFIX/lib/"libwebp*.a "$PREFIX/lib/"libsharpyuv.a "$PREFIX/lib/pkgconfig/"libwebp*.pc "$PREFIX/lib/pkgconfig/libsharpyuv.pc") ;;
     brotli) lib=brotlidec; pc=libbrotlidec; header=brotli; outputs+=("$PREFIX/lib/libbrotlicommon.a" "$PREFIX/lib/pkgconfig/libbrotlicommon.pc") ;;
     libjxl) lib=jxl; pc=libjxl; header=jxl; outputs+=("$PREFIX/lib/libjxl_threads.a" "$PREFIX/lib/pkgconfig/libjxl_threads.pc"); optional+=("$PREFIX/lib/"libjxl*.a "$PREFIX/lib/libhwy.a" "$PREFIX/include/hwy" "$PREFIX/lib/pkgconfig/"libjxl*.pc "$PREFIX/lib/pkgconfig/libhwy.pc") ;;
+    jxrlib) lib=jxrglue; pc=libjxr; header=jxrlib; outputs+=("$PREFIX/lib/libjpegxr.a") ;;
     dav1d) lib=dav1d; pc=dav1d; header=dav1d ;;
     svtav1) lib=SvtAv1Enc; pc=SvtAv1Enc; header=svt-av1 ;;
     libvpl) lib=vpl; pc=vpl; header=vpl ;;
@@ -2595,6 +2606,7 @@ full_source_recipe() {
 full_stage_external_key() {
   case "$1" in
     vmaf|brotli|libjxl) ffbuild_cache_tree_key "$SCRIPT_DIR/../lib/feature_policy.py" ;;
+    jxrlib) ffbuild_cache_tree_key "$FULL_RECIPES_DIR/jxrlib.cmake" ;;
     libiconv)
       local source version
       source="$(ffbuild_source_dir libiconv)" || return 1
@@ -2634,7 +2646,8 @@ full_run_stage_locked() {
   local patches=none host_key=none
   if [[ "$name" == ffmpeg ]]; then
     ensure_host_glslc
-    patches="$(ffbuild_cache_tree_key "$ROOT/shared-patches" "$SCRIPT_DIR/../lib/feature_policy.py")" || return 1
+    patches="$(ffbuild_cache_tree_key "$ROOT/shared-patches" "$SCRIPT_DIR/../lib/feature_policy.py" \
+      "$FULL_RECIPES_DIR/libjxr-decoder.patch" "$FULL_RECIPES_DIR/libjxrdec.c")" || return 1
     host_key="$(ffbuild_cache_tree_key "$HOST_TOOLS/.full-glslc-cache.json" "$HOST_TOOLS/bin/glslc")" || return 1
   fi
   FULL_STAGE_COMPAT_KEY="$(ffbuild_cache_hash full-stage-v3 "$name" "$TARGET" "$PREFIX" "$BUILDROOT" \
@@ -2728,11 +2741,11 @@ write_full_manifest() {
   done
 
   manifest_args+=(--validate "Requested Full build scope completed: ${BUILT_STAGES[*]}")
-  manifest_args+=(--skip "Non-upstream FFmpeg feature patches are not applied; only build/link compatibility patches are retained")
   manifest_args+=(--validate "Native AVS1 decoders included; external AVS2/3 codecs and AVS encoders remain disabled; Audio Vivid/AV3A is unavailable")
   manifest_args+=(--validate "FFmpeg mainline HEVC decoding includes ITU-T T.35 HDR Vivid frame metadata parsing; HDR Vivid generation/encoding is unavailable")
   if [[ "$ffmpeg_built" == "1" ]]; then
     manifest_args+=(--validate "FFmpeg stage configured, linked, and its runtime DLL closure was checked")
+    manifest_args+=(--validate "Static libjxr JPEG XR decoder is registered; no JPEG XR encoder")
   else
     manifest_args+=(--skip "FFmpeg was not relinked; packaged executable/DLL hashes describe the pre-existing Full package, not this library-only build")
   fi

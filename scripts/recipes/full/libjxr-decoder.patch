@@ -1,0 +1,132 @@
+diff --git a/configure b/configure
+--- a/configure
++++ b/configure
+@@ -246,4 +246,5 @@
+   --enable-libjack         enable JACK audio sound server [no]
+   --enable-libjxl          enable JPEG XL de/encoding via libjxl [no]
++  --enable-libjxr          enable JPEG XR decoding via jxrlib [no]
+   --enable-libklvanc       enable Kernel Labs VANC processing [no]
+   --enable-libkvazaar      enable HEVC encoding via libkvazaar [no]
+@@ -2074,4 +2075,5 @@
+     libjack
+     libjxl
++    libjxr
+     libklvanc
+     libkvazaar
+@@ -3817,4 +3819,5 @@
+ libjxl_decoder_deps="libjxl libjxl_threads"
+ libjxl_encoder_deps="libjxl libjxl_threads"
++libjxr_decoder_deps="libjxr"
+ libkvazaar_encoder_deps="libkvazaar"
+ liblc3_decoder_deps="liblc3"
+@@ -3924,4 +3927,5 @@
+ image2_alias_pix_demuxer_select="image2_demuxer"
+ image2_brender_pix_demuxer_select="image2_demuxer"
++image_jpegxr_pipe_demuxer_deps="libjxr"
+ imf_demuxer_deps="libxml2"
+ imf_demuxer_select="mxf_demuxer"
+@@ -7265,4 +7269,5 @@
+ enabled libjxl            && require_pkg_config libjxl "libjxl >= 0.7.0" jxl/decode.h JxlDecoderVersion &&
+                              require_pkg_config libjxl_threads "libjxl_threads >= 0.7.0" jxl/thread_parallel_runner.h JxlThreadParallelRunner
++enabled libjxr            && require_pkg_config libjxr libjxr JXRGlue.h PKImageDecode_Create_WMP
+ enabled libklvanc         && require libklvanc libklvanc/vanc.h klvanc_context_create -lklvanc
+ enabled libkvazaar        && require_pkg_config libkvazaar "kvazaar >= 2.0.0" kvazaar.h kvz_api_get
+diff --git a/libavcodec/codec_id.h b/libavcodec/codec_id.h
+--- a/libavcodec/codec_id.h
++++ b/libavcodec/codec_id.h
+@@ -330,4 +330,7 @@
+
++    /* Local extension: keep after all upstream video IDs. */
++    AV_CODEC_ID_JPEGXR = 0x7F00,
++
+     /* various PCM "codecs" */
+     AV_CODEC_ID_FIRST_AUDIO = 0x10000,     ///< A dummy id pointing at the start of audio codecs
+     AV_CODEC_ID_PCM_S16LE = 0x10000,
+diff --git a/libavcodec/codec_desc.c b/libavcodec/codec_desc.c
+--- a/libavcodec/codec_desc.c
++++ b/libavcodec/codec_desc.c
+@@ -2019,5 +2019,15 @@
+     },
+
++    {
++        .id        = AV_CODEC_ID_JPEGXR,
++        .type      = AVMEDIA_TYPE_VIDEO,
++        .name      = "jpegxr",
++        .long_name = NULL_IF_CONFIG_SMALL("JPEG XR"),
++        .props     = AV_CODEC_PROP_INTRA_ONLY | AV_CODEC_PROP_LOSSY |
++                     AV_CODEC_PROP_LOSSLESS,
++        .mime_types= MT("image/jxr", "image/vnd.ms-photo"),
++    },
++
+     /* various PCM "codecs" */
+     {
+         .id        = AV_CODEC_ID_PCM_S16LE,
+diff --git a/libavcodec/Makefile b/libavcodec/Makefile
+--- a/libavcodec/Makefile
++++ b/libavcodec/Makefile
+@@ -1205,4 +1205,5 @@
+ OBJS-$(CONFIG_LIBJXL_DECODER)             += libjxldec.o libjxl.o
+ OBJS-$(CONFIG_LIBJXL_ENCODER)             += libjxlenc.o libjxl.o
++OBJS-$(CONFIG_LIBJXR_DECODER)             += libjxrdec.o
+ OBJS-$(CONFIG_LIBKVAZAAR_ENCODER)         += libkvazaar.o
+ OBJS-$(CONFIG_LIBLC3_ENCODER)             += liblc3enc.o
+diff --git a/libavcodec/allcodecs.c b/libavcodec/allcodecs.c
+--- a/libavcodec/allcodecs.c
++++ b/libavcodec/allcodecs.c
+@@ -798,4 +798,5 @@
+ extern const FFCodec ff_libjxl_decoder;
+ extern const FFCodec ff_libjxl_encoder;
++extern const FFCodec ff_libjxr_decoder;
+ extern const FFCodec ff_liblc3_encoder;
+ extern const FFCodec ff_liblc3_decoder;
+diff --git a/libavformat/Makefile b/libavformat/Makefile
+--- a/libavformat/Makefile
++++ b/libavformat/Makefile
+@@ -307,4 +307,5 @@
+ OBJS-$(CONFIG_IMAGE_JPEGLS_PIPE_DEMUXER)  += img2dec.o img2.o
+ OBJS-$(CONFIG_IMAGE_JPEGXL_PIPE_DEMUXER)  += img2dec.o img2.o
++OBJS-$(CONFIG_IMAGE_JPEGXR_PIPE_DEMUXER)  += img2dec.o img2.o
+ OBJS-$(CONFIG_IMAGE_JPEGXS_PIPE_DEMUXER)  += img2dec.o img2.o
+ OBJS-$(CONFIG_IMAGE_PAM_PIPE_DEMUXER)     += img2dec.o img2.o
+diff --git a/libavformat/allformats.c b/libavformat/allformats.c
+--- a/libavformat/allformats.c
++++ b/libavformat/allformats.c
+@@ -559,4 +559,5 @@
+ extern const FFInputFormat  ff_image_jpegls_pipe_demuxer;
+ extern const FFInputFormat  ff_image_jpegxl_pipe_demuxer;
++extern const FFInputFormat  ff_image_jpegxr_pipe_demuxer;
+ extern const FFInputFormat  ff_image_jpegxs_pipe_demuxer;
+ extern const FFInputFormat  ff_image_pam_pipe_demuxer;
+diff --git a/libavformat/img2.c b/libavformat/img2.c
+--- a/libavformat/img2.c
++++ b/libavformat/img2.c
+@@ -94,4 +94,7 @@
+     TAG(VBN,             vbn      ) \
+     TAG(JPEGXL,          jxl      ) \
++    TAG(JPEGXR,          jxr      ) \
++    TAG(JPEGXR,          wdp      ) \
++    TAG(JPEGXR,          hdp      ) \
+     TAG(JPEGXS,          jxs      ) \
+     TAG(QOI,             qoi      ) \
+diff --git a/libavformat/img2dec.c b/libavformat/img2dec.c
+--- a/libavformat/img2dec.c
++++ b/libavformat/img2dec.c
+@@ -1009,4 +1009,12 @@
+ }
+ 
++static int jpegxr_probe(const AVProbeData *p)
++{
++    if (p->buf_size >= 8 && AV_RL24(p->buf) == 0xbc4949 && p->buf[3] <= 1 &&
++        AV_RL32(p->buf + 4) >= 8)
++        return AVPROBE_SCORE_EXTENSION + 1;
++    return 0;
++}
++
+ static int tiff_probe(const AVProbeData *p)
+ {
+@@ -1270,4 +1278,5 @@
+ IMAGEAUTO_DEMUXER(jpegls,    JPEGLS)
+ IMAGEAUTO_DEMUXER(jpegxl,    JPEGXL)
++IMAGEAUTO_DEMUXER(jpegxr,    JPEGXR)
+ IMAGEAUTO_DEMUXER(pam,       PAM)
+ IMAGEAUTO_DEMUXER(pbm,       PBM)
